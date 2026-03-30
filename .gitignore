@@ -1,0 +1,5 @@
+trade_bot/.env
+trade_bot/venv/
+trade_bot/*.bak
+__pycache__/
+*.pyc
