@@ -1,0 +1,25 @@
+[Unit]
+Description=Trade Bot live runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradebot
+Group=tradebot
+WorkingDirectory=/opt/trade_bot
+Environment=TRADE_BOT_HOME=/opt/trade_bot
+Environment=PYTHONUNBUFFERED=1
+Environment=BOT_STATE_FILE=bot_state.json
+EnvironmentFile=/opt/trade_bot/.env
+ExecStart=/opt/trade_bot/.venv/bin/python -m trade_bot.main live
+ExecStop=/bin/kill -s TERM $MAINPID
+Restart=always
+RestartSec=10
+TimeoutStopSec=45
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

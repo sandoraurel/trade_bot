@@ -1,0 +1,65 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trade-bot:latest
+    env_file:
+      - .env
+    environment:
+      TRADE_BOT_HOME: /app
+      PYTHONUNBUFFERED: "1"
+      BOT_STATE_FILE: data/bot_state.json
+    command: ["python", "-m", "trade_bot.main", "live"]
+    restart: unless-stopped
+    stop_grace_period: 45s
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./knowledge:/app/knowledge:ro
+      - ./.env:/app/.env:ro
+    healthcheck:
+      test: ["CMD", "python", "-m", "trade_bot.cli", "healthcheck", "--max-snapshot-age-seconds", "1200"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    ports:
+      - "8000:8000"
+    networks:
+      - botnet
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    profiles: ["observability"]
+    depends_on:
+      - bot
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    networks:
+      - botnet
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: ["observability"]
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    networks:
+      - botnet
+
+networks:
+  botnet:
+    driver: bridge

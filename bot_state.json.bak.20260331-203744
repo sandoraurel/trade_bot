@@ -1,0 +1,146 @@
+{
+  "balance": 80.0,
+  "today_trades_count": 0,
+  "today_start_date": "2026-03-31",
+  "consecutive_losses": 0,
+  "reduced_risk_mode": false,
+  "emergency_mode": true,
+  "equity_start_of_day": 100.0,
+  "realized_pl_today": 0.0,
+  "wins_today": 0,
+  "losses_today": 0,
+  "peak_equity": 100.0,
+  "paper_mode": true,
+  "cooldown_until": null,
+  "last_heartbeat": "2026-03-31T20:19:21.794591",
+  "lifetime_profit": 0.0,
+  "lifetime_trades": 0,
+  "best_single_trade": 0.0,
+  "worst_single_trade": 0.0,
+  "unrealized_pnl": 0.0,
+  "last_equity_update": null,
+  "multi_position_mode": false,
+  "last_news_scan_at": "2026-03-31T20:19:27.565063",
+  "pending_news_commands": [
+    {
+      "command_id": "cmd-1644837733952569191",
+      "event_id": "binance_new_listings:20ac487755434d559568552e9812cbf0",
+      "action": "ENTER",
+      "symbol": "BNB/USDT",
+      "side": "buy",
+      "confidence": 0.74,
+      "urgency": "high",
+      "ttl_minutes": 240,
+      "rationale": "Listing-related announcement detected for BNB/USDT. Positive exchange listing flow can create short-term upside.",
+      "event_category": "listing",
+      "created_at": "2026-03-31T18:19:24.424505",
+      "metadata": {
+        "event_title": "Introducing Fabric Protocol (ROBO) on Binance HODLer Airdrops! Earn ROBO With Retroactive BNB Simple Earn Subscriptions",
+        "event_url": "https://www.binance.com/en/support/announcement/20ac487755434d559568552e9812cbf0",
+        "published_at": "2026-03-18T03:30:14.268000",
+        "market_context": {
+          "last_close": 615.99,
+          "momentum_15m": 0.0,
+          "benchmark_symbol": "BTC/USDT",
+          "benchmark_momentum_15m": 0.00010373597055844535,
+          "spread": 1.6241280462536895e-05
+        },
+        "semantic_cluster": "generic",
+        "learned_prior": {
+          "samples": 0,
+          "avg_return": 0.0,
+          "avg_relative_return_vs_benchmark": 0.0,
+          "avg_beta_adjusted_return": 0.0,
+          "avg_realized_volatility": 0.0,
+          "avg_volume_ratio": 1.0,
+          "avg_drift_ratio": 0.0,
+          "hit_rate": 0.5,
+          "confidence_delta": 0.0,
+          "expected_return": 0.0,
+          "learned_edge_score": 0.0,
+          "rationale_suffix": ""
+        },
+        "execution_gate": {
+          "allow": true,
+          "reason": "cold_start"
+        },
+        "event_labels": {
+          "semantic_cluster": "generic",
+          "direction_bias": "bullish",
+          "spread_bucket": "normal",
+          "momentum_bucket": "flat",
+          "samples": 0
+        }
+      }
+    },
+    {
+      "command_id": "cmd-882012720116390012",
+      "event_id": "binance_delistings:e27183f5c08c48bd940bdd2d7f81eca4",
+      "action": "EXIT_OR_SHORT",
+      "symbol": "BNB/USDT",
+      "side": "sell",
+      "confidence": 0.86,
+      "urgency": "high",
+      "ttl_minutes": 720,
+      "rationale": "Delisting-related announcement detected for BNB/USDT. Delisting risk is usually strongly bearish for spot liquidity.",
+      "event_category": "delisting",
+      "created_at": "2026-03-31T18:19:26.535753",
+      "metadata": {
+        "event_title": "Binance Alpha Will Remove MIRROR, SHARDS, FST, DGC, COA, ULTI, TGT, AGON, BNB Card, AFT, PFVS, SGC, RDO, ELDE, MILK, TAT, BOT, SSS, SUBHUB, PLANCK, OOOO (2026-03-12)",
+        "event_url": "https://www.binance.com/en/support/announcement/e27183f5c08c48bd940bdd2d7f81eca4",
+        "published_at": "2026-03-12T12:00:09.568000",
+        "market_context": {
+          "last_close": 615.99,
+          "momentum_15m": 0.0,
+          "benchmark_symbol": "BTC/USDT",
+          "benchmark_momentum_15m": 0.00010358840872273537,
+          "spread": 1.6241280462536895e-05
+        },
+        "semantic_cluster": "trading_bots",
+        "learned_prior": {
+          "samples": 0,
+          "avg_return": 0.0,
+          "avg_relative_return_vs_benchmark": 0.0,
+          "avg_beta_adjusted_return": 0.0,
+          "avg_realized_volatility": 0.0,
+          "avg_volume_ratio": 1.0,
+          "avg_drift_ratio": 0.0,
+          "hit_rate": 0.5,
+          "confidence_delta": 0.0,
+          "expected_return": 0.0,
+          "learned_edge_score": 0.0,
+          "rationale_suffix": ""
+        },
+        "execution_gate": {
+          "allow": true,
+          "reason": "cold_start"
+        },
+        "event_labels": {
+          "semantic_cluster": "trading_bots",
+          "direction_bias": "bearish",
+          "spread_bucket": "normal",
+          "momentum_bucket": "flat",
+          "samples": 0
+        }
+      }
+    }
+  ],
+  "market_regime_alerts": {},
+  "data_cooldown_until": null,
+  "execution_cooldown_until": null,
+  "health_summary": {
+    "emergency_mode": false,
+    "trade_cooldown_active": false,
+    "data_circuit_breaker_active": false,
+    "execution_circuit_breaker_active": false,
+    "market_regime_alerts": {},
+    "top_blocker": "healthy",
+    "ranked_blockers": [],
+    "no_signal_cycles": 4,
+    "market_data_health_failures": 0,
+    "signal_generation_failures": 0,
+    "signal_reliability_rejections": 0,
+    "consecutive_order_failures": 0
+  },
+  "open_positions": []
+}

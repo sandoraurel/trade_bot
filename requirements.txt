@@ -1,0 +1,11 @@
+# Core runtime
+requests
+python-dotenv
+numpy
+prometheus_client
+
+# Optional but required by current repo features
+# - pandas: imported for indicator and backtest flows
+# - ccxt: live exchange and historical market data adapter
+pandas
+ccxt

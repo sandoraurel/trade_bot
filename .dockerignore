@@ -1,0 +1,12 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+data
+logs
+bot_state.json
+bot_state.json.bak.*
+backtest_results.json

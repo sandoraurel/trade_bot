@@ -1,0 +1,305 @@
+{
+  "balance": 80.0,
+  "today_trades_count": 2,
+  "today_start_date": "2026-03-31",
+  "consecutive_losses": 0,
+  "reduced_risk_mode": false,
+  "emergency_mode": true,
+  "equity_start_of_day": 100.0,
+  "realized_pl_today": 36.0,
+  "wins_today": 2,
+  "losses_today": 0,
+  "peak_equity": 100.0,
+  "paper_mode": true,
+  "cooldown_until": null,
+  "last_heartbeat": "2026-03-31T17:30:59.737989",
+  "lifetime_profit": 36.0,
+  "lifetime_trades": 2,
+  "best_single_trade": 18.0,
+  "worst_single_trade": 0.0,
+  "unrealized_pnl": 0.0,
+  "last_equity_update": null,
+  "multi_position_mode": false,
+  "last_news_scan_at": "2026-03-31T18:44:59.516544",
+  "pending_news_commands": [
+    {
+      "command_id": "cmd-2569216477909819164",
+      "event_id": "binance_new_listings:20ac487755434d559568552e9812cbf0",
+      "action": "ENTER",
+      "symbol": "BNB/USDT",
+      "side": "buy",
+      "confidence": 0.74,
+      "urgency": "high",
+      "ttl_minutes": 240,
+      "rationale": "Listing-related announcement detected for BNB/USDT. Positive exchange listing flow can create short-term upside.",
+      "event_category": "listing",
+      "created_at": "2026-03-31T16:05:32.180746",
+      "metadata": {
+        "event_title": "Introducing Fabric Protocol (ROBO) on Binance HODLer Airdrops! Earn ROBO With Retroactive BNB Simple Earn Subscriptions",
+        "event_url": "https://www.binance.com/en/support/announcement/20ac487755434d559568552e9812cbf0",
+        "published_at": "2026-03-18T03:30:14.268000",
+        "market_context": {
+          "last_close": 522.4711,
+          "momentum_15m": 0.02796110491567695,
+          "spread": 0.0010015747738309356
+        }
+      }
+    },
+    {
+      "command_id": "cmd-3838145785540137690",
+      "event_id": "binance_delistings:e27183f5c08c48bd940bdd2d7f81eca4",
+      "action": "EXIT_OR_SHORT",
+      "symbol": "BNB/USDT",
+      "side": "sell",
+      "confidence": 0.86,
+      "urgency": "high",
+      "ttl_minutes": 720,
+      "rationale": "Delisting-related announcement detected for BNB/USDT. Delisting risk is usually strongly bearish for spot liquidity.",
+      "event_category": "delisting",
+      "created_at": "2026-03-31T16:05:32.200797",
+      "metadata": {
+        "event_title": "Binance Alpha Will Remove MIRROR, SHARDS, FST, DGC, COA, ULTI, TGT, AGON, BNB Card, AFT, PFVS, SGC, RDO, ELDE, MILK, TAT, BOT, SSS, SUBHUB, PLANCK, OOOO (2026-03-12)",
+        "event_url": "https://www.binance.com/en/support/announcement/e27183f5c08c48bd940bdd2d7f81eca4",
+        "published_at": "2026-03-12T12:00:09.568000",
+        "market_context": {
+          "last_close": 522.4711,
+          "momentum_15m": 0.02796110491567695,
+          "spread": 0.0010027476314254794
+        }
+      }
+    },
+    {
+      "command_id": "cmd-4405371872639151852",
+      "event_id": "binance_new_listings:20ac487755434d559568552e9812cbf0",
+      "action": "ENTER",
+      "symbol": "BNB/USDT",
+      "side": "buy",
+      "confidence": 0.74,
+      "urgency": "high",
+      "ttl_minutes": 240,
+      "rationale": "Listing-related announcement detected for BNB/USDT. Positive exchange listing flow can create short-term upside.",
+      "event_category": "listing",
+      "created_at": "2026-03-31T16:10:12.082950",
+      "metadata": {
+        "event_title": "Introducing Fabric Protocol (ROBO) on Binance HODLer Airdrops! Earn ROBO With Retroactive BNB Simple Earn Subscriptions",
+        "event_url": "https://www.binance.com/en/support/announcement/20ac487755434d559568552e9812cbf0",
+        "published_at": "2026-03-18T03:30:14.268000",
+        "market_context": {
+          "last_close": 262.1551,
+          "momentum_15m": -0.004676014392526328,
+          "spread": 0.0010011539170002174
+        },
+        "learned_prior": {
+          "samples": 0,
+          "avg_return": 0.0,
+          "hit_rate": 0.5,
+          "confidence_delta": 0.0,
+          "expected_return": 0.0,
+          "rationale_suffix": ""
+        }
+      }
+    },
+    {
+      "command_id": "cmd-5663723780386658116",
+      "event_id": "binance_delistings:e27183f5c08c48bd940bdd2d7f81eca4",
+      "action": "EXIT_OR_SHORT",
+      "symbol": "BNB/USDT",
+      "side": "sell",
+      "confidence": 0.86,
+      "urgency": "high",
+      "ttl_minutes": 720,
+      "rationale": "Delisting-related announcement detected for BNB/USDT. Delisting risk is usually strongly bearish for spot liquidity.",
+      "event_category": "delisting",
+      "created_at": "2026-03-31T16:10:12.402890",
+      "metadata": {
+        "event_title": "Binance Alpha Will Remove MIRROR, SHARDS, FST, DGC, COA, ULTI, TGT, AGON, BNB Card, AFT, PFVS, SGC, RDO, ELDE, MILK, TAT, BOT, SSS, SUBHUB, PLANCK, OOOO (2026-03-12)",
+        "event_url": "https://www.binance.com/en/support/announcement/e27183f5c08c48bd940bdd2d7f81eca4",
+        "published_at": "2026-03-12T12:00:09.568000",
+        "market_context": {
+          "last_close": 262.1551,
+          "momentum_15m": -0.004676014392526328,
+          "spread": 0.0010011075449274994
+        },
+        "learned_prior": {
+          "samples": 0,
+          "avg_return": 0.0,
+          "hit_rate": 0.5,
+          "confidence_delta": 0.0,
+          "expected_return": 0.0,
+          "rationale_suffix": ""
+        }
+      }
+    },
+    {
+      "command_id": "cmd-919098563620093873",
+      "event_id": "binance_new_listings:20ac487755434d559568552e9812cbf0",
+      "action": "ENTER",
+      "symbol": "BNB/USDT",
+      "side": "buy",
+      "confidence": 0.74,
+      "urgency": "high",
+      "ttl_minutes": 240,
+      "rationale": "Listing-related announcement detected for BNB/USDT. Positive exchange listing flow can create short-term upside.",
+      "event_category": "listing",
+      "created_at": "2026-03-31T16:12:22.042415",
+      "metadata": {
+        "event_title": "Introducing Fabric Protocol (ROBO) on Binance HODLer Airdrops! Earn ROBO With Retroactive BNB Simple Earn Subscriptions",
+        "event_url": "https://www.binance.com/en/support/announcement/20ac487755434d559568552e9812cbf0",
+        "published_at": "2026-03-18T03:30:14.268000",
+        "market_context": {
+          "last_close": 357.0476,
+          "momentum_15m": 0.0143821347084665,
+          "benchmark_momentum_15m": 0.022347469303182824,
+          "spread": 0.0009995092148412672
+        },
+        "semantic_cluster": "generic",
+        "learned_prior": {
+          "samples": 0,
+          "avg_return": 0.0,
+          "hit_rate": 0.5,
+          "confidence_delta": 0.0,
+          "expected_return": 0.0,
+          "rationale_suffix": ""
+        }
+      }
+    },
+    {
+      "command_id": "cmd-2517932999245083654",
+      "event_id": "binance_delistings:e27183f5c08c48bd940bdd2d7f81eca4",
+      "action": "EXIT_OR_SHORT",
+      "symbol": "BNB/USDT",
+      "side": "sell",
+      "confidence": 0.86,
+      "urgency": "high",
+      "ttl_minutes": 720,
+      "rationale": "Delisting-related announcement detected for BNB/USDT. Delisting risk is usually strongly bearish for spot liquidity.",
+      "event_category": "delisting",
+      "created_at": "2026-03-31T16:12:22.311514",
+      "metadata": {
+        "event_title": "Binance Alpha Will Remove MIRROR, SHARDS, FST, DGC, COA, ULTI, TGT, AGON, BNB Card, AFT, PFVS, SGC, RDO, ELDE, MILK, TAT, BOT, SSS, SUBHUB, PLANCK, OOOO (2026-03-12)",
+        "event_url": "https://www.binance.com/en/support/announcement/e27183f5c08c48bd940bdd2d7f81eca4",
+        "published_at": "2026-03-12T12:00:09.568000",
+        "market_context": {
+          "last_close": 357.0476,
+          "momentum_15m": 0.0143821347084665,
+          "benchmark_momentum_15m": 0.022347469303182824,
+          "spread": 0.0009979556405898152
+        },
+        "semantic_cluster": "trading_bots",
+        "learned_prior": {
+          "samples": 0,
+          "avg_return": 0.0,
+          "hit_rate": 0.5,
+          "confidence_delta": 0.0,
+          "expected_return": 0.0,
+          "rationale_suffix": ""
+        }
+      }
+    },
+    {
+      "command_id": "cmd-5619593990533960072",
+      "event_id": "binance_new_listings:20ac487755434d559568552e9812cbf0",
+      "action": "ENTER",
+      "symbol": "BNB/USDT",
+      "side": "buy",
+      "confidence": 0.74,
+      "urgency": "high",
+      "ttl_minutes": 240,
+      "rationale": "Listing-related announcement detected for BNB/USDT. Positive exchange listing flow can create short-term upside.",
+      "event_category": "listing",
+      "created_at": "2026-03-31T16:15:14.692547",
+      "metadata": {
+        "event_title": "Introducing Fabric Protocol (ROBO) on Binance HODLer Airdrops! Earn ROBO With Retroactive BNB Simple Earn Subscriptions",
+        "event_url": "https://www.binance.com/en/support/announcement/20ac487755434d559568552e9812cbf0",
+        "published_at": "2026-03-18T03:30:14.268000",
+        "market_context": {
+          "last_close": 321.9209,
+          "momentum_15m": -0.00018168864219257784,
+          "benchmark_momentum_15m": 0.00433599865048999,
+          "spread": 0.0009997044029328923
+        },
+        "semantic_cluster": "generic",
+        "learned_prior": {
+          "samples": 0,
+          "avg_return": 0.0,
+          "avg_relative_return_vs_btc": 0.0,
+          "avg_beta_adjusted_return": 0.0,
+          "avg_realized_volatility": 0.0,
+          "avg_volume_ratio": 1.0,
+          "avg_drift_ratio": 0.0,
+          "hit_rate": 0.5,
+          "confidence_delta": 0.0,
+          "expected_return": 0.0,
+          "learned_edge_score": 0.0,
+          "rationale_suffix": ""
+        },
+        "execution_gate": {
+          "allow": true,
+          "reason": "cold_start"
+        }
+      }
+    },
+    {
+      "command_id": "cmd-1522999567228339960",
+      "event_id": "binance_delistings:e27183f5c08c48bd940bdd2d7f81eca4",
+      "action": "EXIT_OR_SHORT",
+      "symbol": "BNB/USDT",
+      "side": "sell",
+      "confidence": 0.86,
+      "urgency": "high",
+      "ttl_minutes": 720,
+      "rationale": "Delisting-related announcement detected for BNB/USDT. Delisting risk is usually strongly bearish for spot liquidity.",
+      "event_category": "delisting",
+      "created_at": "2026-03-31T16:15:14.959977",
+      "metadata": {
+        "event_title": "Binance Alpha Will Remove MIRROR, SHARDS, FST, DGC, COA, ULTI, TGT, AGON, BNB Card, AFT, PFVS, SGC, RDO, ELDE, MILK, TAT, BOT, SSS, SUBHUB, PLANCK, OOOO (2026-03-12)",
+        "event_url": "https://www.binance.com/en/support/announcement/e27183f5c08c48bd940bdd2d7f81eca4",
+        "published_at": "2026-03-12T12:00:09.568000",
+        "market_context": {
+          "last_close": 321.9209,
+          "momentum_15m": -0.00018168864219257784,
+          "benchmark_momentum_15m": 0.00433599865048999,
+          "spread": 0.0009993119174678674
+        },
+        "semantic_cluster": "trading_bots",
+        "learned_prior": {
+          "samples": 0,
+          "avg_return": 0.0,
+          "avg_relative_return_vs_btc": 0.0,
+          "avg_beta_adjusted_return": 0.0,
+          "avg_realized_volatility": 0.0,
+          "avg_volume_ratio": 1.0,
+          "avg_drift_ratio": 0.0,
+          "hit_rate": 0.5,
+          "confidence_delta": 0.0,
+          "expected_return": 0.0,
+          "learned_edge_score": 0.0,
+          "rationale_suffix": ""
+        },
+        "execution_gate": {
+          "allow": true,
+          "reason": "cold_start"
+        }
+      }
+    },
+    {
+      "command_id": "c1",
+      "event_id": "e1",
+      "action": "watch",
+      "symbol": "BTC/USDT",
+      "side": "buy",
+      "confidence": 0.8,
+      "urgency": "high",
+      "ttl_minutes": 60,
+      "rationale": "listing",
+      "event_category": "listing",
+      "created_at": "2025-01-01T00:00:00",
+      "metadata": {}
+    }
+  ],
+  "market_regime_alerts": {},
+  "data_cooldown_until": null,
+  "execution_cooldown_until": null,
+  "health_summary": {},
+  "open_positions": []
+}

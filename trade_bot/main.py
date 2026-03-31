@@ -1,8 +1,10 @@
 import requests
 import os
 from dotenv import load_dotenv
-load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+import signal
+import threading
 import json
+import math
 import numpy as np
 import os
 import sys
@@ -13,9 +15,42 @@ from typing import Optional, Dict, Any, Tuple
 import time
 import datetime as dt
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Any
+from trade_bot.metrics import MetricsCollector
+from trade_bot.ai.assistant import BotOperatorAssistant, ensure_default_knowledge_base
+from trade_bot.backtest_reporting import build_backtest_report, save_backtest_report
+from trade_bot.bootstrap import ensure_runtime_directories, load_runtime_environment, resolve_runtime_base_dir
+from trade_bot.audit import JsonlDecisionLogger
+from trade_bot.constants import DATA_DIR, EVENT_LOG_FILE, LOG_DIR, STATE_DB_FILE, STATE_FILE
+from trade_bot.config import BotConfig as CoreBotConfig
+from trade_bot.execution import ExecutionEngine as CoreExecutionEngine
+from trade_bot.exchange import ExchangeClient as CoreExchangeClient, MockExchange as CoreMockExchange
+from trade_bot.learning import TradeLearningEngine
+from trade_bot.ensemble import EnsembleAllocator
+from trade_bot.news_engine import BinanceNewsEngine
+from trade_bot.persistence import load_bot_state, save_bot_state
+from trade_bot.readiness import build_readiness_report
+from trade_bot.reconciliation import BotReconciler
+from trade_bot.regime import MarketRegimeEngine
+from trade_bot.risk import RiskManager as CoreRiskManager
+from trade_bot.runtime import (
+    build_portfolio_snapshot,
+    build_risk_decision,
+    build_strategy_health,
+    emit_event,
+    log_reconciliation,
+    log_risk_halt,
+    log_signal,
+    new_trace_id,
+    persist_runtime_snapshot,
+)
+from trade_bot.state import BotState as CoreBotState, Position as CorePosition
+from trade_bot.state_store import SQLiteStateStore
+from trade_bot.strategies import build_strategies
 
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+load_runtime_environment(resolve_runtime_base_dir())
 
 # Import ccxt lazily to avoid import-time hangs in paper mode
 
@@ -216,9 +251,6 @@ class MockExchange:
         return True
 
 
-LOG_DIR = "logs"
-STATE_FILE = "bot_state.json"
-
 # ============================
 # 1) CONFIG – YOUR RULES
 # ============================
@@ -259,6 +291,12 @@ class BotConfig:
     strict_signals: bool = True
     avoid_chop: bool = True
     late_confirmation: bool = True
+    enable_mean_reversion: bool = True
+    enable_trend_breakout: bool = True
+    allow_countertrend_in_chop: bool = True
+    breakout_swing_lookback: int = 5
+    breakout_rr_ratio: float = 2.2
+    min_signal_quality_score: float = 0.55
     # 👉 ALAPÉRTELMEZETTEN NEM PAPERMÓD
     use_paper_trading: bool = False
     # Execution mode
@@ -282,6 +320,8 @@ class BotConfig:
     # Dashboard times (local)
     morning_hour: int = 8
     evening_hour: int = 20
+    news_engine_enabled: bool = True
+    news_poll_interval_minutes: int = 15
     # Telegram (optional – if None, no notifications)
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
@@ -420,6 +460,9 @@ class BotState:
     # For now it does nothing, but later you can use it to switch to
     # multiple positions per symbol without changing the schema again.
     multi_position_mode: bool = False
+    last_news_scan_at: Optional[dt.datetime] = None
+    pending_news_commands: List[Dict[str, Any]] = field(default_factory=list)
+    market_regime_alerts: Dict[str, str] = field(default_factory=dict)
 
 
 # ============================
@@ -504,9 +547,7 @@ class ExchangeClient:
             except Exception as e:
                 # We do not fail hard – we just log and continue with spot-only
                 # behavior
-                print(
-    f"[WARN] Failed to initialize futures trade client: {
-        type(e).__name__}: {e}")
+                print(f"[WARN] Failed to initialize futures trade client: {type(e).__name__}: {e}")
                 self.futures_trade_client = None
 
         # ----- LOAD MARKETS (BEST-EFFORT) -----
@@ -514,24 +555,18 @@ class ExchangeClient:
         try:
             self.public_client.load_markets()
         except Exception as e:
-            print(
-    f"[WARN] Failed to load public markets: {
-        type(e).__name__}: {e}")
+            print(f"[WARN] Failed to load public markets: {type(e).__name__}: {e}")
 
         try:
             self.trade_client.load_markets()
         except Exception as e:
-            print(
-    f"[WARN] Failed to load spot trade markets: {
-        type(e).__name__}: {e}")
+            print(f"[WARN] Failed to load spot trade markets: {type(e).__name__}: {e}")
 
         if self.futures_trade_client is not None:
             try:
                 self.futures_trade_client.load_markets()
             except Exception as e:
-                print(
-    f"[WARN] Failed to load futures trade markets: {
-        type(e).__name__}: {e}")
+                print(f"[WARN] Failed to load futures trade markets: {type(e).__name__}: {e}")
 
         # Track the last raw order response for debugging / analytics
         # (optional)
@@ -963,6 +998,11 @@ class SignalEngine:
     def __init__(self, config: BotConfig, exch: Any):
         self.config = config
         self.exch = exch
+        self.regime_engine = MarketRegimeEngine(config, exch)
+        self.ensemble = EnsembleAllocator(config)
+        self.strategy_modules = build_strategies(config, exch, self)
+        self.research_context_provider = None
+        self.learning_context_provider = None
         # Phase 1: Multi-strategy weights (dynamic later via ML)
         self.strategy_weights = {
             'trend_breakout': 0.35,
@@ -1028,54 +1068,7 @@ class SignalEngine:
         return np.clip(H, 0.0, 1.0)
 
     def get_market_regime(self, symbol: str) -> str:
-        hurst = self.compute_hurst_exponent(symbol)
-        
-        candles = self.exch.fetch_ohlcv(symbol, '1h', limit=50)
-        if not candles or len(candles) < 25:
-            return 'choppy'
-        
-        highs = np.array([c[2] for c in candles])
-        lows = np.array([c[3] for c in candles])
-        closes = np.array([c[4] for c in candles])
-        
-        tr = np.maximum(highs[1:] - lows[1:],
-                        np.abs(highs[1:] - closes[:-1]),
-                        np.abs(lows[1:] - closes[:-1]))
-        
-        up_move = highs[1:] - highs[:-1]
-        down_move = lows[:-1] - lows[1:]
-        
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
-        
-        period = 14
-        atr = np.mean(tr[-period:])
-        plus_di = 100 * np.mean(plus_dm[-period:]) / atr if atr > 0 else 20
-        minus_di = 100 * np.mean(minus_dm[-period:]) / atr if atr > 0 else 20
-        adx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di) if (plus_di + minus_di) > 0 else 20
-        
-        atr_15m = self.compute_atr(symbol, "15m", period=14)
-        current_price = closes[-1]
-        vol_ratio = atr_15m / current_price if atr_15m and current_price > 0 else 0
-        
-        VOL_CHOPPY_THRESHOLD = 0.005
-        TREND_HURST_THRESHOLD = 0.6
-        MEAN_REVERT_HURST_THRESHOLD = 0.4
-        TREND_ADX_THRESHOLD = 25
-        MEAN_REVERT_ADX_THRESHOLD = 20
-        
-        if vol_ratio < VOL_CHOPPY_THRESHOLD:
-            return 'choppy'
-        
-        is_trending = (hurst > TREND_HURST_THRESHOLD) or (adx > TREND_ADX_THRESHOLD)
-        is_mean_reverting = (hurst < MEAN_REVERT_HURST_THRESHOLD) or (adx < MEAN_REVERT_ADX_THRESHOLD)
-        
-        if is_trending and not is_mean_reverting:
-            return 'trending'
-        elif is_mean_reverting and not is_trending:
-            return 'mean_reverting'
-        else:
-            return 'choppy'
+        return self.regime_engine.classify(symbol).regime
 
     def is_choppy_market(self, symbol: str) -> bool:
         "Enhanced chop filter"
@@ -1164,6 +1157,15 @@ class SignalEngine:
 
         return self._has_higher_highs_lows(candles_4h, lookback=6)
 
+    def is_4h_bearish(self, symbol: str) -> bool:
+        candles_4h = self.exch.fetch_ohlcv(symbol, "4h", limit=20)
+        if not candles_4h or len(candles_4h) < 12:
+            return False
+        closes = [c[4] for c in candles_4h]
+        recent_mid = sum(closes[-6:]) / 6
+        earlier_mid = sum(closes[-12:-6]) / 6
+        return recent_mid < earlier_mid * 0.999
+
     def is_1h_uptrend(self, symbol: str) -> bool:
         """
         1H TIMEFRAME FILTER (Momentum Confirmation)
@@ -1185,6 +1187,17 @@ class SignalEngine:
         sma_20 = sum(closes_1h[-20:]) / 20
 
         return last_close > sma_20
+
+    def is_1h_downtrend(self, symbol: str) -> bool:
+        candles_1h = self.exch.fetch_ohlcv(symbol, "1h", limit=50)
+        if not candles_1h or len(candles_1h) < 20:
+            return False
+        closes_1h = [c[4] for c in candles_1h]
+        recent_mid = sum(closes_1h[-4:]) / 4
+        earlier_mid = sum(closes_1h[-8:-4]) / 4
+        sma_20 = sum(closes_1h[-20:]) / 20
+        last_close = closes_1h[-1]
+        return recent_mid < earlier_mid * 0.999 and last_close < sma_20
 
     def get_recent_swing_high_low(
     self,
@@ -1264,28 +1277,98 @@ class SignalEngine:
 
         last_close = closes[-1]
         last_rsi = rsi[-1]
+        atr_15m = self.compute_atr(symbol, "15m", period=14)
+        if atr_15m is None or atr_15m <= 0:
+            return None
 
         if last_rsi < 25 and last_close <= bb_lower[-1] * 1.001:  # Long
-            sl = bb_lower[-1] * 0.998
+            sl = min(bb_lower[-1] * 0.998, last_close - atr_15m * 0.8)
             tp = bb_middle[-1]
+            if sl <= 0 or sl >= last_close or tp <= last_close:
+                return None
             return {
                 'side': 'long',
                 'entry_price': last_close,
                 'stop_loss': sl,
                 'take_profit': tp,
-                'strategy': 'mean_reversion'
+                'strategy': 'mean_reversion',
+                'fast_move': False,
+                'is_futures': False,
+                'signal_quality': 0.62,
             }
         elif last_rsi > 75 and last_close >= bb_upper[-1] * 0.999:  # Short
-            sl = bb_upper[-1] * 1.002
+            sl = max(bb_upper[-1] * 1.002, last_close + atr_15m * 0.8)
             tp = bb_middle[-1]
+            if sl <= last_close or tp >= last_close:
+                return None
             return {
                 'side': 'short',
                 'entry_price': last_close,
                 'stop_loss': sl,
                 'take_profit': tp,
-                'strategy': 'mean_reversion'
+                'strategy': 'mean_reversion',
+                'fast_move': False,
+                'is_futures': False,
+                'signal_quality': 0.62,
             }
         return None
+
+    def trend_breakout_signal(self, symbol: str) -> Optional[Dict[str, Any]]:
+        # Trend-friendly setup with slightly looser filters than the original
+        # all-or-nothing breakout path.
+        if not self.is_4h_bullish(symbol):
+            return None
+        if not self.is_1h_uptrend(symbol):
+            return None
+
+        candles_15m = self.exch.fetch_ohlcv(symbol, "15m", limit=30)
+        lookback = max(int(getattr(self.config, "breakout_swing_lookback", 5)), 3)
+        if not candles_15m or len(candles_15m) < max(lookback, 10):
+            return None
+
+        swing_high, swing_low = self.get_recent_swing_high_low(candles_15m, lookback=lookback)
+        if swing_high is None or swing_low is None:
+            return None
+
+        last_close = candles_15m[-1][4]
+        atr_15m = self.compute_atr(symbol, "15m", period=14)
+        if atr_15m is None or atr_15m <= 0:
+            return None
+
+        breakout_buffer = atr_15m * 0.15
+        if last_close + breakout_buffer < swing_high:
+            return None
+
+        entry_price = max(last_close, swing_high)
+        stop_loss = min(swing_low * 0.999, entry_price - atr_15m * 0.9)
+        if stop_loss <= 0 or stop_loss >= entry_price:
+            return None
+
+        sl_distance = entry_price - stop_loss
+        if sl_distance < 0.25 * atr_15m or sl_distance > 2.5 * atr_15m:
+            return None
+
+        rr_ratio = max(float(getattr(self.config, "breakout_rr_ratio", 2.2)), 1.5)
+        take_profit = entry_price + (sl_distance * rr_ratio)
+        if take_profit <= entry_price:
+            return None
+
+        tp_pct = (take_profit - entry_price) / entry_price
+        if tp_pct > 0.12:
+            take_profit = entry_price * 1.12
+
+        quality = 0.72 if last_close >= swing_high else 0.58
+        return {
+            "side": "long",
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "fast_move": last_close > swing_high,
+            "is_futures": False,
+            "confluence_score": "MEDIUM",
+            "strategy": "trend_breakout",
+            "signal_quality": quality,
+        }
 
     def rsi(self, prices: np.ndarray, period: int = 14) -> np.ndarray:
         if np is None:
@@ -1316,84 +1399,189 @@ class SignalEngine:
      1]), lower))
 
     def generate_signal(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        MULTI-TIMEFRAME CONFLUENCE + ENSEMBLE
-        # REQUIREMENTS (ALL MUST BE TRUE):
-        # This is a HIGH-CONFIDENCE signal only (fewer trades, better quality)
+        regime = self.regime_engine.classify(symbol)
+        proposals = []
+        hurst = self.compute_hurst_exponent(symbol, timeframe=self.config.timeframes.get("trend", "1h"), lookback=80)
+        research_context = self._research_context(symbol)
+        for strategy in self.strategy_modules:
+            proposal = strategy.evaluate(symbol, regime)
+            if proposal is not None:
+                signal_stub = {
+                    "symbol": proposal.signal.symbol,
+                    "side": proposal.signal.side,
+                    "entry_price": proposal.signal.entry_price,
+                    "stop_loss": proposal.signal.stop_loss,
+                    "take_profit": proposal.signal.take_profit,
+                    "strategy": proposal.signal.strategy,
+                    "signal_quality": proposal.signal.confidence,
+                    "expected_edge_bps": proposal.expected_edge_bps,
+                    "regime": proposal.signal.regime,
+                    "rr_ratio": self._reward_risk_ratio_for_signal(proposal.signal),
+                    "hurst_exponent": hurst,
+                    "fast_move": proposal.signal.fast_move,
+                    "metadata": dict(proposal.signal.metadata),
+                    "research_context": research_context,
+                }
+                learning_context = self._learning_context(symbol, signal_stub, regime)
+                proposal.signal.metadata["hurst_exponent"] = hurst
+                proposal.signal.metadata["research_context"] = research_context
+                proposal.signal.metadata["learning_context"] = learning_context
+                proposal.signal.confidence = max(
+                    0.0,
+                    min(0.99, float(proposal.signal.confidence) + float(learning_context.get("confidence_delta", 0.0) or 0.0)),
+                )
+                proposals.append(proposal)
 
-        """
-        # FILTER 1: Choppy market rejection
-        if self.config.avoid_chop and self.is_choppy_market(symbol):
+        decision = self.ensemble.choose(symbol, regime, proposals, research_context=research_context)
+        if decision.signal is None:
             return None
-
-        # FILTER 2: 4H STRUCTURE - Must show clear uptrend (HH + HL)
-        if not self.is_4h_bullish(symbol):
+        signal = decision.signal
+        if signal.strategy == "trend_breakout" and hurst < float(getattr(self.config, "min_hurst_for_trend_breakout", 0.12)):
             return None
-
-        # FILTER 3: 1H MOMENTUM - Must confirm uptrend + price above SMA20
-        if not self.is_1h_uptrend(symbol):
+        if signal.strategy == "trend_pullback" and hurst < float(getattr(self.config, "min_hurst_for_trend_pullback", 0.10)):
             return None
-
-        # FILTER 4: 15M ENTRY - Get breakout level from swing high
-        candles_15m = self.exch.fetch_ohlcv(symbol, "15m", limit=20)
-        if not candles_15m or len(candles_15m) < 5:
+        if signal.strategy == "mean_reversion" and hurst > float(getattr(self.config, "max_hurst_for_mean_reversion", 0.65)):
             return None
-
-        # Get recent swing high/low for breakout
-        swing_high, swing_low = self.get_recent_swing_high_low(
-            candles_15m, lookback=5)
-        if swing_high is None or swing_low is None:
+        if float(signal.confidence) < float(getattr(self.config, "min_signal_quality_score", 0.55)):
             return None
-
-        last_15m_close = candles_15m[-1][4]
-
-        # Entry only if price is at or above swing high (breakout confirmed)
-        if last_15m_close < swing_high:
-            return None  # Not at breakout yet
-
-        # Use close if above swing high
-        entry_price = max(last_15m_close, swing_high)
-
-        # FILTER 5: STOP LOSS - Place below swing low (structure-based, not
-        # arbitrary)
-        stop_loss = swing_low * 0.999  # Minimum 0.1% above swing low
-
-        if stop_loss <= 0 or stop_loss >= entry_price:
-            return None
-
-        sl_distance = entry_price - stop_loss
-
-        # FILTER 6: ATR VALIDATION - SL should be reasonable relative to
-        # volatility
-        atr_15m = self.compute_atr(symbol, "15m", period=14)
-        if atr_15m is None or atr_15m <= 0:
-            return None
-
-        # SL distance should be between 0.3x and 2x ATR (tight but reasonable
-        # stops)
-        if sl_distance < 0.3 * atr_15m or sl_distance > 2.0 * atr_15m:
-            return None
-
-        # FILTER 7: MINIMUM 1:3 RISK/REWARD RATIO
-        # This is CRITICAL for profitability with even modest win rates
-        min_rr_ratio = 3.0
-        take_profit = entry_price + (sl_distance * min_rr_ratio)
-
-        # One final check: ensure TP is reasonable (not >10% move, unrealistic)
-        max_tp_pct = 0.10  # 10% maximum TP distance
-        if (take_profit - entry_price) / entry_price > max_tp_pct:
-            # If TP would be > 10% away, reject (unrealistic target)
-            return None
-
-        return {
-            "side": "long",
-            "entry_price": entry_price,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "fast_move": False,
-            "is_futures": False,
-            "confluence_score": "HIGH",  # Track signal quality
+        rr_ratio = 0.0
+        risk = abs(float(signal.entry_price) - float(signal.stop_loss))
+        reward = abs(float(signal.take_profit) - float(signal.entry_price))
+        if risk > 0:
+            rr_ratio = reward / risk
+        signal_payload = {
+            "side": signal.side,
+            "entry_price": signal.entry_price,
+            "stop_loss": signal.stop_loss,
+            "take_profit": signal.take_profit,
+            "strategy": signal.strategy,
+            "fast_move": signal.fast_move,
+            "is_futures": signal.is_futures,
+            "signal_quality": signal.confidence,
+            "expected_edge_bps": signal.expected_edge_bps,
+            "regime": signal.regime,
+            "rr_ratio": rr_ratio,
+            "hurst_exponent": hurst,
+            "metadata": signal.metadata,
+            "research_context": research_context,
+            "ensemble": {
+                "selected_strategy": decision.selected_strategy,
+                "proposals": decision.proposals,
+                "rejected_reasons": decision.rejected_reasons,
+                "regime": decision.regime,
+            },
         }
+        if not self._passes_reliability_checks(symbol, signal_payload, regime, len(proposals)):
+            return None
+        return signal_payload
+
+    def _passes_reliability_checks(
+        self,
+        symbol: str,
+        signal: Dict[str, Any],
+        regime: Any,
+        proposal_count: int,
+    ) -> bool:
+        side = str(signal.get("side", "")).lower()
+        strategy = str(signal.get("strategy", "unknown"))
+        entry_price = float(signal.get("entry_price", 0.0) or 0.0)
+        stop_loss = float(signal.get("stop_loss", 0.0) or 0.0)
+        take_profit = float(signal.get("take_profit", 0.0) or 0.0)
+        confidence = float(signal.get("signal_quality", 0.0) or 0.0)
+        expected_edge_bps = float(signal.get("expected_edge_bps", 0.0) or 0.0)
+        rr_ratio = float(signal.get("rr_ratio", 0.0) or 0.0)
+        hurst = float(signal.get("hurst_exponent", 0.5) or 0.5)
+        numeric_values = [entry_price, stop_loss, take_profit, confidence, expected_edge_bps, rr_ratio, hurst]
+        research_context = signal.get("research_context", {}) or {}
+
+        if proposal_count <= 0:
+            return False
+        if any(not math.isfinite(value) for value in numeric_values):
+            return False
+        if entry_price <= 0 or stop_loss <= 0 or take_profit <= 0:
+            return False
+        if confidence < float(getattr(self.config, "min_signal_quality_score", 0.55)):
+            return False
+        if float(getattr(regime, "confidence", 0.0)) < float(getattr(self.config, "min_reliable_regime_confidence", 0.58)):
+            return False
+        if expected_edge_bps < float(getattr(self.config, "min_expected_edge_bps", 8.0)):
+            return False
+
+        if side in {"long", "buy"}:
+            if not (stop_loss < entry_price < take_profit):
+                return False
+        elif side in {"short", "sell"}:
+            if not (stop_loss > entry_price > take_profit):
+                return False
+        else:
+            return False
+
+        if not self._passes_research_checks(side, research_context):
+            return False
+
+        if strategy in {"trend_breakout", "trend_pullback"}:
+            if rr_ratio < float(getattr(self.config, "min_reliable_rr_ratio_trend", 1.35)):
+                return False
+        elif strategy == "mean_reversion":
+            if rr_ratio < float(getattr(self.config, "min_reliable_rr_ratio_mean_reversion", 1.10)):
+                return False
+
+        regime_name = str(getattr(regime, "regime", "unknown"))
+        if strategy in {"trend_breakout", "trend_pullback"} and regime_name not in {"trending", "high_volatility"}:
+            return False
+        if strategy == "mean_reversion" and regime_name not in {"mean_reverting", "choppy"}:
+            return False
+
+        try:
+            order_book = self.exch.get_order_book(symbol)
+            bid = float(order_book["bid"])
+            ask = float(order_book["ask"])
+            mid = (bid + ask) / 2.0
+            if mid > 0:
+                entry_deviation = abs(entry_price - mid) / mid
+                if entry_deviation > float(getattr(self.config, "max_entry_deviation_from_mid_fraction", 0.0045)):
+                    return False
+        except Exception:
+            pass
+        return True
+
+    def _research_context(self, symbol: str) -> Dict[str, Any]:
+        if not callable(self.research_context_provider):
+            return {}
+        try:
+            return self.research_context_provider(symbol) or {}
+        except Exception:
+            return {}
+
+    def _learning_context(self, symbol: str, signal: Dict[str, Any], regime: Any | None = None) -> Dict[str, Any]:
+        if not callable(self.learning_context_provider):
+            return {}
+        try:
+            return self.learning_context_provider(symbol, signal, regime) or {}
+        except Exception:
+            return {}
+
+    def _passes_research_checks(self, side: str, research_context: Dict[str, Any]) -> bool:
+        if not research_context:
+            return True
+        risk_off = float(research_context.get("risk_off_confidence", 0.0) or 0.0)
+        bullish = float(research_context.get("bullish_confidence", 0.0) or 0.0)
+        bearish = float(research_context.get("bearish_confidence", 0.0) or 0.0)
+        if risk_off >= float(getattr(self.config, "research_risk_off_veto_confidence", 0.75)):
+            return False
+        if side in {"long", "buy"} and bearish >= float(getattr(self.config, "research_conflict_veto_confidence", 0.72)):
+            return False
+        if side in {"short", "sell"} and bullish >= float(getattr(self.config, "research_conflict_veto_confidence", 0.72)):
+            return False
+        return True
+
+    @staticmethod
+    def _reward_risk_ratio_for_signal(signal: Any) -> float:
+        risk = abs(float(signal.entry_price) - float(signal.stop_loss))
+        reward = abs(float(signal.take_profit) - float(signal.entry_price))
+        if risk <= 0:
+            return 0.0
+        return reward / risk
 
 
 # ============================
@@ -1492,7 +1680,8 @@ class RiskManager:
                             if pos.symbol.split('/')[0] in coins:
                                 total_risk += self.config.risk_per_trade_max
                     else:
-                        if pos.symbol.split('/')[0] in coins:
+                        pos = sym_pos
+                        if getattr(pos, "symbol", "").split('/')[0] in coins:
                             total_risk += self.config.risk_per_trade_max
                 break
         return total_risk
@@ -1597,6 +1786,28 @@ class ExecutionEngine:
             return 1.0
         return (ask - bid) / mid
 
+    def validate_trade_plan(
+        self,
+        side: str,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        size: float,
+    ) -> bool:
+        if size <= 0 or entry_price <= 0 or stop_loss <= 0 or take_profit <= 0:
+            return False
+
+        normalized_side = (side or "").lower()
+        if normalized_side == "long":
+            return stop_loss < entry_price < take_profit
+        if normalized_side == "short":
+            return stop_loss > entry_price > take_profit
+        if normalized_side == "buy":
+            return stop_loss < entry_price < take_profit
+        if normalized_side == "sell":
+            return stop_loss > entry_price > take_profit
+        return False
+
     # ... [rest of ExecutionEngine methods - truncated for diff]
     # Full methods already in code above, just completing class
 
@@ -1613,6 +1824,7 @@ class BacktestEngine:
         self.trades: List[Dict] = []
         self.balance_curve: List[float] = []
         self.equity_start = config.starting_balance
+        self._total_fees: float = 0.0
 
     def load_historical_data(
     self,
@@ -1623,14 +1835,26 @@ class BacktestEngine:
         import ccxt
 
         exchange = ccxt.binance({'enableRateLimit': True})
-        since = int(
-    (pd.Timestamp.now() -
-    pd.Timedelta(
-        days=days)).timestamp() *
-         1000)
+        start_ts = pd.Timestamp.now() - pd.Timedelta(days=days)
+        end_ts = pd.Timestamp.now()
+        since = int(start_ts.timestamp() * 1000)
+        end_ms = int(end_ts.timestamp() * 1000)
 
-        ohlcv = exchange.fetch_ohlcv(
-    symbol, timeframe, since=since, limit=1000)
+        ohlcv: List[List[Any]] = []
+        seen_timestamps = set()
+        while since < end_ms:
+            batch = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+            if not batch:
+                break
+            new_rows = [row for row in batch if row[0] not in seen_timestamps]
+            if not new_rows:
+                break
+            ohlcv.extend(new_rows)
+            seen_timestamps.update(row[0] for row in new_rows)
+            last_ts = int(new_rows[-1][0])
+            since = last_ts + 1
+            if len(batch) < 1000:
+                break
 
         df = pd.DataFrame(
     ohlcv,
@@ -1644,9 +1868,7 @@ class BacktestEngine:
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
 
-        print(
-    f"Loaded {
-        len(df)} candles for {symbol} {timeframe} ({days} days)")
+        print(f"Loaded {len(df)} candles for {symbol} {timeframe} ({days} days)")
         return df
 
     def run_backtest(
@@ -1662,90 +1884,182 @@ class BacktestEngine:
         if df.empty:
             return {'error': 'No data loaded'}
 
-        # Initialize backtest state
         balance = self.config.starting_balance
-        equity = balance
-        positions = {}
+        positions: List[Dict[str, Any]] = []
+        pending_entries: List[Dict[str, Any]] = []
         self.trades = []
         self.balance_curve = [balance]
+        self._total_fees = 0.0
 
-        # Create backtest exchange with full df
         mock_exch = MockBacktestExchange(df, symbol)
         signal_engine = SignalEngine(self.config, mock_exch)
-        risk_mgr = RiskManager(
-    self.config, BotState(
-        balance=self.config.starting_balance))
+        warmup = max(int(getattr(self.config, "backtest_warmup_candles", 100)), 20)
+        fee_rate = float(getattr(self.config, "backtest_fee_bps", 10.0)) / 10000.0
 
-        for i in range(100, len(df)):  # Skip warmup
-            # Set current market state for signal generation
+        for i in range(warmup, len(df)):
+            mock_exch.set_cursor(i)
             current_candle = df.iloc[i]
+            candle_timestamp = current_candle.name
+            active_date = candle_timestamp.date()
 
-            # Generate signals using current market data
-            signal = signal_engine.generate_signal(symbol)
+            newly_active: List[Dict[str, Any]] = []
+            still_pending: List[Dict[str, Any]] = []
+            for planned in pending_entries:
+                if planned["activate_index"] != i:
+                    still_pending.append(planned)
+                    continue
 
-            # Simulate RiskManager.can_open_new_position (simplified)
-            if (signal and
-                len([p for ps in positions.values() for p in ps]) < self.config.max_open_positions and
-                len(self.trades) < self.config.max_trades_per_day_max * days / 30):  # Approx daily
-
-                entry_price = signal['entry_price']
-                stop_loss = signal['stop_loss']
-                take_profit = signal['take_profit']
-
-                # Position sizing
-                risk_mgr = RiskManager(self.config, BotState(balance=balance))
-                size = risk_mgr.calc_position_size(entry_price, stop_loss)
-
-                if size > 0:
-                    # Open position
-                    pos = {
-                        'entry_time': current_candle.name,
-                        'entry_price': entry_price,
-                        'size': size,
-                        'stop_loss': stop_loss,
-                        'take_profit': take_profit,
-                        'side': 'long'
+                entry_price = self._apply_entry_costs(
+                    side=planned["side"],
+                    raw_price=float(current_candle["open"]),
+                )
+                fee_paid = entry_price * planned["size"] * fee_rate
+                balance -= fee_paid
+                self._total_fees += fee_paid
+                newly_active.append(
+                    {
+                        **planned,
+                        "entry_time": candle_timestamp,
+                        "entry_price": entry_price,
+                        "fee_paid_entry": fee_paid,
                     }
-                    positions.setdefault(symbol, []).append(pos)
+                )
+            pending_entries = still_pending
+            positions.extend(newly_active)
 
-            # Check position exits (SL/TP hit)
             remaining_pos = []
-            for pos in positions.get(symbol, []):
-                high = current_candle['high']
-                low = current_candle['low']
-                close = current_candle['close']
-
+            for pos in positions:
+                high = float(current_candle["high"])
+                low = float(current_candle["low"])
                 closed = False
                 exit_price = None
+                exit_reason = None
 
-                if low <= pos['stop_loss']:
-                    exit_price = pos['stop_loss']
-                    closed = True
-                elif high >= pos['take_profit']:
-                    exit_price = pos['take_profit']
-                    closed = True
+                if pos["side"] == "long":
+                    if low <= pos["stop_loss"]:
+                        exit_price = pos["stop_loss"]
+                        exit_reason = "SL"
+                        closed = True
+                    elif high >= pos["take_profit"]:
+                        exit_price = pos["take_profit"]
+                        exit_reason = "TP"
+                        closed = True
+                else:
+                    if high >= pos["stop_loss"]:
+                        exit_price = pos["stop_loss"]
+                        exit_reason = "SL"
+                        closed = True
+                    elif low <= pos["take_profit"]:
+                        exit_price = pos["take_profit"]
+                        exit_reason = "TP"
+                        closed = True
 
                 if closed:
-                    pl = (exit_price - pos['entry_price']) * pos['size']
-                    balance += pl
+                    adjusted_exit = self._apply_exit_costs(
+                        side=pos["side"],
+                        raw_price=float(exit_price),
+                    )
+                    gross_pl = self._gross_pl(pos["side"], pos["entry_price"], adjusted_exit, pos["size"])
+                    exit_fee = adjusted_exit * pos["size"] * fee_rate
+                    net_pl = gross_pl - exit_fee
+                    balance += net_pl
+                    self._total_fees += exit_fee
+                    holding_minutes = max(
+                        (candle_timestamp - pos["entry_time"]).total_seconds() / 60.0,
+                        0.0,
+                    )
                     self.trades.append({
-                        'entry_time': pos['entry_time'],
-                        'exit_time': current_candle.name,
-                        'pl': pl,
-                        'exit_reason': 'SL' if exit_price == pos['stop_loss'] else 'TP'
+                        "symbol": symbol,
+                        "strategy": pos.get("strategy", "unknown"),
+                        "side": pos["side"],
+                        "entry_time": pos["entry_time"],
+                        "exit_time": candle_timestamp,
+                        "entry_price": pos["entry_price"],
+                        "exit_price": adjusted_exit,
+                        "size": pos["size"],
+                        "gross_pl": gross_pl,
+                        "pl": net_pl,
+                        "fees": pos.get("fee_paid_entry", 0.0) + exit_fee,
+                        "holding_minutes": holding_minutes,
+                        "exit_reason": exit_reason,
                     })
                 else:
                     remaining_pos.append(pos)
+            positions = remaining_pos
 
-            positions[symbol] = remaining_pos
-            equity = balance  # Simplified, no unrealized PnL yet
-            self.balance_curve.append(equity)
+            trades_today = sum(1 for trade in self.trades if trade["exit_time"].date() == active_date)
+            signal = signal_engine.generate_signal(symbol)
+            can_schedule_entry = (
+                signal is not None
+                and i + 1 < len(df)
+                and len(positions) + len(pending_entries) < self.config.max_open_positions
+                and trades_today < self.config.max_trades_per_day_max
+            )
+            if can_schedule_entry:
+                signal_side = signal.get("side", "long")
+                if signal_side in ("buy", "sell"):
+                    signal_side = "long" if signal_side == "buy" else "short"
+                if getattr(self.config, "trading_mode", "spot") == "spot" and signal_side == "short":
+                    unrealized = 0.0
+                    close_price = float(current_candle["close"])
+                    for pos in positions:
+                        unrealized += self._gross_pl(pos["side"], pos["entry_price"], close_price, pos["size"])
+                    self.balance_curve.append(balance + unrealized)
+                    continue
+
+                synthetic_state = BotState(balance=balance)
+                risk_mgr = RiskManager(self.config, synthetic_state)
+                size = risk_mgr.calc_position_size(
+                    float(signal["entry_price"]),
+                    float(signal["stop_loss"]),
+                )
+                if size > 0:
+                    pending_entries.append(
+                        {
+                            "activate_index": i + 1,
+                            "symbol": symbol,
+                            "strategy": signal.get("strategy", "unknown"),
+                            "side": signal_side,
+                            "stop_loss": float(signal["stop_loss"]),
+                            "take_profit": float(signal["take_profit"]),
+                            "size": size,
+                            "signal_time": candle_timestamp,
+                        }
+                    )
+
+            unrealized = 0.0
+            close_price = float(current_candle["close"])
+            for pos in positions:
+                unrealized += self._gross_pl(pos["side"], pos["entry_price"], close_price, pos["size"])
+            self.balance_curve.append(balance + unrealized)
 
         metrics = self.compute_metrics()
         return {
             **metrics,
-            'raw_trades': len(self.trades)
+            "raw_trades": len(self.trades),
+            "total_fees": self._total_fees,
+            "long_trades": sum(1 for trade in self.trades if trade["side"] == "long"),
+            "short_trades": sum(1 for trade in self.trades if trade["side"] == "short"),
+            "trade_log": self.trades,
         }
+
+    def _apply_entry_costs(self, side: str, raw_price: float) -> float:
+        slippage = float(getattr(self.config, "backtest_slippage_bps", 5.0)) / 10000.0
+        spread = float(getattr(self.config, "backtest_spread_bps", 4.0)) / 10000.0
+        direction = 1.0 if side == "long" else -1.0
+        return raw_price * (1.0 + (direction * (slippage + spread / 2.0)))
+
+    def _apply_exit_costs(self, side: str, raw_price: float) -> float:
+        slippage = float(getattr(self.config, "backtest_slippage_bps", 5.0)) / 10000.0
+        spread = float(getattr(self.config, "backtest_spread_bps", 4.0)) / 10000.0
+        direction = -1.0 if side == "long" else 1.0
+        return raw_price * (1.0 + (direction * (slippage + spread / 2.0)))
+
+    @staticmethod
+    def _gross_pl(side: str, entry_price: float, exit_price: float, size: float) -> float:
+        if side == "short":
+            return (entry_price - exit_price) * size
+        return (exit_price - entry_price) * size
 
     def compute_metrics(self) -> Dict[str, float]:
         "Compute standard trading metrics"
@@ -1778,6 +2092,12 @@ class BacktestEngine:
         peak = np.maximum.accumulate(self.balance_curve)
         drawdown = (self.balance_curve - peak) / peak
         max_dd = drawdown.min() * 100
+        expectancy = float(np.mean([t["pl"] for t in self.trades])) if self.trades else 0.0
+        avg_holding_minutes = float(np.mean([t.get("holding_minutes", 0.0) for t in self.trades])) if self.trades else 0.0
+        by_strategy: Dict[str, int] = {}
+        for trade in self.trades:
+            strategy = trade.get("strategy", "unknown")
+            by_strategy[strategy] = by_strategy.get(strategy, 0) + 1
 
         return {
             'total_return_pct': total_return,
@@ -1788,6 +2108,9 @@ class BacktestEngine:
             'max_drawdown_pct': max_dd,
             'avg_win': np.mean(wins) if wins else 0,
             'avg_loss': np.mean(losses) if losses else 0,
+            'expectancy': expectancy,
+            'avg_holding_minutes': avg_holding_minutes,
+            'strategy_trade_counts': by_strategy,
         }
 
 class MockBacktestExchange:
@@ -1796,16 +2119,25 @@ class MockBacktestExchange:
     def __init__(self, df: 'pd.DataFrame', symbol: str):  # type: ignore
         self.df = df.reset_index()
         self.symbol = symbol
+        self.cursor = len(self.df) - 1
+
+    def set_cursor(self, index: int) -> None:
+        self.cursor = max(0, min(index, len(self.df) - 1))
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 200):
         if symbol != self.symbol:
             return []
-        return self.df.tail(
-            limit)[['timestamp', 'open', 'high', 'low', 'close', 'volume']].values.tolist()
+        visible = self.df.iloc[: self.cursor + 1]
+        return visible.tail(limit)[['timestamp', 'open', 'high', 'low', 'close', 'volume']].values.tolist()
 
     def get_order_book(self, symbol: str):
         "Mock for spread checks"
-        return {"bid": 45000.0, "ask": 45001.0}
+        if symbol != self.symbol or self.df.empty:
+            return {"bid": 100.0, "ask": 100.1}
+        close_price = float(self.df.iloc[self.cursor]["close"])
+        spread_fraction = float(getattr(self, "spread_fraction", 0.0004))
+        half_spread = close_price * spread_fraction / 2.0
+        return {"bid": close_price - half_spread, "ask": close_price + half_spread}
 
 class HyperoptEngine:
     "Hyperparameter optimization using backtesting grid search"
@@ -1842,9 +2174,7 @@ class HyperoptEngine:
             import random
             full_grid = random.sample(full_grid, max_combinations)
 
-        print(
-    f"🚀 HYPEROPT: Testing {
-        len(full_grid)} combinations on {symbol} ({days}d)")
+        print(f"🚀 HYPEROPT: Testing {len(full_grid)} combinations on {symbol} ({days}d)")
         print(f"Grid: {dict(zip(param_names, [len(v) for v in self.PARAM_GRID.values()]))}")
 
         # Single-threaded sequential for simplicity (parallel had import
@@ -1927,9 +2257,7 @@ class HyperoptEngine:
                 return None
             return mid
         except Exception as e:
-            print(
-    f"[WARN] _get_mid_price failed for {symbol}: {
-        type(e).__name__}: {e}")
+            print(f"[WARN] _get_mid_price failed for {symbol}: {type(e).__name__}: {e}")
             return None
 
     def _check_slippage_for_market(
@@ -1953,10 +2281,8 @@ class HyperoptEngine:
         slippage = abs(mid - entry_price) / mid
         if slippage > self.config.max_slippage_fraction:
             print(
-                f"[WARN] Estimated slippage too high on {symbol}: {
-    slippage:.4%} "
-                f"(max allowed {
-    self.config.max_slippage_fraction:.4%}). Aborting market order."
+                f"[WARN] Estimated slippage too high on {symbol}: {slippage:.4%} "
+                f"(max allowed {self.config.max_slippage_fraction:.4%}). Aborting market order."
             )
             return False
 
@@ -2026,8 +2352,7 @@ class HyperoptEngine:
         if cost_min is not None and price is not None:
             if size * price < cost_min:
                 print(
-                    f"[WARN] Notional {
-    size * price:.8f} for {symbol} is below minimum "
+                    f"[WARN] Notional {size * price:.8f} for {symbol} is below minimum "
                     f"cost {cost_min}. Skipping order."
                 )
                 return 0.0, price
@@ -2039,8 +2364,7 @@ class HyperoptEngine:
         if spread > self.config.max_spread_fraction:
             print(
                 f"[INFO] Spread too high on {symbol}: {spread:.4%} "
-                f"(max allowed {
-    self.config.max_spread_fraction:.4%}). Skipping."
+                f"(max allowed {self.config.max_spread_fraction:.4%}). Skipping."
             )
             return False
         return True
@@ -2066,6 +2390,13 @@ class HyperoptEngine:
         - Futures routing is still handled by ExchangeClient and currently uses SPOT TESTNET.
         - is_futures flag is passed through unchanged for future extension.
         """
+        if not self.validate_trade_plan(side, entry_price, stop_loss, take_profit, size):
+            print(
+                f"[WARN] Invalid trade plan for {symbol}: side={side}, entry={entry_price}, "
+                f"SL={stop_loss}, TP={take_profit}, size={size}"
+            )
+            return False
+
         if not self.can_trade_symbol_now(symbol):
             return False
 
@@ -2186,8 +2517,7 @@ class Reporter:
         if not self.config.telegram_bot_token or not self.config.telegram_chat_id:
             return
 
-        url = f"https://api.telegram.org/bot{
-    self.config.telegram_bot_token}/sendMessage"
+        url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendMessage"
         payload = {
             "chat_id": self.config.telegram_chat_id,
             "text": message,
@@ -2316,16 +2646,15 @@ class Reporter:
         )
 
         self.mentor_log(
-    f"Balance (test): <b>{
-        self.state.balance:.2f} USDT</b>",
-         level="INFO")
+            f"Balance (test): <b>{self.state.balance:.2f} USDT</b>",
+            level="INFO",
+        )
 
         if self.state.equity_start_of_day == 0.0:
             self.state.equity_start_of_day = self.state.balance
 
         self.mentor_log(
-            f"Equity start of day: <b>{
-    self.state.equity_start_of_day:.2f} USDT</b>",
+            f"Equity start of day: <b>{self.state.equity_start_of_day:.2f} USDT</b>",
             level="INFO",
         )
 
@@ -2404,9 +2733,20 @@ class Reporter:
 # ============================
 # 8) MAIN LOOP + STATE PERSISTENCE
 # ============================
+BotConfig = CoreBotConfig
+BotState = CoreBotState
+Position = CorePosition
+MockExchange = CoreMockExchange
+ExchangeClient = CoreExchangeClient
+RiskManager = CoreRiskManager
+ExecutionEngine = CoreExecutionEngine
+
+
 class TradeBot:
-    def __init__(self, config: BotConfig):
+    def __init__(self, config: BotConfig, *, enable_metrics: bool = True):
         self.config = config
+        self.base_dir = resolve_runtime_base_dir()
+        ensure_runtime_directories(self.base_dir)
 
         # Set paper_mode correctly based on config FIRST
         paper_mode = config.use_paper_trading
@@ -2429,9 +2769,30 @@ class TradeBot:
         self.signals = SignalEngine(config, self.exch)  # type: ignore
         self.exec = ExecutionEngine(config, self.state, self.exch)
         self.reporter = Reporter(config, self.state)
+        self.state_store = SQLiteStateStore(os.path.join(self.base_dir, STATE_DB_FILE))
+        self.metrics = MetricsCollector(port=8000) if enable_metrics else None
+        self.decision_logger = JsonlDecisionLogger(os.path.join(self.base_dir, EVENT_LOG_FILE))
+        self.learning = TradeLearningEngine(config, self.state_store)
+        self.reconciler = BotReconciler(self)
+        self.last_reconciliation_status = None
+        self._shutdown_event = threading.Event()
+        self._signal_handlers_registered = False
+        self.operator_assistant = BotOperatorAssistant(
+            bot=self,
+            knowledge_dir=ensure_default_knowledge_base(self.base_dir),
+        )
+        self.news_engine = BinanceNewsEngine(
+            exchange_client=self.exch,
+            state_path=os.path.join(self.base_dir, "data", "binance_news_state.json"),
+            symbols=self.config.symbols,
+            research_store=self.state_store,
+        )
+        self.signals.research_context_provider = self.news_engine.research_signal_context
+        self.signals.learning_context_provider = self._learning_context_for_signal
 
         # Load previous state (if exists)
         self.load_state()
+        self._last_notified_health_blocker = str(getattr(self.state, "health_summary", {}).get("top_blocker", "unknown"))
 
         # Initialize daily equity and peak equity if needed
         if self.state.equity_start_of_day == 0.0:
@@ -2440,207 +2801,252 @@ class TradeBot:
         if self.state.peak_equity == 0.0:
             self.state.peak_equity = self.state.balance
 
+    def answer_operator_question(self, question: str) -> Dict[str, Any]:
+        """
+        Operator-facing grounded assistant.
+
+        Combines:
+        - parametric memory from the model client
+        - non-parametric memory from local knowledge files
+        - tool outputs from the live bot state and exchange adapters
+        """
+        response = self.operator_assistant.answer(question)
+        return {
+            "answer": response.answer,
+            "retrieved_context": response.retrieved_context,
+            "tool_results": response.tool_results,
+            "portfolio_snapshot": asdict(build_portfolio_snapshot(self)),
+            "risk_state": asdict(build_risk_decision(self)),
+            "reconciliation_status": asdict(self.last_reconciliation_status) if self.last_reconciliation_status else None,
+            "strategy_health": [asdict(item) for item in build_strategy_health(self)],
+            "event_risk": self.news_engine.event_risk_snapshot(),
+            "event_research": self.news_engine.recent_research_records(limit=10),
+            "system_health": self._build_system_health_summary(),
+            "readiness_report": asdict(build_readiness_report(self)),
+        }
+
+    def scan_binance_news(self) -> List[Dict[str, Any]]:
+        commands = self.news_engine.scan()
+        serialized = [asdict(command) for command in commands]
+        self.state.pending_news_commands.extend(serialized)
+        self.state.last_news_scan_at = dt.datetime.now()
+        if serialized:
+            for command in serialized[:5]:
+                self.reporter.mentor_log(
+                    f"NEWS COMMAND {command['action']} {command['symbol']} "
+                    f"confidence={command['confidence']} urgency={command['urgency']} "
+                    f"reason={command['rationale']}"
+                )
+            self.save_state()
+        return serialized
+
+    def maybe_run_news_engine(self, now: Optional[dt.datetime] = None) -> List[Dict[str, Any]]:
+        if not getattr(self.config, "news_engine_enabled", True):
+            return []
+        now = now or dt.datetime.now()
+        interval_minutes = max(int(getattr(self.config, "news_poll_interval_minutes", 15)), 1)
+        if self.state.last_news_scan_at is not None:
+            elapsed = (now - self.state.last_news_scan_at).total_seconds()
+            if elapsed < interval_minutes * 60:
+                return []
+        try:
+            return self.scan_binance_news()
+        except Exception as exc:
+            self.reporter.log_error(f"Binance news scan failed: {exc}")
+            return []
+
     # ---------- STATE PERSISTENCE ----------
     def save_state(self):
+        trace_id = new_trace_id()
         try:
-            # Normalize open_positions into a flat list of dicts for JSON
-            from dataclasses import is_dataclass
-
-            open_positions_list = []
-            for symbol, val in self.state.open_positions.items():
-                if is_dataclass(val):
-                    positions = [val]
-                elif isinstance(val, list):
-                    positions = val
-                else:
-                    continue
-
-                for pos in positions:
-                    open_positions_list.append(
-                        {
-                            "symbol": pos.symbol,
-                            "side": pos.side,
-                            "entry_price": pos.entry_price,
-                            "size": pos.size,
-                            "stop_loss": pos.stop_loss,
-                            "take_profit": pos.take_profit,
-                            "is_futures": pos.is_futures,
-                            "opened_at": pos.opened_at.isoformat(),
-                            # Extended Position fields (if present)
-                            "leverage": pos.leverage,
-                            "order_id": pos.order_id,
-                            "status": pos.status,
-                            "fee_paid": pos.fee_paid,
-                            "unrealized_pnl": pos.unrealized_pnl,
-                            "last_update": pos.last_update.isoformat() if pos.last_update else None,
-                            "initial_stop_loss": pos.initial_stop_loss,
-                            "initial_take_profit": pos.initial_take_profit,
-                        }
-                    )
-
-            data = {
-                "balance": self.state.balance,
-                "today_trades_count": self.state.today_trades_count,
-                "today_start_date": self.state.today_start_date.isoformat(),
-                "consecutive_losses": self.state.consecutive_losses,
-                "reduced_risk_mode": self.state.reduced_risk_mode,
-                "emergency_mode": self.state.emergency_mode,
-                "equity_start_of_day": self.state.equity_start_of_day,
-                "realized_pl_today": self.state.realized_pl_today,
-                "wins_today": self.state.wins_today,
-                "losses_today": self.state.losses_today,
-                "peak_equity": self.state.peak_equity,
-                "paper_mode": self.state.paper_mode,
-                # Extended BotState fields
-                "cooldown_until": self.state.cooldown_until.isoformat() if self.state.cooldown_until else None,
-                "last_heartbeat": self.state.last_heartbeat.isoformat() if self.state.last_heartbeat else None,
-                "lifetime_profit": self.state.lifetime_profit,
-                "lifetime_trades": self.state.lifetime_trades,
-                "best_single_trade": self.state.best_single_trade,
-                "worst_single_trade": self.state.worst_single_trade,
-                "unrealized_pnl": self.state.unrealized_pnl,
-                "last_equity_update": self.state.last_equity_update.isoformat() if self.state.last_equity_update else None,
-                "multi_position_mode": getattr(self.state, "multi_position_mode", False),
-                "open_positions": open_positions_list,
-            }
-
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-
+            save_bot_state(self.state, STATE_FILE)
+            persist_runtime_snapshot(self, trace_id)
         except Exception as e:
             print(f"[WARN] Failed to save state: {e}")
 
     def load_state(self):
-        if not os.path.exists(STATE_FILE):
-            return
-
+        requested_paper_mode = bool(self.config.use_paper_trading)
         try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            self.state.balance = data.get("balance", self.state.balance)
-            self.state.today_trades_count = data.get("today_trades_count", 0)
-
-            tsd = data.get("today_start_date")
-            if tsd:
-                self.state.today_start_date = dt.date.fromisoformat(tsd)
-
-            self.state.consecutive_losses = data.get("consecutive_losses", 0)
-            self.state.reduced_risk_mode = data.get("reduced_risk_mode", False)
-            self.state.emergency_mode = data.get("emergency_mode", False)
-            self.state.equity_start_of_day = data.get(
-                "equity_start_of_day", self.state.balance)
-            self.state.realized_pl_today = data.get("realized_pl_today", 0.0)
-            self.state.wins_today = data.get("wins_today", 0)
-            self.state.losses_today = data.get("losses_today", 0)
-            self.state.peak_equity = data.get(
-                "peak_equity", self.state.balance)
-            self.state.paper_mode = data.get(
-    "paper_mode", self.state.paper_mode)
-
-            # Extended BotState fields (with safe defaults)
-            cu = data.get("cooldown_until")
-            if cu:
-                try:
-                    parsed = dt.datetime.fromisoformat(cu)
-                    self.state.cooldown_until = parsed.replace(
-                        tzinfo=None) if parsed.tzinfo else parsed
-                except Exception:
-                    self.state.cooldown_until = None
-
-            lh = data.get("last_heartbeat")
-            if lh:
-                try:
-                    parsed = dt.datetime.fromisoformat(lh)
-                    self.state.last_heartbeat = parsed.replace(
-                        tzinfo=None) if parsed.tzinfo else parsed
-                except Exception:
-                    self.state.last_heartbeat = None
-
-            self.state.lifetime_profit = data.get("lifetime_profit", 0.0)
-            self.state.lifetime_trades = data.get("lifetime_trades", 0)
-            self.state.best_single_trade = data.get("best_single_trade", 0.0)
-            self.state.worst_single_trade = data.get("worst_single_trade", 0.0)
-            self.state.unrealized_pnl = data.get("unrealized_pnl", 0.0)
-
-            leu = data.get("last_equity_update")
-            if leu:
-                try:
-                    parsed = dt.datetime.fromisoformat(leu)
-                    self.state.last_equity_update = parsed.replace(
-                        tzinfo=None) if parsed.tzinfo else parsed
-                except Exception:
-                    self.state.last_equity_update = None
-
-            self.state.multi_position_mode = data.get(
-                "multi_position_mode", False)
-
-            # Rebuild open_positions as Dict[str, List[Position]]
-            self.state.open_positions = {}
-            for p in data.get("open_positions", []):
-                try:
-                    opened_at_raw = p.get("opened_at")
-                    try:
-                        parsed = dt.datetime.fromisoformat(
-                            opened_at_raw) if opened_at_raw else None
-                        opened_at = parsed.replace(
-    tzinfo=None) if parsed and parsed.tzinfo else parsed or dt.datetime.now()
-                    except Exception:
-                        opened_at = dt.datetime.now()
-
-                    lu_raw = p.get("last_update")
-                    last_update = None
-                    if lu_raw:
-                        try:
-                            parsed = dt.datetime.fromisoformat(lu_raw)
-                            last_update = parsed.replace(
-    tzinfo=None) if parsed.tzinfo else parsed
-                        except Exception:
-                            last_update = None
-
-                    pos = Position(
-                        symbol=p["symbol"],
-                        side=p["side"],
-                        entry_price=p["entry_price"],
-                        size=p["size"],
-                        stop_loss=p["stop_loss"],
-                        take_profit=p["take_profit"],
-                        is_futures=p.get("is_futures", False),
-                        opened_at=opened_at,
-                        leverage=p.get("leverage"),
-                        order_id=p.get("order_id"),
-                        status=p.get("status", "open"),
-                        fee_paid=p.get("fee_paid", 0.0),
-                        unrealized_pnl=p.get("unrealized_pnl", 0.0),
-                        last_update=last_update,
-                        initial_stop_loss=p.get("initial_stop_loss"),
-                        initial_take_profit=p.get("initial_take_profit"),
-                    )
-
-                    # Store as list per symbol to support multi-position
-                    if pos.symbol not in self.state.open_positions:
-                        self.state.open_positions[pos.symbol] = [pos]
-                    else:
-                        existing = self.state.open_positions[pos.symbol]
-                        if isinstance(existing, list):
-                            existing.append(pos)
-                        else:
-                            self.state.open_positions[pos.symbol] = [
-                                existing, pos]
-                except Exception:
-                    continue
-
-            print("[INFO] State loaded from file.")
-
+            if load_bot_state(self.state, STATE_FILE):
+                print("[INFO] State loaded from file.")
         except Exception as e:
             print(f"[WARN] Failed to load state: {e}")
+        self.state.paper_mode = requested_paper_mode
+        self.last_reconciliation_status = self.reconciler.reconcile()
+        log_reconciliation(self, new_trace_id())
+        if getattr(self, "state_store", None) is not None:
+            metrics = self.state_store.load_operational_metrics()
+            if "runtime_hours" not in metrics:
+                self.state_store.set_operational_metric("runtime_hours", 0.0)
 
-    # ---------- MAIN CYCLE ----------
+    def _cooldown_active(self, attr_name: str, now: Optional[dt.datetime] = None) -> bool:
+        now = now or dt.datetime.now()
+        until = getattr(self.state, attr_name, None)
+        return until is not None and until > now
+
+    def _set_circuit_breaker(self, attr_name: str, minutes: int) -> None:
+        if minutes <= 0:
+            return
+        setattr(self.state, attr_name, dt.datetime.now() + dt.timedelta(minutes=minutes))
+
+    def _build_system_health_summary(self) -> Dict[str, Any]:
+        metrics = self.state_store.load_operational_metrics() if getattr(self, "state_store", None) else {}
+        now = dt.datetime.now()
+        blockers: List[Dict[str, Any]] = []
+        if self.state.emergency_mode:
+            blockers.append({"reason": "emergency_mode", "priority": 100})
+        if self._cooldown_active("execution_cooldown_until", now):
+            blockers.append({"reason": "execution_circuit_breaker", "priority": 95})
+        if self._cooldown_active("data_cooldown_until", now):
+            blockers.append({"reason": "data_circuit_breaker", "priority": 90})
+        if self.state.cooldown_until is not None and self.state.cooldown_until > now:
+            blockers.append({"reason": "trade_cooldown", "priority": 80})
+        for key, value in self.state.market_regime_alerts.items():
+            blockers.append({"reason": f"{key}:{value}", "priority": 60 if key == "SYSTEM" else 40})
+        ranked_blockers = [item["reason"] for item in sorted(blockers, key=lambda item: item["priority"], reverse=True)]
+        summary = {
+            "emergency_mode": self.state.emergency_mode,
+            "trade_cooldown_active": self.state.cooldown_until is not None and self.state.cooldown_until > now,
+            "data_circuit_breaker_active": self._cooldown_active("data_cooldown_until", now),
+            "execution_circuit_breaker_active": self._cooldown_active("execution_cooldown_until", now),
+            "market_regime_alerts": dict(self.state.market_regime_alerts),
+            "top_blocker": ranked_blockers[0] if ranked_blockers else "healthy",
+            "ranked_blockers": ranked_blockers,
+            "no_signal_cycles": int(metrics.get("no_signal_cycles", 0)),
+            "market_data_health_failures": int(metrics.get("market_data_health_failures", 0)),
+            "signal_generation_failures": int(metrics.get("signal_generation_failures", 0)),
+            "signal_reliability_rejections": int(metrics.get("signal_reliability_rejections", 0)),
+            "consecutive_order_failures": int(metrics.get("consecutive_order_failures", 0)),
+        }
+        self.state.health_summary = summary
+        return summary
+
+    def _learning_context_for_signal(self, symbol: str, signal: Dict[str, Any], regime: Any | None = None) -> Dict[str, Any]:
+        try:
+            return self.learning.learning_context_for_signal(signal, regime)
+        except Exception as exc:
+            self.reporter.log_error(f"Learning context failed for {symbol}: {type(exc).__name__}: {exc}")
+            return {}
+
+    def _notify_health_transition(self, previous: Dict[str, Any], current: Dict[str, Any]) -> None:
+        current_blocker = current.get("top_blocker", "healthy")
+        previous_blocker = previous.get("top_blocker", self._last_notified_health_blocker)
+        if current_blocker == previous_blocker or current_blocker == self._last_notified_health_blocker:
+            return
+        self.reporter.mentor_log(
+            f"System health changed from <b>{previous_blocker}</b> to <b>{current_blocker}</b>.",
+            level="WARN" if current_blocker != "healthy" else "INFO",
+            send_telegram=True,
+        )
+        self._last_notified_health_blocker = str(current_blocker)
+
+    def _assess_market_data_health(self, symbol: str, timeframe: Optional[str] = None) -> tuple[bool, str]:
+        timeframe = timeframe or self.config.timeframes.get("entry", "15m")
+        candles = self.exch.fetch_ohlcv(symbol, timeframe, limit=3) or []
+        if not candles:
+            return False, "missing_candles"
+        last_candle = candles[-1]
+        if len(last_candle) < 6:
+            return False, "malformed_candle"
+        try:
+            candle_ts = float(last_candle[0]) / 1000.0
+            high = float(last_candle[2])
+            low = float(last_candle[3])
+            close = float(last_candle[4])
+            volume = float(last_candle[5])
+        except Exception:
+            return False, "non_numeric_candle"
+        if high < low or close <= 0 or volume < 0:
+            return False, "invalid_ohlcv"
+        age_seconds = max(dt.datetime.now().timestamp() - candle_ts, 0.0)
+        max_age_seconds = max(int(getattr(self.config, "max_market_data_age_minutes", 90)), 1) * 60
+        if age_seconds > max_age_seconds:
+            return False, "stale_market_data"
+        return True, "ok"
+
+    def _safe_generate_signal(self, symbol: str) -> Optional[Dict[str, Any]]:
+        if self._cooldown_active("data_cooldown_until"):
+            self.state.market_regime_alerts["SYSTEM"] = "data_circuit_breaker_active"
+            return None
+        healthy, reason = self._assess_market_data_health(symbol)
+        if not healthy:
+            self.state.market_regime_alerts[symbol] = reason
+            if getattr(self, "state_store", None) is not None:
+                self.state_store.increment_operational_metric("market_data_health_failures", 1)
+            return None
+        try:
+            signal = self.signals.generate_signal(symbol)
+        except Exception as exc:
+            self.reporter.log_error(f"Signal generation failed for {symbol}: {type(exc).__name__}: {exc}")
+            self.state.market_regime_alerts[symbol] = "signal_generation_error"
+            if getattr(self, "state_store", None) is not None:
+                self.state_store.increment_operational_metric("signal_generation_failures", 1)
+            return None
+        if signal is None:
+            return None
+        if not self._signal_payload_is_tradeable(signal):
+            self.state.market_regime_alerts[symbol] = "untradeable_signal"
+            if getattr(self, "state_store", None) is not None:
+                self.state_store.increment_operational_metric("signal_reliability_rejections", 1)
+            return None
+        self.state.market_regime_alerts.pop(symbol, None)
+        return signal
+
+    @staticmethod
+    def _signal_payload_is_tradeable(signal: Dict[str, Any]) -> bool:
+        required = ("side", "entry_price", "stop_loss", "take_profit", "strategy")
+        for key in required:
+            if key not in signal:
+                return False
+        try:
+            entry_price = float(signal.get("entry_price", 0.0) or 0.0)
+            stop_loss = float(signal.get("stop_loss", 0.0) or 0.0)
+            take_profit = float(signal.get("take_profit", 0.0) or 0.0)
+            rr_ratio = float(signal.get("rr_ratio", 0.0) or 0.0)
+            signal_quality = float(signal.get("signal_quality", 0.0) or 0.0)
+        except Exception:
+            return False
+        if not all(math.isfinite(v) for v in (entry_price, stop_loss, take_profit, rr_ratio, signal_quality)):
+            return False
+        if entry_price <= 0 or stop_loss <= 0 or take_profit <= 0:
+            return False
+        side = str(signal.get("side", "")).lower()
+        if side in {"long", "buy"}:
+            return stop_loss < entry_price < take_profit
+        if side in {"short", "sell"}:
+            return stop_loss > entry_price > take_profit
+        return False
+
     def run_once(self):
         now = dt.datetime.now()
+        cycle_trace_id = new_trace_id()
+        if getattr(self, "state_store", None) is not None:
+            self.state_store.increment_operational_metric("runtime_hours", 1.0 / 60.0)
+        signals_generated = 0
+        signal_failures = 0
+        previous_health = dict(getattr(self.state, "health_summary", {}))
 
         # Daily reset for counters and equity
         self.risk.check_daily_reset()
+        self.last_reconciliation_status = self.reconciler.reconcile()
+        log_reconciliation(self, cycle_trace_id)
+        if self.metrics is not None:
+            self.metrics.set_reconciliation(self.last_reconciliation_status.ok)
+        if self.last_reconciliation_status and not self.last_reconciliation_status.ok:
+            if getattr(self, "state_store", None) is not None:
+                self.state_store.increment_operational_metric("reconciliation_failures", 1)
+            self.state.emergency_mode = True
+            decision = build_risk_decision(self)
+            log_risk_halt(self, cycle_trace_id, decision)
+            if self.metrics is not None:
+                self.metrics.inc_risk_halt(decision.reason)
+            if getattr(self, "state_store", None) is not None:
+                self.state_store.increment_operational_metric("risk_halts", 1)
+            self.reporter.mentor_log(
+                "Reconciliation mismatch detected. Trading halted until operator review."
+            )
+            self.save_state()
+            return
 
         # Track cooldown transitions for notifications
         in_cooldown_before = self.state.cooldown_until is not None and self.state.cooldown_until > now
@@ -2655,9 +3061,14 @@ class TradeBot:
 
             if dd <= -0.20:
                 self.state.emergency_mode = True
+                log_risk_halt(self, cycle_trace_id, build_risk_decision(self))
+                if self.metrics is not None:
+                    self.metrics.inc_risk_halt("max_drawdown")
+                if getattr(self, "state_store", None) is not None:
+                    self.state_store.increment_operational_metric("risk_halts", 1)
                 self.reporter.mentor_log(
-    f"Max drawdown reached ({
-        dd*100:.1f}%). Trading halted (emergency mode).")
+                    f"Max drawdown reached ({dd*100:.1f}%). Trading halted (emergency mode)."
+                )
                 self.save_state()
                 return
 
@@ -2682,20 +3093,40 @@ class TradeBot:
         # Daily loss limit
         if self.risk.check_daily_loss_limit():
             self.state.emergency_mode = True
+            log_risk_halt(self, cycle_trace_id, build_risk_decision(self))
+            if self.metrics is not None:
+                self.metrics.inc_risk_halt("daily_loss_limit")
+            if getattr(self, "state_store", None) is not None:
+                self.state_store.increment_operational_metric("risk_halts", 1)
             self.reporter.mentor_log(
                 "Daily loss limit reached. Trading halted for the rest of the day.")
             self.save_state()
             return
 
-        # ATR volatility spike check on BTC/USDT as global risk proxy
-        if self.signals.is_atr_spike(
-    "BTC/USDT",
-    timeframe="15m",
-    period=14,
-     spike_mult=3.0):
+        # Multi-coin volatility sweep across the configured symbol universe.
+        spiking_symbols = [
+            symbol for symbol in self.config.symbols
+            if self.signals.is_atr_spike(
+                symbol,
+                timeframe=self.config.timeframes.get("entry", "15m"),
+                period=14,
+                spike_mult=3.0,
+            )
+        ]
+        self.state.market_regime_alerts = {
+            symbol: "atr_spike" for symbol in spiking_symbols
+        }
+        if spiking_symbols:
             self.state.emergency_mode = True
+            log_risk_halt(self, cycle_trace_id, build_risk_decision(self))
+            if self.metrics is not None:
+                self.metrics.inc_risk_halt("atr_spike")
+            if getattr(self, "state_store", None) is not None:
+                self.state_store.increment_operational_metric("risk_halts", 1)
             self.reporter.mentor_log(
-                "ATR volatility spike detected on BTC/USDT (3x). Trading halted for the rest of the day."
+                "ATR volatility spike detected on "
+                + ", ".join(spiking_symbols[:5])
+                + ". Trading halted for the rest of the day."
             )
             self.save_state()
             return
@@ -2709,6 +3140,14 @@ class TradeBot:
 
         # Heartbeat (will send only if interval passed)
         self.reporter.heartbeat()
+        self.maybe_run_news_engine(now)
+        current_health = self._build_system_health_summary()
+        self._notify_health_transition(previous_health, current_health)
+        portfolio_snapshot = build_portfolio_snapshot(self)
+        if self.metrics is not None:
+            self.metrics.set_balance(self.state.balance)
+            self.metrics.set_open_positions(len(portfolio_snapshot.open_positions))
+            self.metrics.set_exposures(portfolio_snapshot.gross_exposure, portfolio_snapshot.net_exposure)
 
         # If in emergency mode -> observe only (no repeated spam message)
         if self.state.emergency_mode:
@@ -2732,11 +3171,24 @@ class TradeBot:
 
         for symbol in self.config.symbols:
             # We rely on generate_signal's internal filters
-            signal = self.signals.generate_signal(symbol)
+            signal = self._safe_generate_signal(symbol)
             if not signal:
+                if self.state.market_regime_alerts.get(symbol) == "signal_generation_error":
+                    signal_failures += 1
+                continue
+            signals_generated += 1
+            log_signal(self, cycle_trace_id, {"symbol": symbol, **signal})
+
+            if not self.risk.can_open_new_position(symbol):
                 continue
 
-            if not self.risk.can_open_new_position():
+            risk_decision = build_risk_decision(self, signal)
+            if not risk_decision.allowed:
+                log_risk_halt(self, cycle_trace_id, risk_decision)
+                if self.metrics is not None:
+                    self.metrics.inc_risk_halt(risk_decision.reason)
+                if getattr(self, "state_store", None) is not None:
+                    self.state_store.increment_operational_metric("risk_halts", 1)
                 continue
 
             side = signal.get("side")
@@ -2745,6 +3197,9 @@ class TradeBot:
             take_profit = signal.get("take_profit")
             fast_move = signal.get("fast_move", False)
             is_futures = signal.get("is_futures", False)
+            normalized_side = (side or "").lower()
+            if getattr(self.config, "trading_mode", "spot") == "spot" and normalized_side in ("short", "sell"):
+                continue
 
             # Enforce at most one LONG and one SHORT per symbol (no pyramiding
             # same side)
@@ -2768,6 +3223,21 @@ class TradeBot:
 
             size = self.risk.calc_position_size(
                 entry_price or 0, stop_loss or 0)
+            portfolio_decision = self.risk.evaluate_portfolio_risk(
+                symbol=symbol,
+                strategy=signal.get("strategy", "unknown"),
+                side=side or "buy",
+                entry_price=float(entry_price or 0),
+                proposed_size=float(size or 0),
+            )
+            if not portfolio_decision.allowed:
+                log_risk_halt(self, cycle_trace_id, portfolio_decision)
+                if self.metrics is not None:
+                    self.metrics.inc_risk_halt(portfolio_decision.reason)
+                if getattr(self, "state_store", None) is not None:
+                    self.state_store.increment_operational_metric("risk_halts", 1)
+                continue
+            size = float(portfolio_decision.capped_size or size)
             if size <= 0 or not entry_price or not stop_loss:
                 continue
 
@@ -2783,6 +3253,12 @@ class TradeBot:
             )
 
             if success:
+                if getattr(self, "state_store", None) is not None:
+                    self.state_store.set_operational_metric("consecutive_order_failures", 0)
+                fill_fraction = float(getattr(getattr(self.exec, "last_fill", None), "metadata", {}).get("fill_fraction", 1.0))
+                if self.metrics is not None:
+                    self.metrics.inc_order_success()
+                    self.metrics.observe_fill_ratio(fill_fraction)
                 side_str = (side or "buy").upper()
                 msg = (
                     f"Opened {side_str} on {symbol} with entry={entry_price}, "
@@ -2801,11 +3277,16 @@ class TradeBot:
                     size=size,
                     stop_loss=stop_loss or 0,
                     take_profit=take_profit or 0,
-                    strategy=signal.get('winning_strategy', 'unknown'),
+                    strategy=signal.get('strategy', 'unknown'),
                     is_futures=is_futures,
                     opened_at=dt.datetime.now(),
                     initial_stop_loss=stop_loss or 0,
                     initial_take_profit=take_profit or 0,
+                    metadata={
+                        "decision_context": self.learning.build_trade_context(signal),
+                        "signal_snapshot": signal,
+                        "opened_trace_id": cycle_trace_id,
+                    },
                 )
                 if symbol not in self.state.open_positions:
                     self.state.open_positions[symbol] = [new_pos]
@@ -2818,7 +3299,73 @@ class TradeBot:
                     else:
                         self.state.open_positions[symbol] = [new_pos]
 
+                emit_event(
+                    self,
+                    "position_updated",
+                    cycle_trace_id,
+                    {
+                        "symbol": symbol,
+                        "side": side or "buy",
+                        "size": size,
+                        "strategy": signal.get("strategy", "unknown"),
+                    },
+                )
                 self.save_state()
+            else:
+                attempts = int(getattr(self.exec, "last_execution_report", {}).get("attempts", 1))
+                for _ in range(max(attempts - 1, 0)):
+                    if self.metrics is not None:
+                        self.metrics.inc_order_retry()
+                if self.metrics is not None:
+                    self.metrics.inc_order_failure()
+                if getattr(self, "state_store", None) is not None:
+                    self.state_store.increment_operational_metric("consecutive_order_failures", 1)
+        if getattr(self, "state_store", None) is not None:
+            if signals_generated == 0:
+                no_signal_cycles = int(self.state_store.load_operational_metrics().get("no_signal_cycles", 0)) + 1
+                self.state_store.set_operational_metric("no_signal_cycles", no_signal_cycles)
+                alert_threshold = int(getattr(self.config, "no_signal_cycles_before_alert", 30))
+                if no_signal_cycles >= alert_threshold:
+                    self.state.market_regime_alerts["SYSTEM"] = "extended_no_signal_period"
+            else:
+                self.state_store.set_operational_metric("no_signal_cycles", 0)
+                self.state.market_regime_alerts.pop("SYSTEM", None)
+            max_signal_exceptions = int(getattr(self.config, "max_signal_exceptions_per_cycle", 2))
+            if signal_failures > max_signal_exceptions:
+                self.state.emergency_mode = True
+                self.state.market_regime_alerts["SYSTEM"] = "signal_engine_unhealthy"
+                self.state_store.increment_operational_metric("risk_halts", 1)
+                self._set_circuit_breaker("data_cooldown_until", int(getattr(self.config, "data_circuit_breaker_minutes", 30)))
+            consecutive_order_failures = int(self.state_store.load_operational_metrics().get("consecutive_order_failures", 0))
+            if consecutive_order_failures >= int(getattr(self.config, "max_consecutive_order_failures", 3)):
+                self.state.emergency_mode = True
+                self.state.market_regime_alerts["SYSTEM"] = "execution_unhealthy"
+                self.state_store.increment_operational_metric("risk_halts", 1)
+                self._set_circuit_breaker("execution_cooldown_until", int(getattr(self.config, "execution_circuit_breaker_minutes", 30)))
+            market_data_failures = int(self.state_store.load_operational_metrics().get("market_data_health_failures", 0))
+            if market_data_failures > 0 and signals_generated == 0:
+                self._set_circuit_breaker("data_cooldown_until", int(getattr(self.config, "data_circuit_breaker_minutes", 30)))
+            current_health = self._build_system_health_summary()
+            self._notify_health_transition(previous_health, current_health)
+        self.save_state()
+
+    def render_status_report(self) -> str:
+        health = self._build_system_health_summary()
+        lines = [
+            f"Balance: {self.state.balance:.2f} USDT",
+            f"Emergency mode: {health['emergency_mode']}",
+            f"Top blocker: {health['top_blocker']}",
+            f"Trade cooldown active: {health['trade_cooldown_active']}",
+            f"Data circuit breaker active: {health['data_circuit_breaker_active']}",
+            f"Execution circuit breaker active: {health['execution_circuit_breaker_active']}",
+            f"No-signal cycles: {health['no_signal_cycles']}",
+            f"Signal generation failures: {health['signal_generation_failures']}",
+            f"Market data health failures: {health['market_data_health_failures']}",
+            f"Consecutive order failures: {health['consecutive_order_failures']}",
+        ]
+        if health["ranked_blockers"]:
+            lines.append("Ranked blockers: " + ", ".join(health["ranked_blockers"]))
+        return "\n".join(lines)
 
     def manage_open_positions(self):
         """
@@ -2851,6 +3398,7 @@ class TradeBot:
             for pos in positions:
                 closed = False
                 close_price = None
+                exit_reason = "UNKNOWN"
 
                 # --- Dynamic risk management (long-only for now) ---
                 if pos.side == "long":
@@ -2880,18 +3428,22 @@ class TradeBot:
                     # Long: SL if low <= SL, TP if high >= TP
                     if last_low <= pos.stop_loss:
                         close_price = pos.stop_loss
+                        exit_reason = "SL"
                         closed = True
                     elif last_high >= pos.take_profit:
                         close_price = pos.take_profit
+                        exit_reason = "TP"
                         closed = True
 
                 elif pos.side == "short":
                     # Short: SL if high >= SL, TP if low <= TP
                     if last_high >= pos.stop_loss:
                         close_price = pos.stop_loss
+                        exit_reason = "SL"
                         closed = True
                     elif last_low <= pos.take_profit:
                         close_price = pos.take_profit
+                        exit_reason = "TP"
                         closed = True
 
                 if not closed:
@@ -2908,6 +3460,43 @@ class TradeBot:
 
                 self.state.balance += pl
                 self.risk.update_after_trade_result(pl)
+                self.learning.record_closed_trade(
+                    symbol=symbol,
+                    position=pos,
+                    close_price=close_price_val,
+                    profit_loss=pl,
+                    exit_reason=exit_reason,
+                    closed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                )
+                if getattr(self, "state_store", None) is not None:
+                    self.state_store.increment_operational_metric("closed_trades", 1)
+                    wins = float(self.state_store.load_operational_metrics().get("wins", 0.0))
+                    losses = float(self.state_store.load_operational_metrics().get("losses", 0.0))
+                    gross_profit = float(self.state_store.load_operational_metrics().get("gross_profit", 0.0))
+                    gross_loss = float(self.state_store.load_operational_metrics().get("gross_loss", 0.0))
+                    if pl >= 0:
+                        wins += 1.0
+                        gross_profit += pl
+                        self.state_store.set_operational_metric("wins", wins)
+                        self.state_store.set_operational_metric("gross_profit", gross_profit)
+                    else:
+                        losses += 1.0
+                        gross_loss += abs(pl)
+                        self.state_store.set_operational_metric("losses", losses)
+                        self.state_store.set_operational_metric("gross_loss", gross_loss)
+                    total = wins + losses
+                    win_rate = (wins / total * 100.0) if total > 0 else 0.0
+                    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else gross_profit
+                    peak_equity = float(self.state_store.load_operational_metrics().get("promotion_peak_equity", self.state.balance))
+                    if self.state.balance > peak_equity:
+                        peak_equity = self.state.balance
+                        self.state_store.set_operational_metric("promotion_peak_equity", peak_equity)
+                    max_drawdown_pct = 0.0
+                    if peak_equity > 0:
+                        max_drawdown_pct = abs(min((self.state.balance - peak_equity) / peak_equity * 100.0, 0.0))
+                    self.state_store.set_operational_metric("win_rate_pct", win_rate)
+                    self.state_store.set_operational_metric("profit_factor", profit_factor)
+                    self.state_store.set_operational_metric("max_drawdown_pct", max_drawdown_pct)
 
                 msg = (
                     f"Closed {pos.side.upper()} on {symbol} at {close_price} "
@@ -2922,80 +3511,55 @@ class TradeBot:
             else:
                 # Keep list for consistency
                 self.state.open_positions[symbol] = remaining_positions
-
         self.save_state()
+
+    def _request_shutdown(self, signum: int | None = None, frame: Any | None = None) -> None:
+        signal_name = None
+        if signum is not None:
+            try:
+                signal_name = signal.Signals(signum).name
+            except Exception:
+                signal_name = str(signum)
+        message = "Shutdown requested. Saving state and stopping loop."
+        if signal_name:
+            message = f"{message} Signal={signal_name}"
+        self.reporter.mentor_log(message, level="WARN", send_telegram=False)
+        self._shutdown_event.set()
+
+    def _register_signal_handlers(self) -> None:
+        if self._signal_handlers_registered:
+            return
+        for signame in ("SIGINT", "SIGTERM"):
+            sig = getattr(signal, signame, None)
+            if sig is None:
+                continue
+            try:
+                signal.signal(sig, self._request_shutdown)
+            except ValueError:
+                continue
+        self._signal_handlers_registered = True
 
     def run_forever(self, sleep_seconds: int = 60):
         mode = "PAPER MODE" if self.state.paper_mode else "LIVE TESTNET MODE"
         self.reporter.mentor_log(f"Starting passive 24/7 loop in {mode}.")
+        self._register_signal_handlers()
 
-        while True:
+        while not self._shutdown_event.is_set():
             try:
                 self.run_once()
+            except KeyboardInterrupt:
+                self._request_shutdown()
             except Exception as e:
                 err_msg = f"Error occurred: {e}"
                 self.reporter.log_error(err_msg)
                 print(err_msg)
-            time.sleep(sleep_seconds)
+            if self._shutdown_event.wait(max(int(sleep_seconds), 1)):
+                break
+        self.save_state()
+        self.reporter.mentor_log("Runtime loop stopped cleanly.", send_telegram=False)
 
-    @staticmethod
-    def run_backtest_cli(
-            symbol: str = 'BTC/USDT',
-            days: int = 180,
-            timeframe: str = '15m'):
-        """CLI entrypoint for backtesting."""
-        config = BotConfig(
-            starting_balance=10000.0,
-            telegram_bot_token="",
-            telegram_chat_id="",
-            api_key="",
-            api_secret="",
-        )
-
-        bt = BacktestEngine(config)
-        results = bt.run_backtest(symbol, timeframe, days)
-
-        # Save results
-        with open('backtest_results.json', 'w') as f:
-            json.dump(results, f, indent=2)
-
-        print("\n" + "="*60)
-        print("BACKTEST RESULTS:")
-        print("="*60)
-        for k, v in results.items():
-            if isinstance(v, float):
-                print(f"{k.replace('_', ' ').title()}: {v:.2f}")
-            else:
-                print(f"{k.replace('_', ' ').title()}: {v}")
-        print("\nFull results saved to backtest_results.json")
-        print("="*60)
-
-
+    
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AI Trading Bot: Live | Backtest | Hyperopt")
-    parser.add_argument('mode', choices=['live', 'backtest', 'hyperopt'], 
-                       help="live=paper trading, backtest=historical test, hyperopt=param optimization")
-    parser.add_argument('--symbol', default='BTC/USDT', help="Trading pair")
-    parser.add_argument('--days', type=int, default=90, help="Backtest/hyperopt days")
-    parser.add_argument('--timeframe', default='15m', help="Chart timeframe")
-    parser.add_argument('--combinations', type=int, help="Max hyperopt combinations")
-    
-    args = parser.parse_args()
-    
-    if args.mode == 'backtest':
-        run_backtest_cli(args.symbol, args.days, args.timeframe)
-    elif args.mode == 'hyperopt':
-        hyperopt = HyperoptEngine()
-        hyperopt.optimize(args.symbol, args.days, args.combinations)
-    else:  # live/paper trading
-        config = BotConfig(
-            starting_balance=50.0,
-            use_paper_trading=True,
-            telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
-            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
-            api_key=os.getenv("BINANCE_API_KEY"), 
-            api_secret=os.getenv("BINANCE_API_SECRET"),
-        )
-        config.validate()
-        bot = TradeBot(config)
-        bot.run_forever(60)
+    from trade_bot.cli import main as cli_main
+
+    cli_main()
