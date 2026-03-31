@@ -977,74 +977,102 @@ class SignalEngine:
             'momentum_scalp': 1.0
         }
 
-    def compute_hurst_exponent(
-    self,
-    symbol: str,
-    timeframe: str = "1h",
-     lookback: int = 50) -> float:
-        """Hurst Exponent classifier"""
-
-        candles: List[List[float]] = self.exch.fetch_ohlcv(
-            symbol, timeframe, limit=lookback * 2) or []
-        if not candles or len(candles) < lookback:
-            return 0.5  # neutral
-
-        prices: np.ndarray = np.array([float(c[4])
-                                      for c in candles[-lookback:]])  # closes
-        if np.std(prices) == 0:
+    def compute_hurst_exponent(self, symbol: str, timeframe: str = "1h", lookback: int = 100) -> float:
+        """
+        Hurst exponent becslése Detrended Fluctuation Analysis (DFA) módszerrel.
+        """
+        candles = self.exch.fetch_ohlcv(symbol, timeframe, limit=lookback * 2) or []
+        if len(candles) < lookback:
             return 0.5
-
-        # Simplified R/S analysis
-        lags = range(2, 20)
-        rs_values: List[float] = []
-
-        for lag in lags:
-            n = len(prices) // lag
-            if n < 4:
+        
+        prices = np.array([float(c[4]) for c in candles[-lookback:]])
+        log_prices = np.log(prices)
+        y = log_prices - np.mean(log_prices)
+        n = len(y)
+        
+        min_window = max(10, n // 20)
+        max_window = n // 4
+        if max_window <= min_window:
+            return 0.5
+        
+        window_sizes = np.unique(np.logspace(np.log10(min_window), np.log10(max_window), num=15, dtype=int))
+        fluctuations = []
+        
+        for w in window_sizes:
+            if w < 2 or w >= n:
                 continue
-
-            rs: List[float] = []
-            for i in range(n):
-                seg: np.ndarray = prices[i * lag:(i + 1) * lag]
-                if len(seg) < 4:
-                    continue
-                R = float(np.max(seg) - np.min(seg))
-                S = float(np.std(seg))
-                if S > 0:
-                    rs.append(float(np.log(R / S)))
-
-            if rs:
-                rs_values.append(float(np.mean(rs)))
-
-        if not rs_values:
+            n_segments = n // w
+            if n_segments < 2:
+                continue
+            
+            f2 = 0.0
+            for i in range(n_segments):
+                start = i * w
+                end = start + w
+                segment = y[start:end]
+                x = np.arange(w)
+                coeffs = np.polyfit(x, segment, 1)
+                trend = np.polyval(coeffs, x)
+                detrended = segment - trend
+                f2 += np.sum(detrended ** 2)
+            
+            f2 /= (n_segments * w)
+            fluctuations.append(np.sqrt(f2))
+        
+        if len(fluctuations) < 2:
             return 0.5
-
-        # Hurst ~ log(R/S) / log(lag) slope approximation
-        hurst = float(np.mean(rs_values))
-        return min(max(hurst, 0.2), 0.8)
+        
+        log_w = np.log(window_sizes[:len(fluctuations)])
+        log_f = np.log(fluctuations)
+        H, _ = np.polyfit(log_w, log_f, 1)
+        return np.clip(H, 0.0, 1.0)
 
     def get_market_regime(self, symbol: str) -> str:
-        "Returns regime string"
         hurst = self.compute_hurst_exponent(symbol)
-        adx_candles = self.exch.fetch_ohlcv(symbol, '1h', limit=25)
-        if not adx_candles:
+        
+        candles = self.exch.fetch_ohlcv(symbol, '1h', limit=50)
+        if not candles or len(candles) < 25:
             return 'choppy'
-
-        # Simplified ADX (trend strength)
-        highs, lows, closes = [
-    c[2] for c in adx_candles], [
-        c[3] for c in adx_candles], [
-            c[4] for c in adx_candles]
-        dm_plus = sum(max(h - hc, 0) for h, hc in zip(highs[1:], highs[:-1]))
-        dm_minus = sum(max(lc - l, 0) for l, lc in zip(lows[1:], lows[:-1]))
-        tr = sum(max(h - l, abs(h - pc), abs(l - pc))
-                 for h, l, pc in zip(highs[1:], lows[1:], closes[:-1]))
-
-        adx = 100 * abs(dm_plus - dm_minus) / tr if tr > 0 else 20
-
-        if hurst > 0.65 or adx > 30:
+        
+        highs = np.array([c[2] for c in candles])
+        lows = np.array([c[3] for c in candles])
+        closes = np.array([c[4] for c in candles])
+        
+        tr = np.maximum(highs[1:] - lows[1:],
+                        np.abs(highs[1:] - closes[:-1]),
+                        np.abs(lows[1:] - closes[:-1]))
+        
+        up_move = highs[1:] - highs[:-1]
+        down_move = lows[:-1] - lows[1:]
+        
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+        
+        period = 14
+        atr = np.mean(tr[-period:])
+        plus_di = 100 * np.mean(plus_dm[-period:]) / atr if atr > 0 else 20
+        minus_di = 100 * np.mean(minus_dm[-period:]) / atr if atr > 0 else 20
+        adx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di) if (plus_di + minus_di) > 0 else 20
+        
+        atr_15m = self.compute_atr(symbol, "15m", period=14)
+        current_price = closes[-1]
+        vol_ratio = atr_15m / current_price if atr_15m and current_price > 0 else 0
+        
+        VOL_CHOPPY_THRESHOLD = 0.005
+        TREND_HURST_THRESHOLD = 0.6
+        MEAN_REVERT_HURST_THRESHOLD = 0.4
+        TREND_ADX_THRESHOLD = 25
+        MEAN_REVERT_ADX_THRESHOLD = 20
+        
+        if vol_ratio < VOL_CHOPPY_THRESHOLD:
+            return 'choppy'
+        
+        is_trending = (hurst > TREND_HURST_THRESHOLD) or (adx > TREND_ADX_THRESHOLD)
+        is_mean_reverting = (hurst < MEAN_REVERT_HURST_THRESHOLD) or (adx < MEAN_REVERT_ADX_THRESHOLD)
+        
+        if is_trending and not is_mean_reverting:
             return 'trending'
-        elif hurst < 0.35 or adx < 15:
+        elif is_mean_reverting and not is_trending:
             return 'mean_reverting'
         else:
             return 'choppy'
