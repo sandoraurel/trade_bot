@@ -11,7 +11,9 @@ from .constants import DATA_DIR, LOG_DIR
 def resolve_runtime_base_dir() -> str:
     configured = os.getenv("TRADE_BOT_HOME", "").strip()
     if configured:
-        return os.path.abspath(configured)
+        candidate = os.path.abspath(configured)
+        if os.path.isdir(candidate) and os.access(candidate, os.W_OK):
+            return candidate
     return os.getcwd()
 
 
@@ -38,4 +40,3 @@ def getenv_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
-

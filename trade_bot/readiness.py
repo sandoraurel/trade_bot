@@ -33,6 +33,25 @@ def _next_mode(mode: str) -> str | None:
     return order[idx + 1]
 
 
+def _runtime_snapshot_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    if not snapshot:
+        return {}
+    readiness = snapshot.get("readiness", {}) or {}
+    metrics = readiness.get("metrics", {}) or {}
+    system_health = metrics.get("system_health", {}) or {}
+    risk = snapshot.get("risk", {}) or {}
+    portfolio = snapshot.get("portfolio", {}) or {}
+    return {
+        "snapshot_key": snapshot.get("snapshot_key", "runtime"),
+        "updated_at": snapshot.get("updated_at"),
+        "risk_reason": risk.get("reason", "ok"),
+        "risk_allowed": bool(risk.get("allowed", True)),
+        "top_blocker": system_health.get("top_blocker", "unknown"),
+        "gross_exposure": portfolio.get("gross_exposure", 0.0),
+        "open_positions": len(portfolio.get("open_positions", []) or []),
+    }
+
+
 def build_readiness_report(bot: Any) -> ReadinessReport:
     snapshot = bot.state_store.load_snapshot("runtime") if getattr(bot, "state_store", None) else {}
     operating_mode = getattr(bot.config, "operating_mode", "paper")
@@ -113,7 +132,7 @@ def build_readiness_report(bot: Any) -> ReadinessReport:
         summary=summary,
         gates=gates,
         metrics={
-            "runtime_snapshot": snapshot,
+            "runtime_snapshot": _runtime_snapshot_summary(snapshot),
             "runtime_hours": runtime_hours,
             "reconciliation_failures": reconciliation_failures,
             "risk_halts": risk_halts,

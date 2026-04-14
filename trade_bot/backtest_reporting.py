@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
 from typing import Any, Dict
 
 
@@ -35,3 +37,671 @@ def build_backtest_report(
 def save_backtest_report(path: str, report: Dict[str, Any]) -> None:
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2, sort_keys=True, default=str)
+
+
+def build_campaign_comparison(
+    baseline: Dict[str, Any],
+    candidate: Dict[str, Any],
+    *,
+    metrics: list[str] | None = None,
+) -> Dict[str, Any]:
+    def _value(item: Dict[str, Any], key: str) -> Any:
+        if key == "trades_per_day":
+            trade_frequency = dict(item.get("trade_frequency", {}) or {})
+            global_metrics = dict(trade_frequency.get("global", {}) or {})
+            return global_metrics.get("trades_per_day", global_metrics.get("closed_trades_per_day"))
+        if key == "strategy_family_mix":
+            return dict(item.get("signals_by_strategy", {}) or {})
+        if key == "symbol_mix":
+            return dict(item.get("raw_signals_by_symbol", {}) or {})
+        return item.get(key)
+
+    def _mix_delta(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, float]:
+        keys = sorted(set(dict(before or {})) | set(dict(after or {})))
+        return {
+            str(key): float(dict(after or {}).get(key, 0.0) or 0.0) - float(dict(before or {}).get(key, 0.0) or 0.0)
+            for key in keys
+        }
+
+    keys = metrics or [
+        "num_trades",
+        "trades_per_day",
+        "raw_signals",
+        "win_rate_pct",
+        "total_return_pct",
+        "profit_factor",
+        "max_drawdown_pct",
+        "avg_holding_minutes",
+        "strategy_family_mix",
+        "symbol_mix",
+    ]
+    comparison: Dict[str, Any] = {"metrics": {}, "acceptance": {}}
+    for key in keys:
+        before = _value(baseline, key)
+        after = _value(candidate, key)
+        delta = None
+        if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+            delta = after - before
+        elif isinstance(before, dict) and isinstance(after, dict):
+            delta = _mix_delta(before, after)
+        comparison["metrics"][key] = {
+            "baseline": before,
+            "candidate": after,
+            "delta": delta,
+        }
+
+    baseline_trades = float(baseline.get("num_trades", 0) or 0.0)
+    candidate_trades = float(candidate.get("num_trades", 0) or 0.0)
+    baseline_trades_per_day = float(_value(baseline, "trades_per_day") or 0.0)
+    candidate_trades_per_day = float(_value(candidate, "trades_per_day") or 0.0)
+    baseline_return = float(baseline.get("total_return_pct", 0.0) or 0.0)
+    candidate_return = float(candidate.get("total_return_pct", 0.0) or 0.0)
+    baseline_win_rate = float(baseline.get("win_rate_pct", 0.0) or 0.0)
+    candidate_win_rate = float(candidate.get("win_rate_pct", 0.0) or 0.0)
+    baseline_drawdown = float(baseline.get("max_drawdown_pct", 0.0) or 0.0)
+    candidate_drawdown = float(candidate.get("max_drawdown_pct", 0.0) or 0.0)
+    baseline_strategy_mix = dict(_value(baseline, "strategy_family_mix") or {})
+    candidate_strategy_mix = dict(_value(candidate, "strategy_family_mix") or {})
+    baseline_symbol_mix = dict(_value(baseline, "symbol_mix") or {})
+    candidate_symbol_mix = dict(_value(candidate, "symbol_mix") or {})
+    comparison["acceptance"] = {
+        "more_trades": candidate_trades > baseline_trades,
+        "trades_per_day_not_worse": candidate_trades_per_day >= baseline_trades_per_day,
+        "better_profit": candidate_return > baseline_return,
+        "win_rate_not_worse": candidate_win_rate >= baseline_win_rate,
+        "drawdown_not_worse": candidate_drawdown >= baseline_drawdown,
+        "strategy_mix_changed": baseline_strategy_mix != candidate_strategy_mix,
+        "symbol_mix_changed": baseline_symbol_mix != candidate_symbol_mix,
+        "passes_all": (
+            candidate_trades > baseline_trades
+            and candidate_trades_per_day >= baseline_trades_per_day
+            and candidate_return > baseline_return
+            and candidate_win_rate >= baseline_win_rate
+            and candidate_drawdown >= baseline_drawdown
+        ),
+    }
+    return comparison
+
+
+def build_batch_summary(reports: list[Dict[str, Any]], *, include_horizons: bool = True) -> Dict[str, Any]:
+    completed = [dict(report or {}) for report in reports if report]
+    if not completed:
+        return {"num_runs": 0, "status": "empty", "runs": []}
+    numeric_keys = [
+        "num_trades",
+        "raw_signals",
+        "win_rate_pct",
+        "total_return_pct",
+        "profit_factor",
+        "max_drawdown_pct",
+        "avg_holding_minutes",
+    ]
+    aggregates: Dict[str, Dict[str, Any]] = {}
+    for key in numeric_keys:
+        values = [float(item.get(key, 0.0) or 0.0) for item in completed if isinstance(item.get(key, 0.0), (int, float)) and math.isfinite(float(item.get(key, 0.0) or 0.0))]
+        if not values:
+            continue
+        aggregates[key] = {
+            "avg": sum(values) / len(values),
+            "min": min(values),
+            "max": max(values),
+            "latest": values[-1],
+        }
+    def _stddev(values: list[float]) -> float:
+        if len(values) <= 1:
+            return 0.0
+        mean = sum(values) / len(values)
+        return math.sqrt(sum((value - mean) ** 2 for value in values) / len(values))
+    decision_totals: Dict[str, Dict[str, int]] = {
+        "skip_reasons": {},
+        "signals_by_strategy": {},
+        "signals_by_order_type": {},
+        "submitted_by_strategy": {},
+        "submitted_by_order_type": {},
+        "filled_by_strategy": {},
+        "closed_by_strategy": {},
+        "closed_by_order_type": {},
+        "raw_signals_by_symbol": {},
+        "submitted_by_symbol": {},
+        "filled_by_symbol": {},
+        "closed_by_symbol": {},
+        "wins_by_symbol": {},
+        "losses_by_symbol": {},
+        "skipped_by_symbol": {},
+        "family_rotation_counts": {},
+        "family_rotation_recovery_counts": {},
+        "learning_evidence_counts": {},
+        "learning_asymmetry_counts": {},
+        "missed_opportunity_relaxations": {},
+        "reentry_cooldown_registrations": {},
+        "realized_performance_penalty_counts": {},
+        "realized_performance_no_trade_blocks": {},
+        "limit_to_market_upgrades_by_strategy": {},
+        "limit_queue_priority_assists_by_strategy": {},
+        "limit_latency_reductions_by_strategy": {},
+        "stale_market_escalations_by_strategy": {},
+        "repriced_by_strategy": {},
+        "touch_escalations_by_strategy": {},
+        "partial_profit_takes_by_strategy": {},
+    }
+    execution_totals: Dict[str, int] = {
+        "limit_to_market_upgrades": 0,
+        "limit_queue_priority_assists": 0,
+        "limit_latency_reductions": 0,
+        "stale_market_escalations": 0,
+        "repriced_orders": 0,
+        "touch_escalations": 0,
+        "partial_profit_takes": 0,
+    }
+    acceptance_totals: Dict[str, int] = {}
+    realized_performance: Dict[str, Dict[str, Dict[str, float]]] = {
+        "by_symbol": {},
+        "by_strategy": {},
+    }
+    exit_quality: Dict[str, Dict[str, Dict[str, float]]] = {
+        "by_exit_reason": {},
+        "giveback_by_strategy": {},
+    }
+    family_rotation_by_strategy: Dict[str, Dict[str, int]] = {}
+    family_rotation_recovery_by_strategy: Dict[str, Dict[str, int]] = {}
+    learning_evidence_by_strategy: Dict[str, Dict[str, int]] = {}
+    learning_asymmetry_by_strategy: Dict[str, Dict[str, int]] = {}
+    missed_opportunity_relaxations_by_strategy: Dict[str, Dict[str, int]] = {}
+    reentry_cooldown_registrations_by_strategy: Dict[str, Dict[str, int]] = {}
+    family_rotation_soft_by_strategy: Dict[str, Dict[str, int]] = {}
+    family_rotation_hard_by_strategy: Dict[str, Dict[str, int]] = {}
+    duplicate_bucket_throttle_by_strategy: Dict[str, int] = {}
+    weak_cluster_throttle_by_strategy: Dict[str, int] = {}
+    realized_performance_penalty_by_strategy: Dict[str, Dict[str, int]] = {}
+    realized_performance_no_trade_by_strategy: Dict[str, Dict[str, int]] = {}
+    skip_reasons_by_symbol: Dict[str, Dict[str, int]] = {}
+    expected_edge_by_symbol: Dict[str, Dict[str, float]] = {}
+    universe_selection: Dict[str, Any] = {
+        "eligible_symbols": {},
+        "rejected_symbols": {},
+        "eligible_buckets": {},
+        "rejected_buckets": {},
+        "bucket_cap_rejections": {},
+        "bucket_cap_rejections_by_bucket": {},
+        "eligible_bucket_pressure": {},
+        "realized_universe_promotions": {},
+        "realized_universe_penalties": {},
+        "realized_universe_adjustments_by_bucket": {},
+        "realized_universe_vetoes": {},
+        "realized_universe_vetoes_by_bucket": {},
+    }
+    for item in completed:
+        diagnostics = dict(item.get("decision_diagnostics", {}) or {})
+        campaign_summary = dict(item.get("campaign_summary", {}) or {})
+        realized_payload = dict(campaign_summary.get("realized_performance", {}) or {})
+        exit_quality_payload = dict(campaign_summary.get("exit_quality", {}) or {})
+        universe_payload = dict(campaign_summary.get("universe_selection", {}) or {})
+        acceptance_payload = dict(campaign_summary.get("acceptance", {}) or {})
+        symbol_rollups = dict(item.get("symbol_rollups", {}) or {})
+        for bucket in decision_totals:
+            payload = dict(diagnostics.get(bucket, {}) or {})
+            for key, value in payload.items():
+                decision_totals[bucket][str(key)] = int(decision_totals[bucket].get(str(key), 0)) + int(value or 0)
+        for key in execution_totals:
+            execution_totals[key] += int(diagnostics.get(key, 0) or 0)
+        for key, value in dict(acceptance_payload.get("checks", {}) or {}).items():
+            if bool(value):
+                acceptance_totals[str(key)] = int(acceptance_totals.get(str(key), 0)) + 1
+        if bool(acceptance_payload.get("passes_all", False)):
+            acceptance_totals["passes_all"] = int(acceptance_totals.get("passes_all", 0)) + 1
+        for bucket in ("by_symbol", "by_strategy"):
+            payload = dict(realized_payload.get(bucket, {}) or {})
+            for entity, metrics in payload.items():
+                target = realized_performance[bucket].setdefault(
+                    str(entity),
+                    {"trades": 0.0, "wins": 0.0, "losses": 0.0, "total_pl": 0.0},
+                )
+                metric_payload = dict(metrics or {})
+                target["trades"] += float(metric_payload.get("trades", 0.0) or 0.0)
+                target["wins"] += float(metric_payload.get("wins", 0.0) or 0.0)
+                target["losses"] += float(metric_payload.get("losses", 0.0) or 0.0)
+                target["total_pl"] += float(metric_payload.get("total_pl", 0.0) or 0.0)
+        exit_reason_payload = dict(exit_quality_payload.get("by_exit_reason", {}) or {})
+        for exit_reason, metrics in exit_reason_payload.items():
+            target = exit_quality["by_exit_reason"].setdefault(
+                str(exit_reason),
+                {
+                    "trades": 0.0,
+                    "wins": 0.0,
+                    "losses": 0.0,
+                    "total_pl": 0.0,
+                    "total_mfe_r": 0.0,
+                    "total_mae_r": 0.0,
+                    "total_giveback_r": 0.0,
+                },
+            )
+            metric_payload = dict(metrics or {})
+            target["trades"] += float(metric_payload.get("trades", 0.0) or 0.0)
+            target["wins"] += float(metric_payload.get("wins", 0.0) or 0.0)
+            target["losses"] += float(metric_payload.get("losses", 0.0) or 0.0)
+            target["total_pl"] += float(metric_payload.get("total_pl", 0.0) or 0.0)
+            target["total_mfe_r"] += float(metric_payload.get("total_mfe_r", 0.0) or 0.0)
+            target["total_mae_r"] += float(metric_payload.get("total_mae_r", 0.0) or 0.0)
+            target["total_giveback_r"] += float(metric_payload.get("total_giveback_r", 0.0) or 0.0)
+        giveback_payload = dict(exit_quality_payload.get("giveback_by_strategy", {}) or {})
+        for strategy, metrics in giveback_payload.items():
+            target = exit_quality["giveback_by_strategy"].setdefault(
+                str(strategy),
+                {
+                    "trades": 0.0,
+                    "total_giveback_r": 0.0,
+                    "mfe_above_1r_count": 0.0,
+                    "gave_back_below_0_25r_count": 0.0,
+                },
+            )
+            metric_payload = dict(metrics or {})
+            target["trades"] += float(metric_payload.get("trades", 0.0) or 0.0)
+            target["total_giveback_r"] += float(metric_payload.get("total_giveback_r", 0.0) or 0.0)
+            target["mfe_above_1r_count"] += float(metric_payload.get("mfe_above_1r_count", 0.0) or 0.0)
+            target["gave_back_below_0_25r_count"] += float(metric_payload.get("gave_back_below_0_25r_count", 0.0) or 0.0)
+        strategy_rotation_payload = dict(diagnostics.get("family_rotation_counts_by_strategy", {}) or {})
+        for strategy, reasons in strategy_rotation_payload.items():
+            target = family_rotation_by_strategy.setdefault(str(strategy), {})
+            for key, value in dict(reasons or {}).items():
+                reason_key = str(key)
+                target[reason_key] = int(target.get(reason_key, 0)) + int(value or 0)
+                severity_target = family_rotation_hard_by_strategy if reason_key.endswith("_hard") else family_rotation_soft_by_strategy
+                severity_bucket = severity_target.setdefault(str(strategy), {})
+                severity_bucket[reason_key] = int(severity_bucket.get(reason_key, 0)) + int(value or 0)
+        strategy_recovery_payload = dict(diagnostics.get("family_rotation_recovery_counts_by_strategy", {}) or {})
+        for strategy, reasons in strategy_recovery_payload.items():
+            target = family_rotation_recovery_by_strategy.setdefault(str(strategy), {})
+            for key, value in dict(reasons or {}).items():
+                target[str(key)] = int(target.get(str(key), 0)) + int(value or 0)
+        learning_evidence_payload = dict(diagnostics.get("learning_evidence_counts_by_strategy", {}) or {})
+        for strategy, reasons in learning_evidence_payload.items():
+            target = learning_evidence_by_strategy.setdefault(str(strategy), {})
+            for key, value in dict(reasons or {}).items():
+                target[str(key)] = int(target.get(str(key), 0)) + int(value or 0)
+        learning_asymmetry_payload = dict(diagnostics.get("learning_asymmetry_counts_by_strategy", {}) or {})
+        for strategy, reasons in learning_asymmetry_payload.items():
+            target = learning_asymmetry_by_strategy.setdefault(str(strategy), {})
+            for key, value in dict(reasons or {}).items():
+                target[str(key)] = int(target.get(str(key), 0)) + int(value or 0)
+        missed_opportunity_payload = dict(diagnostics.get("missed_opportunity_relaxations_by_strategy", {}) or {})
+        for strategy, reasons in missed_opportunity_payload.items():
+            target = missed_opportunity_relaxations_by_strategy.setdefault(str(strategy), {})
+            for key, value in dict(reasons or {}).items():
+                target[str(key)] = int(target.get(str(key), 0)) + int(value or 0)
+        reentry_cooldown_payload = dict(diagnostics.get("reentry_cooldown_registrations_by_strategy", {}) or {})
+        for strategy, reasons in reentry_cooldown_payload.items():
+            target = reentry_cooldown_registrations_by_strategy.setdefault(str(strategy), {})
+            for key, value in dict(reasons or {}).items():
+                target[str(key)] = int(target.get(str(key), 0)) + int(value or 0)
+        realized_penalty_payload = dict(diagnostics.get("realized_performance_penalty_counts_by_strategy", {}) or {})
+        for strategy, reasons in realized_penalty_payload.items():
+            target = realized_performance_penalty_by_strategy.setdefault(str(strategy), {})
+            for key, value in dict(reasons or {}).items():
+                target[str(key)] = int(target.get(str(key), 0)) + int(value or 0)
+        realized_no_trade_payload = dict(diagnostics.get("realized_performance_no_trade_blocks_by_strategy", {}) or {})
+        for strategy, reasons in realized_no_trade_payload.items():
+            target = realized_performance_no_trade_by_strategy.setdefault(str(strategy), {})
+            for key, value in dict(reasons or {}).items():
+                target[str(key)] = int(target.get(str(key), 0)) + int(value or 0)
+        strategy_skip_payload = dict(diagnostics.get("skip_reasons_by_strategy_by_symbol", {}) or {})
+        for symbol_counts in strategy_skip_payload.values():
+            for strategy, reasons in dict(symbol_counts or {}).items():
+                bucket_count = int(dict(reasons or {}).get("portfolio_duplicate_bucket_throttle", 0) or 0)
+                if bucket_count > 0:
+                    duplicate_bucket_throttle_by_strategy[str(strategy)] = int(duplicate_bucket_throttle_by_strategy.get(str(strategy), 0)) + bucket_count
+                weak_count = int(dict(reasons or {}).get("portfolio_persistently_weak_cluster_throttle", 0) or 0)
+                if weak_count > 0:
+                    weak_cluster_throttle_by_strategy[str(strategy)] = int(weak_cluster_throttle_by_strategy.get(str(strategy), 0)) + weak_count
+        symbol_payload = dict(diagnostics.get("skip_reasons_by_symbol", {}) or {})
+        for symbol, reasons in symbol_payload.items():
+            target = skip_reasons_by_symbol.setdefault(str(symbol), {})
+            for key, value in dict(reasons or {}).items():
+                target[str(key)] = int(target.get(str(key), 0)) + int(value or 0)
+        for symbol, payload in symbol_rollups.items():
+            trades = float(dict(payload or {}).get("trades", 0.0) or 0.0)
+            avg_edge_bps = float(dict(payload or {}).get("avg_edge_bps", 0.0) or 0.0)
+            target = expected_edge_by_symbol.setdefault(
+                str(symbol),
+                {"trades": 0.0, "weighted_edge_bps": 0.0},
+            )
+            target["trades"] += trades
+            target["weighted_edge_bps"] += avg_edge_bps * max(trades, 0.0)
+        for symbol in list(universe_payload.get("eligible_symbols", []) or []):
+            universe_selection["eligible_symbols"][str(symbol)] = int(universe_selection["eligible_symbols"].get(str(symbol), 0)) + 1
+            scored_payload = dict(universe_payload.get("scored_symbols", {}) or {}).get(str(symbol), {}) or {}
+            bucket = str(dict(scored_payload).get("bucket", "other") or "other")
+            universe_selection["eligible_buckets"][bucket] = int(universe_selection["eligible_buckets"].get(bucket, 0)) + 1
+            realized_adjustment = float(dict(scored_payload).get("realized_score_adjustment", 0.0) or 0.0)
+            if realized_adjustment > 0.0:
+                universe_selection["realized_universe_promotions"][str(symbol)] = int(universe_selection["realized_universe_promotions"].get(str(symbol), 0)) + 1
+                universe_selection["realized_universe_adjustments_by_bucket"][bucket] = int(universe_selection["realized_universe_adjustments_by_bucket"].get(bucket, 0)) + 1
+            elif realized_adjustment < 0.0:
+                universe_selection["realized_universe_penalties"][str(symbol)] = int(universe_selection["realized_universe_penalties"].get(str(symbol), 0)) + 1
+                universe_selection["realized_universe_adjustments_by_bucket"][bucket] = int(universe_selection["realized_universe_adjustments_by_bucket"].get(bucket, 0)) - 1
+        for bucket, value in dict(universe_payload.get("eligible_bucket_counts", {}) or {}).items():
+            bucket_key = str(bucket or "other")
+            universe_selection["eligible_bucket_pressure"][bucket_key] = int(universe_selection["eligible_bucket_pressure"].get(bucket_key, 0)) + int(value or 0)
+        for symbol, payload in dict(universe_payload.get("rejected_symbols", {}) or {}).items():
+            reason = str(dict(payload or {}).get("reason", "unknown") or "unknown")
+            key = f"{symbol}:{reason}"
+            universe_selection["rejected_symbols"][key] = int(universe_selection["rejected_symbols"].get(key, 0)) + 1
+            bucket = str(dict(payload or {}).get("bucket", "other") or "other")
+            universe_selection["rejected_buckets"][bucket] = int(universe_selection["rejected_buckets"].get(bucket, 0)) + 1
+            if reason == "bucket_cap_reached":
+                universe_selection["bucket_cap_rejections"][str(symbol)] = int(universe_selection["bucket_cap_rejections"].get(str(symbol), 0)) + 1
+                universe_selection["bucket_cap_rejections_by_bucket"][bucket] = int(universe_selection["bucket_cap_rejections_by_bucket"].get(bucket, 0)) + 1
+            if reason == "realized_negative_expectancy_veto":
+                universe_selection["realized_universe_vetoes"][str(symbol)] = int(universe_selection["realized_universe_vetoes"].get(str(symbol), 0)) + 1
+                universe_selection["realized_universe_vetoes_by_bucket"][bucket] = int(universe_selection["realized_universe_vetoes_by_bucket"].get(bucket, 0)) + 1
+    best_run = max(completed, key=lambda item: float(item.get("total_return_pct", float("-inf")) or float("-inf")))
+    worst_run = min(completed, key=lambda item: float(item.get("total_return_pct", float("inf")) or float("inf")))
+    baseline_run = completed[0]
+    latest_run = completed[-1]
+    median_index = len(completed) // 2
+    median_run = sorted(
+        completed,
+        key=lambda item: float(item.get("total_return_pct", 0.0) or 0.0),
+    )[median_index]
+    baseline_vs_latest = build_campaign_comparison(baseline_run, latest_run)
+    baseline_vs_median = build_campaign_comparison(baseline_run, median_run)
+    return_values = [float(item.get("total_return_pct", 0.0) or 0.0) for item in completed]
+    trades_values = [float(item.get("num_trades", 0.0) or 0.0) for item in completed]
+    win_rate_values = [float(item.get("win_rate_pct", 0.0) or 0.0) for item in completed]
+    stability = {
+        "return_range_pct": (max(return_values) - min(return_values)) if return_values else 0.0,
+        "return_stddev_pct": _stddev(return_values),
+        "trade_stddev": _stddev(trades_values),
+        "win_rate_stddev_pct": _stddev(win_rate_values),
+        "best_vs_median_return_gap_pct": float(best_run.get("total_return_pct", 0.0) or 0.0) - float(median_run.get("total_return_pct", 0.0) or 0.0),
+        "latest_vs_median_return_gap_pct": float(latest_run.get("total_return_pct", 0.0) or 0.0) - float(median_run.get("total_return_pct", 0.0) or 0.0),
+    }
+    for bucket in realized_performance.values():
+        for payload in bucket.values():
+            trades = float(payload.get("trades", 0.0) or 0.0)
+            wins = float(payload.get("wins", 0.0) or 0.0)
+            payload["expectancy"] = float(payload.get("total_pl", 0.0) or 0.0) / trades if trades else 0.0
+            payload["win_rate_pct"] = (wins / trades * 100.0) if trades else 0.0
+    for payload in exit_quality["by_exit_reason"].values():
+        trades = float(payload.get("trades", 0.0) or 0.0)
+        wins = float(payload.get("wins", 0.0) or 0.0)
+        payload["expectancy"] = float(payload.get("total_pl", 0.0) or 0.0) / trades if trades else 0.0
+        payload["win_rate_pct"] = (wins / trades * 100.0) if trades else 0.0
+        payload["avg_mfe_r"] = float(payload.get("total_mfe_r", 0.0) or 0.0) / trades if trades else 0.0
+        payload["avg_mae_r"] = float(payload.get("total_mae_r", 0.0) or 0.0) / trades if trades else 0.0
+        payload["avg_giveback_r"] = float(payload.get("total_giveback_r", 0.0) or 0.0) / trades if trades else 0.0
+    for payload in exit_quality["giveback_by_strategy"].values():
+        trades = float(payload.get("trades", 0.0) or 0.0)
+        payload["avg_giveback_r"] = float(payload.get("total_giveback_r", 0.0) or 0.0) / trades if trades else 0.0
+    failure_leaderboard: Dict[str, Any] = {
+        "top_skip_reasons": dict(sorted(decision_totals["skip_reasons"].items(), key=lambda item: item[1], reverse=True)[:5]),
+        "losing_families": {},
+        "losing_symbols": {},
+        "expected_vs_realized_edge_divergence": {},
+    }
+    losing_families = {
+        strategy: payload
+        for strategy, payload in realized_performance["by_strategy"].items()
+        if float(dict(payload or {}).get("expectancy", 0.0) or 0.0) < 0.0
+    }
+    losing_symbols = {
+        symbol: payload
+        for symbol, payload in realized_performance["by_symbol"].items()
+        if float(dict(payload or {}).get("expectancy", 0.0) or 0.0) < 0.0
+    }
+    failure_leaderboard["losing_families"] = {
+        strategy: {
+            "expectancy": float(dict(payload or {}).get("expectancy", 0.0) or 0.0),
+            "trades": float(dict(payload or {}).get("trades", 0.0) or 0.0),
+            "win_rate_pct": float(dict(payload or {}).get("win_rate_pct", 0.0) or 0.0),
+        }
+        for strategy, payload in sorted(
+            losing_families.items(),
+            key=lambda item: (float(dict(item[1] or {}).get("expectancy", 0.0) or 0.0), -float(dict(item[1] or {}).get("trades", 0.0) or 0.0)),
+        )[:5]
+    }
+    failure_leaderboard["losing_symbols"] = {
+        symbol: {
+            "expectancy": float(dict(payload or {}).get("expectancy", 0.0) or 0.0),
+            "trades": float(dict(payload or {}).get("trades", 0.0) or 0.0),
+            "win_rate_pct": float(dict(payload or {}).get("win_rate_pct", 0.0) or 0.0),
+        }
+        for symbol, payload in sorted(
+            losing_symbols.items(),
+            key=lambda item: (float(dict(item[1] or {}).get("expectancy", 0.0) or 0.0), -float(dict(item[1] or {}).get("trades", 0.0) or 0.0)),
+        )[:5]
+    }
+    divergence_rows: Dict[str, Dict[str, float | str]] = {}
+    for symbol, edge_payload in expected_edge_by_symbol.items():
+        realized_payload = dict(realized_performance["by_symbol"].get(symbol, {}) or {})
+        trades = float(edge_payload.get("trades", 0.0) or 0.0)
+        if trades <= 0.0:
+            continue
+        avg_edge_bps = float(edge_payload.get("weighted_edge_bps", 0.0) or 0.0) / trades
+        realized_expectancy = float(realized_payload.get("expectancy", 0.0) or 0.0)
+        if avg_edge_bps <= 0.0 or realized_expectancy >= 0.0:
+            continue
+        divergence_rows[symbol] = {
+            "avg_edge_bps": avg_edge_bps,
+            "realized_expectancy": realized_expectancy,
+            "trades": trades,
+            "divergence_score": avg_edge_bps * abs(realized_expectancy) * max(trades, 1.0),
+            "direction": "positive_expected_negative_realized",
+        }
+    failure_leaderboard["expected_vs_realized_edge_divergence"] = {
+        symbol: {
+            "avg_edge_bps": float(dict(payload or {}).get("avg_edge_bps", 0.0) or 0.0),
+            "realized_expectancy": float(dict(payload or {}).get("realized_expectancy", 0.0) or 0.0),
+            "trades": float(dict(payload or {}).get("trades", 0.0) or 0.0),
+            "direction": str(dict(payload or {}).get("direction", "")),
+        }
+        for symbol, payload in sorted(
+            divergence_rows.items(),
+            key=lambda item: float(dict(item[1] or {}).get("divergence_score", 0.0) or 0.0),
+            reverse=True,
+        )[:5]
+    }
+    by_horizon: Dict[str, Dict[str, Any]] = {}
+    walk_forward: Dict[str, Any] = {}
+    if include_horizons:
+        horizon_groups: Dict[str, list[Dict[str, Any]]] = {}
+        for item in completed:
+            campaign_summary = dict(item.get("campaign_summary", {}) or {})
+            session = dict(campaign_summary.get("session", {}) or {})
+            days = int(session.get("days", item.get("days", 0)) or 0)
+            if days > 0:
+                horizon_groups.setdefault(f"{days}d", []).append(item)
+        for label, runs in sorted(horizon_groups.items()):
+            by_horizon[label] = build_batch_summary(runs, include_horizons=False)
+        horizon_labels = sorted(
+            by_horizon.keys(),
+            key=lambda label: int(str(label).rstrip("d") or 0),
+        )
+        if len(horizon_labels) >= 2:
+            iteration_label = horizon_labels[0]
+            confirmation_label = horizon_labels[-1]
+            iteration_summary = dict(by_horizon.get(iteration_label, {}) or {})
+            confirmation_summary = dict(by_horizon.get(confirmation_label, {}) or {})
+            iteration_aggregates = dict(iteration_summary.get("aggregates", {}) or {})
+            confirmation_aggregates = dict(confirmation_summary.get("aggregates", {}) or {})
+
+            def _avg(payload: Dict[str, Any], key: str) -> float:
+                return float(dict(payload.get(key, {}) or {}).get("avg", 0.0) or 0.0)
+
+            iteration_return = _avg(iteration_aggregates, "total_return_pct")
+            confirmation_return = _avg(confirmation_aggregates, "total_return_pct")
+            iteration_trades = _avg(iteration_aggregates, "num_trades")
+            confirmation_trades = _avg(confirmation_aggregates, "num_trades")
+            iteration_win_rate = _avg(iteration_aggregates, "win_rate_pct")
+            confirmation_win_rate = _avg(confirmation_aggregates, "win_rate_pct")
+            iteration_label_days = max(int(iteration_label.rstrip("d") or 0), 1)
+            confirmation_label_days = max(int(confirmation_label.rstrip("d") or 0), 1)
+            iteration_trades_per_day = iteration_trades / iteration_label_days
+            confirmation_trades_per_day = confirmation_trades / confirmation_label_days
+            walk_forward = {
+                "iteration_horizon": iteration_label,
+                "confirmation_horizon": confirmation_label,
+                "metrics": {
+                    "trades_per_day": {
+                        "iteration": iteration_trades_per_day,
+                        "confirmation": confirmation_trades_per_day,
+                        "delta": confirmation_trades_per_day - iteration_trades_per_day,
+                    },
+                    "total_return_pct": {
+                        "iteration": iteration_return,
+                        "confirmation": confirmation_return,
+                        "delta": confirmation_return - iteration_return,
+                    },
+                    "win_rate_pct": {
+                        "iteration": iteration_win_rate,
+                        "confirmation": confirmation_win_rate,
+                        "delta": confirmation_win_rate - iteration_win_rate,
+                    },
+                },
+                "acceptance": {
+                    "confirmation_trades_per_day_not_worse": confirmation_trades_per_day >= iteration_trades_per_day,
+                    "confirmation_return_not_worse": confirmation_return >= iteration_return,
+                    "confirmation_win_rate_not_worse": confirmation_win_rate >= iteration_win_rate,
+                    "passes_all": (
+                        confirmation_trades_per_day >= iteration_trades_per_day
+                        and confirmation_return >= iteration_return
+                        and confirmation_win_rate >= iteration_win_rate
+                    ),
+                },
+            }
+    candidate_verdict_reasons: list[str] = []
+    if int(acceptance_totals.get("passes_all", 0) or 0) <= 0:
+        candidate_verdict_reasons.append("no_run_passed_acceptance")
+    if float(stability.get("return_stddev_pct", 0.0) or 0.0) > 1.0:
+        candidate_verdict_reasons.append("returns_unstable")
+    if float(stability.get("best_vs_median_return_gap_pct", 0.0) or 0.0) > 1.0:
+        candidate_verdict_reasons.append("best_run_far_above_median")
+    if not bool(dict(walk_forward.get("acceptance", {}) or {}).get("passes_all", True)):
+        candidate_verdict_reasons.append("confirmation_weaker_than_iteration")
+    if dict(failure_leaderboard.get("losing_families", {}) or {}):
+        candidate_verdict_reasons.append("losing_families_present")
+    if dict(failure_leaderboard.get("expected_vs_realized_edge_divergence", {}) or {}):
+        candidate_verdict_reasons.append("edge_realization_divergence_present")
+    if not candidate_verdict_reasons:
+        candidate_verdict = {
+            "status": "promising",
+            "reasons": ["passes_current_validation_checks"],
+        }
+    elif "no_run_passed_acceptance" in candidate_verdict_reasons:
+        candidate_verdict = {
+            "status": "not_ready",
+            "reasons": candidate_verdict_reasons,
+        }
+    else:
+        candidate_verdict = {
+            "status": "mixed",
+            "reasons": candidate_verdict_reasons,
+        }
+    fill_conversion_by_strategy: Dict[str, Dict[str, float]] = {}
+    strategy_names = sorted(
+        set(decision_totals.get("signals_by_strategy", {}) or {})
+        | set(decision_totals.get("submitted_by_strategy", {}) or {})
+        | set(decision_totals.get("filled_by_strategy", {}) or {})
+        | set(decision_totals.get("closed_by_strategy", {}) or {})
+    )
+    for strategy in strategy_names:
+        signals = int((decision_totals.get("signals_by_strategy", {}) or {}).get(strategy, 0) or 0)
+        submitted = int((decision_totals.get("submitted_by_strategy", {}) or {}).get(strategy, 0) or 0)
+        filled = int((decision_totals.get("filled_by_strategy", {}) or {}).get(strategy, 0) or 0)
+        closed = int((decision_totals.get("closed_by_strategy", {}) or {}).get(strategy, 0) or 0)
+        fill_conversion_by_strategy[str(strategy)] = {
+            "signals": signals,
+            "submitted": submitted,
+            "filled": filled,
+            "closed": closed,
+            "submit_rate_pct": (submitted / signals * 100.0) if signals > 0 else 0.0,
+            "fill_rate_pct": (filled / submitted * 100.0) if submitted > 0 else 0.0,
+            "close_rate_pct": (closed / submitted * 100.0) if submitted > 0 else 0.0,
+        }
+    return {
+        "num_runs": len(completed),
+        "status": "ok",
+        "aggregates": aggregates,
+        "decision_totals": decision_totals,
+        "execution_totals": execution_totals,
+        "acceptance_totals": acceptance_totals,
+        "stability": stability,
+        "failure_leaderboard": failure_leaderboard,
+        "realized_performance": realized_performance,
+        "exit_quality": exit_quality,
+        "family_rotation_by_strategy": family_rotation_by_strategy,
+        "family_rotation_soft_by_strategy": family_rotation_soft_by_strategy,
+        "family_rotation_hard_by_strategy": family_rotation_hard_by_strategy,
+        "family_rotation_recovery_by_strategy": family_rotation_recovery_by_strategy,
+        "learning_evidence_by_strategy": learning_evidence_by_strategy,
+        "learning_asymmetry_by_strategy": learning_asymmetry_by_strategy,
+        "missed_opportunity_relaxations_by_strategy": missed_opportunity_relaxations_by_strategy,
+        "reentry_cooldown_registrations_by_strategy": reentry_cooldown_registrations_by_strategy,
+        "duplicate_bucket_throttle_by_strategy": duplicate_bucket_throttle_by_strategy,
+        "weak_cluster_throttle_by_strategy": weak_cluster_throttle_by_strategy,
+        "realized_performance_penalty_by_strategy": realized_performance_penalty_by_strategy,
+        "realized_performance_no_trade_by_strategy": realized_performance_no_trade_by_strategy,
+        "fill_conversion_by_strategy": fill_conversion_by_strategy,
+        "universe_selection": universe_selection,
+        "skip_reasons_by_symbol": skip_reasons_by_symbol,
+        "comparisons": {
+            "baseline_vs_latest": {
+                "baseline_artifact_dir": baseline_run.get("artifact_dir"),
+                "candidate_artifact_dir": latest_run.get("artifact_dir"),
+                **baseline_vs_latest,
+            },
+            "baseline_vs_median": {
+                "baseline_artifact_dir": baseline_run.get("artifact_dir"),
+                "candidate_artifact_dir": median_run.get("artifact_dir"),
+                **baseline_vs_median,
+            },
+        },
+        "best_run": {
+            "artifact_dir": best_run.get("artifact_dir"),
+            "total_return_pct": best_run.get("total_return_pct"),
+            "num_trades": best_run.get("num_trades"),
+            "win_rate_pct": best_run.get("win_rate_pct"),
+        },
+        "median_run": {
+            "artifact_dir": median_run.get("artifact_dir"),
+            "total_return_pct": median_run.get("total_return_pct"),
+            "num_trades": median_run.get("num_trades"),
+            "win_rate_pct": median_run.get("win_rate_pct"),
+        },
+        "worst_run": {
+            "artifact_dir": worst_run.get("artifact_dir"),
+            "total_return_pct": worst_run.get("total_return_pct"),
+            "num_trades": worst_run.get("num_trades"),
+            "win_rate_pct": worst_run.get("win_rate_pct"),
+        },
+        "by_horizon": by_horizon,
+        "walk_forward": walk_forward,
+        "candidate_verdict": candidate_verdict,
+        "runs": [
+            {
+                "artifact_dir": item.get("artifact_dir"),
+                "num_trades": item.get("num_trades"),
+                "raw_signals": item.get("raw_signals"),
+                "win_rate_pct": item.get("win_rate_pct"),
+                "total_return_pct": item.get("total_return_pct"),
+                "profit_factor": item.get("profit_factor"),
+                "max_drawdown_pct": item.get("max_drawdown_pct"),
+                "days": int(dict(dict(item.get("campaign_summary", {}) or {}).get("session", {}) or {}).get("days", item.get("days", 0)) or 0),
+            }
+            for item in completed
+        ],
+    }
+
+
+def load_batch_reports(runs_dir: str) -> list[Dict[str, Any]]:
+    if not os.path.isdir(runs_dir):
+        return []
+    reports: list[Dict[str, Any]] = []
+    for name in sorted(os.listdir(runs_dir)):
+        report_path = os.path.join(runs_dir, name, "report.json")
+        if not os.path.exists(report_path):
+            continue
+        with open(report_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        payload.setdefault("artifact_dir", os.path.join(runs_dir, name))
+        reports.append(payload)
+    return reports

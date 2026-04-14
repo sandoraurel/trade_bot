@@ -2,6 +2,13 @@
 /.venv/
 /data/
 /logs/
+/bot_state.json
+/bot_runtime.sqlite3
+/*.sqlite3
+/.DS_Store
+**/.DS_Store
+*.zip
+trade-bot-secrets-and-state*/
 __pycache__/
 *.pyc
 trade_bot/.env

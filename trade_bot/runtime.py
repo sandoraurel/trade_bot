@@ -153,6 +153,7 @@ def persist_runtime_snapshot(bot: Any, trace_id: str) -> None:
         "strategy_health": [asdict(item) for item in build_strategy_health(bot)],
         "execution": getattr(bot.exec, "last_execution_report", {}),
         "event_risk": bot.news_engine.event_risk_snapshot() if getattr(bot, "news_engine", None) is not None else {},
+        "learning": bot.learning.summary_snapshot() if getattr(bot, "learning", None) is not None else {},
         "readiness": asdict(build_readiness_report(bot)) if getattr(bot, "state_store", None) is not None else {},
     }
     bot.state_store.persist_snapshot(snapshot)

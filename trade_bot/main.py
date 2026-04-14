@@ -11,7 +11,7 @@ import sys
 from typing import Optional, Dict, Any, List
 import argparse
 import warnings
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Sequence
 import time
 import datetime as dt
 import random
@@ -22,14 +22,15 @@ from trade_bot.ai.assistant import BotOperatorAssistant, ensure_default_knowledg
 from trade_bot.backtest_reporting import build_backtest_report, save_backtest_report
 from trade_bot.bootstrap import ensure_runtime_directories, load_runtime_environment, resolve_runtime_base_dir
 from trade_bot.audit import JsonlDecisionLogger
-from trade_bot.constants import DATA_DIR, EVENT_LOG_FILE, LOG_DIR, STATE_DB_FILE, STATE_FILE
+from trade_bot.constants import DATA_DIR, EVENT_LOG_FILE, LEARNING_DB_FILE, LOG_DIR, STATE_DB_FILE, STATE_FILE
 from trade_bot.config import BotConfig as CoreBotConfig
 from trade_bot.execution import ExecutionEngine as CoreExecutionEngine
 from trade_bot.exchange import ExchangeClient as CoreExchangeClient, MockExchange as CoreMockExchange
 from trade_bot.learning import TradeLearningEngine
 from trade_bot.ensemble import EnsembleAllocator
 from trade_bot.news_engine import BinanceNewsEngine
-from trade_bot.persistence import load_bot_state, save_bot_state
+from trade_bot.persistence import _sanitize_jsonish, load_bot_state, save_bot_state
+from trade_bot.process_service import write_bot_status
 from trade_bot.readiness import build_readiness_report
 from trade_bot.reconciliation import BotReconciler
 from trade_bot.regime import MarketRegimeEngine
@@ -46,7 +47,7 @@ from trade_bot.runtime import (
     persist_runtime_snapshot,
 )
 from trade_bot.state import BotState as CoreBotState, Position as CorePosition
-from trade_bot.state_store import SQLiteStateStore
+from trade_bot.state_store import PersistentLearningStore, SQLiteStateStore, backfill_learning_from_sqlite_artifacts
 from trade_bot.strategies import build_strategies
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
@@ -296,7 +297,73 @@ class BotConfig:
     allow_countertrend_in_chop: bool = True
     breakout_swing_lookback: int = 5
     breakout_rr_ratio: float = 2.2
+    breakout_confirmed_rr_ratio: float = 1.9
+    breakout_retest_rr_ratio: float = 1.7
+    breakout_confirm_close_atr_fraction: float = 0.05
+    breakout_max_stretch: float = 0.045
+    breakout_retest_entry_buffer_atr_fraction: float = 0.04
+    breakout_retest_expiry_bars: int = 10
+    breakout_confirmed_market_rr_ratio: float = 1.55
+    breakout_confirmed_market_min_body_fraction: float = 0.58
+    breakout_confirmed_market_min_close_location_long: float = 0.72
+    breakout_confirmed_market_max_close_location_short: float = 0.28
+    breakout_confirmed_market_min_breakout_atr: float = 0.12
+    breakout_confirmed_market_max_stretch: float = 0.032
+    breakout_confirmed_market_min_continuation_score: float = 1.58
+    breakout_confirmed_market_min_breakout_score: float = 1.62
+    breakout_confirmed_market_min_trend_persistence: float = 0.44
+    breakout_confirmed_market_min_volume_impulse: float = 1.08
+    breakout_confirmed_market_min_trend_efficiency: float = 0.34
+    breakout_post_shock_drawdown_floor: float = -0.045
+    breakout_post_shock_rebound_floor: float = 0.012
+    breakout_post_shock_crash_risk_floor: float = 0.60
+    breakout_weak_confirmation_penalty_bps: float = 5.0
+    pullback_ema_fast_period: int = 8
+    pullback_ema_slow_period: int = 21
+    pullback_entry_atr_fraction: float = 0.35
+    pullback_confirmation_buffer_atr_fraction: float = 0.08
+    pullback_shallow_rr_ratio: float = 1.35
+    pullback_deep_rr_ratio: float = 1.2
+    pullback_max_stretch: float = 0.035
+    pullback_shallow_min_pullback_score: float = 1.24
+    pullback_shallow_min_trend_persistence: float = 0.38
+    pullback_deep_min_continuation_score: float = 1.58
+    pullback_shallow_max_volatility_percentile: float = 0.72
+    pullback_deep_max_volatility_percentile: float = 0.88
+    pullback_deep_min_trend_efficiency: float = 0.16
+    pullback_deep_min_volume_impulse: float = 0.92
+    pullback_reclaim_body_fraction_min: float = 0.18
+    pullback_reclaim_close_location_min: float = 0.24
+    pullback_reclaim_close_location_max: float = 0.76
+    pullback_reclaim_buffer_atr_fraction: float = 0.04
     min_signal_quality_score: float = 0.55
+    min_reliable_regime_confidence: float = 0.54
+    min_reliable_rr_ratio_trend: float = 1.35
+    min_reliable_rr_ratio_mean_reversion: float = 1.10
+    rotation_reliability_quality_delta: float = 0.03
+    rotation_reliability_edge_delta_bps: float = 1.5
+    rotation_reliability_rr_delta: float = 0.06
+    rotation_pullback_reliability_quality_delta: float = 0.12
+    rotation_pullback_reliability_edge_delta_bps: float = 9.0
+    rotation_pullback_reliability_rr_delta: float = 0.30
+    rotation_risk_preferred_multiplier: float = 1.06
+    rotation_risk_suppressed_multiplier: float = 0.90
+    min_hurst_for_trend_breakout: float = 0.16
+    min_hurst_for_trend_pullback: float = 0.18
+    max_hurst_for_mean_reversion: float = 0.60
+    mean_reversion_entry_zscore: float = 1.10
+    mean_reversion_max_efficiency: float = 0.48
+    mean_reversion_min_exhaustion_score: float = 0.42
+    mean_reversion_min_rebound_strength: float = 0.12
+    mean_reversion_min_fade_strength: float = 0.12
+    mean_reversion_liquid_relaxed_liquidity_score: float = 0.78
+    mean_reversion_liquid_relaxed_efficiency_bonus: float = 0.06
+    mean_reversion_liquid_relaxed_exhaustion_delta: float = 0.05
+    mean_reversion_liquid_relaxed_rebound_delta: float = 0.03
+    mean_reversion_liquid_relaxed_fade_delta: float = 0.03
+    mean_reversion_countertrend_continuation_score: float = 1.28
+    mean_reversion_countertrend_efficiency_floor: float = 0.34
+    mean_reversion_countertrend_trend_strength_floor: float = 0.010
     # 👉 ALAPÉRTELMEZETTEN NEM PAPERMÓD
     use_paper_trading: bool = False
     # Execution mode
@@ -317,6 +384,44 @@ class BotConfig:
     trailing_atr_mult: float = 1.0  # trail distance = ATR * mult
     trailing_atr_period: int = 14  # ATR period for trailing
     trailing_timeframe: str = "15m"  # timeframe to compute trailing ATR
+    trailing_breakout_rr: float = 1.10
+    trailing_pullback_rr: float = 1.80
+    trailing_mean_reversion_rr: float = 2.50
+    trailing_breakout_atr_mult: float = 0.85
+    trailing_pullback_atr_mult: float = 1.20
+    trailing_mean_reversion_atr_mult: float = 1.35
+    profit_protect_breakout_trigger_rr: float = 0.75
+    profit_protect_pullback_trigger_rr: float = 1.10
+    profit_protect_mean_reversion_trigger_rr: float = 0.60
+    profit_protect_breakout_lock_rr: float = 0.20
+    profit_protect_pullback_lock_rr: float = 0.10
+    profit_protect_mean_reversion_lock_rr: float = 0.18
+    mean_reversion_profit_capture_trigger_rr: float = 0.45
+    mean_reversion_profit_capture_lock_rr: float = 0.30
+    mean_reversion_reclaim_failure_activation_rr: float = 0.25
+    mean_reversion_reclaim_failure_buffer_rr: float = 0.05
+    partial_profit_take_breakout_trigger_rr: float = 1.00
+    partial_profit_take_breakout_fraction: float = 0.35
+    partial_profit_take_mean_reversion_trigger_rr: float = 0.70
+    partial_profit_take_mean_reversion_fraction: float = 0.50
+    mean_reversion_reclaim_failure_cooldown_bars: int = 6
+    breakout_volatility_exit_cooldown_bars: int = 8
+    volatility_tightening_trigger_ratio: float = 1.30
+    volatility_tightening_breakout_rr: float = 0.30
+    volatility_tightening_pullback_rr: float = 0.12
+    volatility_tightening_mean_reversion_rr: float = 0.22
+    time_stop_soft_holding_multiplier: float = 1.35
+    time_stop_soft_min_r_multiple: float = 0.15
+    time_stop_hard_holding_multiplier: float = 2.25
+    time_stop_hard_min_r_multiple: float = 0.45
+    time_stop_breakout_soft_multiplier: float = 0.85
+    time_stop_breakout_hard_multiplier: float = 0.80
+    time_stop_pullback_soft_multiplier: float = 1.15
+    time_stop_pullback_hard_multiplier: float = 1.20
+    min_signal_quality_score_pullback: float = 0.62
+    min_reliable_rr_ratio_pullback: float = 1.55
+    time_stop_mean_reversion_soft_multiplier: float = 0.80
+    time_stop_mean_reversion_hard_multiplier: float = 0.75
     # Dashboard times (local)
     morning_hour: int = 8
     evening_hour: int = 20
@@ -364,6 +469,201 @@ class BotConfig:
     # If True -> public_client.set_sandbox_mode(True)
     # If False -> public_client uses mainnet (api.binance.com)
     use_testnet_public: bool = True
+    simulation_random_seed: int = 7
+    simulation_latency_jitter_bars: int = 0
+    simulation_limit_order_expiry_bars: int = 4
+    simulation_stale_order_cancel_bars: int = 3
+    simulation_stale_order_cancel_distance_bps: float = 18.0
+    simulation_stale_order_reprice_max_attempts: int = 1
+    simulation_stale_order_reprice_quality_floor: float = 0.68
+    simulation_stale_order_reprice_edge_floor_bps: float = 16.0
+    simulation_stale_order_reprice_offset_bps: float = 6.0
+    simulation_stale_order_reprice_extension_bars: int = 2
+    simulation_stale_order_reprice_early_bars_delta: int = 1
+    simulation_stale_order_reprice_early_quality_floor: float = 0.76
+    simulation_stale_order_reprice_early_edge_floor_bps: float = 22.0
+    simulation_stale_order_extra_reprice_quality_floor: float = 0.76
+    simulation_stale_order_extra_reprice_edge_floor_bps: float = 20.0
+    simulation_breakout_stale_order_extra_reprice_quality_floor: float = 0.80
+    simulation_breakout_stale_order_extra_reprice_edge_floor_bps: float = 24.0
+    simulation_limit_latency_reduction_quality_floor: float = 0.76
+    simulation_limit_latency_reduction_edge_floor_bps: float = 20.0
+    simulation_breakout_limit_latency_reduction_quality_floor: float = 0.80
+    simulation_breakout_limit_latency_reduction_edge_floor_bps: float = 24.0
+    simulation_limit_queue_priority_quality_floor: float = 0.74
+    simulation_limit_queue_priority_edge_floor_bps: float = 18.0
+    simulation_breakout_limit_queue_priority_quality_floor: float = 0.78
+    simulation_breakout_limit_queue_priority_edge_floor_bps: float = 22.0
+    simulation_stale_market_escalation_quality_floor: float = 0.76
+    simulation_stale_market_escalation_edge_floor_bps: float = 20.0
+    simulation_breakout_stale_market_escalation_quality_floor: float = 0.80
+    simulation_breakout_stale_market_escalation_edge_floor_bps: float = 24.0
+    simulation_volume_participation_rate: float = 0.20
+    simulation_slippage_volatility_weight: float = 0.12
+    simulation_volume_impact_weight: float = 0.10
+    simulation_market_impact_exponent: float = 0.5
+    simulation_market_impact_weight: float = 0.08
+    simulation_passive_fill_spread_capture: float = 0.20
+    simulation_queue_decay: float = 0.55
+    simulation_aggressive_entry_quality_floor: float = 0.72
+    simulation_aggressive_entry_edge_floor_bps: float = 18.0
+    simulation_aggressive_entry_max_distance_bps: float = 14.0
+    simulation_aggressive_entry_rr_floor: float = 1.45
+    simulation_breakout_aggressive_entry_quality_floor: float = 0.80
+    simulation_breakout_aggressive_entry_edge_floor_bps: float = 26.0
+    simulation_breakout_aggressive_entry_max_distance_bps: float = 8.0
+    simulation_breakout_aggressive_entry_rr_floor: float = 1.70
+    simulation_pullback_limit_offset_bps: float = 4.0
+    simulation_mean_reversion_limit_offset_bps: float = 7.0
+    simulation_high_quality_limit_offset_tightening_bps: float = 2.0
+    simulation_high_quality_limit_quality_floor: float = 0.76
+    simulation_high_quality_limit_edge_floor_bps: float = 22.0
+    simulation_limit_offset_stop_distance_cap_fraction: float = 0.22
+    simulation_pullback_limit_expiry_bonus_bars: int = 2
+    simulation_breakout_limit_expiry_bonus_bars: int = 1
+    simulation_mean_reversion_limit_expiry_bonus_bars: int = 1
+    simulation_expiry_bonus_quality_floor: float = 0.70
+    simulation_touch_escalation_min_touches: int = 2
+    simulation_touch_escalation_quality_floor: float = 0.74
+    simulation_touch_escalation_edge_floor_bps: float = 20.0
+    simulation_breakout_touch_escalation_min_touches: int = 1
+    simulation_breakout_touch_escalation_quality_floor: float = 0.82
+    simulation_breakout_touch_escalation_edge_floor_bps: float = 28.0
+    simulation_no_trade_buffer_bps: float = 1.5
+    simulation_no_trade_crowding_penalty_bps: float = 4.0
+    simulation_symbol_crowding_penalty: float = 14.0
+    simulation_family_crowding_penalty: float = 7.5
+    simulation_bucket_crowding_penalty: float = 5.0
+    simulation_directional_cluster_penalty: float = 6.0
+    simulation_diversification_bonus: float = 3.5
+    simulation_bucket_diversification_bonus: float = 2.5
+    min_expected_edge_bps_pullback: float = 15.0
+    simulation_duplicate_family_throttle_score_gap: float = 3.0
+    simulation_duplicate_bucket_throttle_score_gap: float = 2.5
+    simulation_learning_score_weight: float = 1.0
+    simulation_learning_negative_penalty: float = 2.5
+    simulation_realized_perf_min_trades: int = 2
+    simulation_realized_symbol_penalty_score: float = 5.0
+    simulation_realized_strategy_penalty_score: float = 4.0
+    simulation_realized_negative_expectancy_floor: float = -1.0
+    simulation_realized_positive_expectancy_floor: float = 1.0
+    simulation_realized_symbol_positive_score: float = 2.5
+    simulation_realized_strategy_positive_score: float = 2.0
+    simulation_realized_no_trade_penalty_bps: float = 3.0
+    simulation_pullback_realized_symbol_penalty_score: float = 3.0
+    simulation_pullback_realized_symbol_no_trade_penalty_bps: float = 2.0
+    simulation_weak_cluster_min_trades: int = 2
+    simulation_weak_cluster_negative_expectancy_floor: float = -1.0
+    simulation_universe_top_n: int = 6
+    simulation_universe_tradability_floor: float = 45.0
+    simulation_universe_spread_penalty_weight: float = 1.4
+    simulation_universe_volatility_penalty_weight: float = 60.0
+    simulation_universe_volume_score_weight: float = 4.0
+    simulation_universe_bucket_cap: int = 2
+    simulation_universe_bucket_cap_majors: int = 2
+    simulation_universe_bucket_cap_exchange_beta: int = 2
+    simulation_universe_bucket_cap_high_beta_alts: int = 2
+    simulation_universe_bucket_cap_slower_large_caps: int = 2
+    simulation_universe_bucket_cap_other: int = 2
+    simulation_universe_regime_lookback_bars: int = 20
+    simulation_universe_regime_high_vol_threshold: float = 0.02
+    simulation_universe_regime_trend_strength_threshold: float = 0.015
+    simulation_universe_regime_trend_exchange_beta_delta: int = 0
+    simulation_universe_regime_trend_high_beta_delta: int = 0
+    simulation_universe_regime_risk_off_exchange_beta_delta: int = 0
+    simulation_universe_regime_risk_off_high_beta_delta: int = 0
+    simulation_universe_regime_risk_off_slower_large_caps_delta: int = 0
+    simulation_universe_regime_risk_off_other_delta: int = 0
+    simulation_universe_realized_min_trades: int = 2
+    simulation_universe_realized_negative_expectancy_floor: float = -1.0
+    simulation_universe_realized_positive_expectancy_floor: float = 1.0
+    simulation_universe_realized_penalty_score: float = 10.0
+    simulation_universe_realized_boost_score: float = 5.0
+    simulation_universe_realized_veto_min_trades: int = 2
+    simulation_universe_realized_veto_expectancy_floor: float = -8.0
+    simulation_symbol_probation_veto_min_trades: int = 1
+    simulation_symbol_probation_veto_expectancy_floor: float = -20.0
+    simulation_disable_trend_pullback: bool = False
+    simulation_pullback_strategy_veto_min_trades: int = 2
+    simulation_pullback_strategy_veto_expectancy_floor: float = -20.0
+    simulation_snapshot_interval_bars: int = 250
+    simulation_checkpoint_interval_bars: int = 250
+    simulation_enable_checkpointing: bool = True
+    simulation_resume_from_checkpoint: bool = True
+    target_trades_per_day_min: float = 2.0
+    target_trades_per_day_max: float = 3.0
+    target_trades_per_day_soft_floor: float = 1.5
+    target_trades_per_day_soft_ceiling: float = 3.5
+    simulation_stress_every_n_bars: int = 0
+    simulation_stress_shock_bps: float = 0.0
+    simulation_queue_model: str = "fractional_queue"
+    learning_decay_half_life_days: float = 45.0
+    learning_prior_strength: float = 5.0
+    learning_min_effective_samples: float = 3.0
+    learning_negative_score_cap: float = 9.0
+    learning_positive_score_cap: float = 5.0
+    learning_confidence_penalty_cap: float = 0.08
+    learning_confidence_boost_cap: float = 0.04
+    learning_min_risk_multiplier: float = 0.72
+    learning_max_risk_multiplier: float = 1.10
+    learning_severe_pattern_samples: float = 10.0
+    learning_structural_veto_ratio: float = 0.82
+    learning_severe_avg_r_multiple: float = -0.85
+    learning_drift_ewma_alpha: float = 0.12
+    learning_drift_threshold: float = 2.8
+    learning_drift_slack: float = 0.15
+    learning_drift_cusum_decay: float = 0.92
+    learning_calibration_prior_strength: float = 6.0
+    learning_calibration_gap_alpha: float = 0.15
+    learning_positive_update_min_samples: float = 8.0
+    learning_positive_update_max_calibration_gap: float = 0.18
+    learning_opportunity_min_samples: float = 6.0
+    learning_positive_opportunity_min_samples: float = 6.0
+    learning_positive_opportunity_avg_forward_r: float = 0.22
+    learning_positive_opportunity_positive_ratio: float = 0.55
+    learning_missed_opportunity_min_samples: float = 4.0
+    learning_missed_opportunity_avg_forward_r: float = 0.18
+    learning_missed_opportunity_positive_ratio: float = 0.56
+    learning_positive_prequential_min_samples: float = 6.0
+    learning_positive_prequential_avg_r: float = 0.18
+    learning_positive_prequential_win_rate: float = 0.52
+    learning_positive_prequential_max_brier: float = 0.30
+    learning_positive_calibration_slack: float = 0.24
+    learning_positive_min_score_delta: float = 1.10
+    learning_positive_min_confidence_delta: float = 0.01
+    learning_positive_min_risk_multiplier: float = 1.03
+    learning_bucket_positive_sample_delta: float = 2.0
+    learning_bucket_negative_sample_delta: float = 2.0
+    learning_bucket_positive_score_boost: float = 0.50
+    learning_bucket_negative_score_penalty: float = 0.75
+    learning_bucket_positive_risk_boost: float = 0.03
+    learning_bucket_negative_risk_cap: float = 0.84
+    learning_family_rotation_window: int = 18
+    learning_family_rotation_min_samples: float = 3.0
+    learning_family_rotation_negative_avg_r: float = -0.20
+    learning_family_rotation_negative_win_rate: float = 0.35
+    learning_family_rotation_positive_avg_r: float = 0.15
+    learning_family_rotation_positive_win_rate: float = 0.52
+    learning_family_rotation_hard_negative_avg_r: float = -0.45
+    learning_family_rotation_hard_negative_win_rate: float = 0.28
+    learning_family_rotation_hard_positive_avg_r: float = 0.22
+    learning_family_rotation_hard_positive_win_rate: float = 0.56
+    learning_family_rotation_hard_gap_r: float = 0.35
+    learning_family_rotation_hard_gap_win_rate: float = 0.18
+    learning_family_rotation_recovery_window: int = 4
+    learning_family_rotation_recovery_min_samples: float = 2.0
+    learning_family_rotation_recovery_avg_r: float = 0.08
+    learning_family_rotation_recovery_win_rate: float = 0.55
+    learning_family_rotation_recovery_score_boost: float = 0.45
+    learning_family_rotation_recovery_risk_boost: float = 0.02
+    learning_family_rotation_penalty_score: float = 1.50
+    learning_family_rotation_penalty_risk_cap: float = 0.82
+    learning_family_rotation_boost_score: float = 0.75
+    learning_family_rotation_boost_risk: float = 0.04
+    learning_family_rotation_hard_penalty_score: float = 2.75
+    learning_family_rotation_hard_penalty_risk_cap: float = 0.74
+    learning_family_rotation_hard_boost_score: float = 1.35
+    learning_family_rotation_hard_boost_risk: float = 0.06
 
     def validate(self):
         """Basic configuration validation"""
@@ -1003,6 +1303,7 @@ class SignalEngine:
         self.strategy_modules = build_strategies(config, exch, self)
         self.research_context_provider = None
         self.learning_context_provider = None
+        self.frequency_context_provider = None
         # Phase 1: Multi-strategy weights (dynamic later via ML)
         self.strategy_weights = {
             'trend_breakout': 0.35,
@@ -1015,6 +1316,13 @@ class SignalEngine:
             'trend_breakout': 1.0,
             'mean_reversion': 1.0,
             'momentum_scalp': 1.0
+        }
+        self.last_generation_diagnostics: Dict[str, Dict[str, Any]] = {}
+
+    def _store_generation_diagnostics(self, symbol: str, payload: Dict[str, Any]) -> None:
+        self.last_generation_diagnostics[symbol] = {
+            "symbol": symbol,
+            **payload,
         }
 
     def compute_hurst_exponent(self, symbol: str, timeframe: str = "1h", lookback: int = 100) -> float:
@@ -1419,12 +1727,16 @@ class SignalEngine:
                     "rr_ratio": self._reward_risk_ratio_for_signal(proposal.signal),
                     "hurst_exponent": hurst,
                     "fast_move": proposal.signal.fast_move,
-                    "metadata": dict(proposal.signal.metadata),
+                    "metadata": {
+                        **dict(proposal.signal.metadata),
+                        **self._microstructure_context(symbol, proposal.signal.entry_price),
+                    },
                     "research_context": research_context,
                 }
                 learning_context = self._learning_context(symbol, signal_stub, regime)
                 proposal.signal.metadata["hurst_exponent"] = hurst
                 proposal.signal.metadata["research_context"] = research_context
+                proposal.signal.metadata.update(self._microstructure_context(symbol, proposal.signal.entry_price))
                 proposal.signal.metadata["learning_context"] = learning_context
                 proposal.signal.confidence = max(
                     0.0,
@@ -1432,17 +1744,111 @@ class SignalEngine:
                 )
                 proposals.append(proposal)
 
-        decision = self.ensemble.choose(symbol, regime, proposals, research_context=research_context)
+        proposal_count = len(proposals)
+        if proposal_count <= 0:
+            self._store_generation_diagnostics(
+                symbol,
+                {
+                    "outcome": "no_proposal",
+                    "reason": "strategy_produced_no_proposal",
+                    "proposal_count": 0,
+                    "proposal_strategies": [],
+                    "regime": regime.regime,
+                },
+            )
+            return None
+
+        decision = self.ensemble.choose(
+            symbol,
+            regime,
+            proposals,
+            research_context=research_context,
+            frequency_context=self._frequency_context(symbol, regime),
+        )
+        frequency_adjustments = [
+            {
+                "strategy": str(item.get("strategy", "unknown")),
+                "reason": str(item.get("frequency_reason", "inactive")),
+                "score_delta": float(item.get("frequency_score_delta", 0.0) or 0.0),
+                "min_net_expectancy_delta": float(item.get("frequency_min_net_expectancy_delta", 0.0) or 0.0),
+            }
+            for item in list(decision.proposals or [])
+            if str(item.get("frequency_reason", "inactive")) not in {"inactive", "neutral"}
+        ]
         if decision.signal is None:
+            self._store_generation_diagnostics(
+                symbol,
+                {
+                    "outcome": "ensemble_rejected",
+                    "reason": "no_ensemble_selection",
+                    "proposal_count": proposal_count,
+                    "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                    "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
+                    "frequency_adjustments": frequency_adjustments,
+                    "regime": regime.regime,
+                },
+            )
             return None
         signal = decision.signal
         if signal.strategy == "trend_breakout" and hurst < float(getattr(self.config, "min_hurst_for_trend_breakout", 0.12)):
+            self._store_generation_diagnostics(
+                symbol,
+                {
+                    "outcome": "reliability_rejected",
+                    "reason": "hurst_breakout_blocked",
+                    "proposal_count": proposal_count,
+                    "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                    "selected_strategy": signal.strategy,
+                    "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
+                    "frequency_adjustments": frequency_adjustments,
+                    "regime": regime.regime,
+                },
+            )
             return None
         if signal.strategy == "trend_pullback" and hurst < float(getattr(self.config, "min_hurst_for_trend_pullback", 0.10)):
+            self._store_generation_diagnostics(
+                symbol,
+                {
+                    "outcome": "reliability_rejected",
+                    "reason": "hurst_pullback_blocked",
+                    "proposal_count": proposal_count,
+                    "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                    "selected_strategy": signal.strategy,
+                    "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
+                    "frequency_adjustments": frequency_adjustments,
+                    "regime": regime.regime,
+                },
+            )
             return None
         if signal.strategy == "mean_reversion" and hurst > float(getattr(self.config, "max_hurst_for_mean_reversion", 0.65)):
+            self._store_generation_diagnostics(
+                symbol,
+                {
+                    "outcome": "reliability_rejected",
+                    "reason": "hurst_mean_reversion_blocked",
+                    "proposal_count": proposal_count,
+                    "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                    "selected_strategy": signal.strategy,
+                    "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
+                    "frequency_adjustments": frequency_adjustments,
+                    "regime": regime.regime,
+                },
+            )
             return None
         if float(signal.confidence) < float(getattr(self.config, "min_signal_quality_score", 0.55)):
+            self._store_generation_diagnostics(
+                symbol,
+                {
+                    "outcome": "reliability_rejected",
+                    "reason": "signal_quality_below_threshold",
+                    "proposal_count": proposal_count,
+                    "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                    "selected_strategy": signal.strategy,
+                    "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
+                    "frequency_adjustments": frequency_adjustments,
+                    "regime": regime.regime,
+                },
+            )
             return None
         rr_ratio = 0.0
         risk = abs(float(signal.entry_price) - float(signal.stop_loss))
@@ -1450,6 +1856,7 @@ class SignalEngine:
         if risk > 0:
             rr_ratio = reward / risk
         signal_payload = {
+            "symbol": symbol,
             "side": signal.side,
             "entry_price": signal.entry_price,
             "stop_loss": signal.stop_loss,
@@ -1459,6 +1866,8 @@ class SignalEngine:
             "is_futures": signal.is_futures,
             "signal_quality": signal.confidence,
             "expected_edge_bps": signal.expected_edge_bps,
+            "expected_holding_minutes": signal.expected_holding_minutes,
+            "timeframe": signal.timeframe,
             "regime": signal.regime,
             "rr_ratio": rr_ratio,
             "hurst_exponent": hurst,
@@ -1471,8 +1880,35 @@ class SignalEngine:
                 "regime": decision.regime,
             },
         }
-        if not self._passes_reliability_checks(symbol, signal_payload, regime, len(proposals)):
+        reliability_reason = self._reliability_rejection_reason(symbol, signal_payload, regime, len(proposals))
+        if reliability_reason is not None:
+            self._store_generation_diagnostics(
+                symbol,
+                {
+                    "outcome": "reliability_rejected",
+                    "reason": reliability_reason,
+                    "proposal_count": proposal_count,
+                    "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                    "selected_strategy": signal.strategy,
+                    "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
+                    "frequency_adjustments": frequency_adjustments,
+                    "regime": regime.regime,
+                },
+            )
             return None
+        self._store_generation_diagnostics(
+            symbol,
+            {
+                "outcome": "selected",
+                "reason": "selected_for_submission",
+                "proposal_count": proposal_count,
+                "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                "selected_strategy": signal.strategy,
+                "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
+                "frequency_adjustments": frequency_adjustments,
+                "regime": regime.regime,
+            },
+        )
         return signal_payload
 
     def _passes_reliability_checks(
@@ -1482,6 +1918,15 @@ class SignalEngine:
         regime: Any,
         proposal_count: int,
     ) -> bool:
+        return SignalEngine._reliability_rejection_reason(self, symbol, signal, regime, proposal_count) is None
+
+    def _reliability_rejection_reason(
+        self,
+        symbol: str,
+        signal: Dict[str, Any],
+        regime: Any,
+        proposal_count: int,
+    ) -> Optional[str]:
         side = str(signal.get("side", "")).lower()
         strategy = str(signal.get("strategy", "unknown"))
         entry_price = float(signal.get("entry_price", 0.0) or 0.0)
@@ -1493,44 +1938,110 @@ class SignalEngine:
         hurst = float(signal.get("hurst_exponent", 0.5) or 0.5)
         numeric_values = [entry_price, stop_loss, take_profit, confidence, expected_edge_bps, rr_ratio, hurst]
         research_context = signal.get("research_context", {}) or {}
+        metadata = dict(signal.get("metadata", {}) or {})
+        learning_context = dict(metadata.get("learning_context", {}) or {})
+        calibration = dict(learning_context.get("calibration", {}) or {})
+        opportunity = dict(learning_context.get("opportunity", {}) or {})
+        positive_cell_evidence = bool(learning_context.get("positive_cell_evidence", False))
+        order_profile = str(metadata.get("preferred_order_type", "market" if bool(signal.get("fast_move", False)) else "limit")).lower()
+        rotation_policy = dict(getattr(regime, "metadata", {}).get("rotation_policy", {}) or {})
+        preferred_family = str(rotation_policy.get("preferred_family", getattr(regime, "metadata", {}).get("preferred_family", "")) or "")
+        suppressed_family = str(rotation_policy.get("suppressed_family", getattr(regime, "metadata", {}).get("suppressed_family", "")) or "")
+        rotation_confidence = float(rotation_policy.get("confidence", getattr(regime, "metadata", {}).get("rotation_confidence", 0.0)) or 0.0)
+        quality_delta = float(getattr(self.config, "rotation_reliability_quality_delta", 0.03))
+        edge_delta_bps = float(getattr(self.config, "rotation_reliability_edge_delta_bps", 1.5))
+        rr_delta = float(getattr(self.config, "rotation_reliability_rr_delta", 0.06))
+        quality_floor = float(getattr(self.config, "min_signal_quality_score", 0.55))
+        edge_floor = float(getattr(self.config, "min_expected_edge_bps", 8.0))
+        trend_rr_floor = float(getattr(self.config, "min_reliable_rr_ratio_trend", 1.35))
+        mean_reversion_rr_floor = float(getattr(self.config, "min_reliable_rr_ratio_mean_reversion", 1.10))
+        if strategy == "trend_pullback":
+            quality_floor = max(quality_floor, float(getattr(self.config, "min_signal_quality_score_pullback", 0.62)))
+            edge_floor = max(edge_floor, float(getattr(self.config, "min_expected_edge_bps_pullback", 14.0)))
+            trend_rr_floor = max(trend_rr_floor, float(getattr(self.config, "min_reliable_rr_ratio_pullback", 1.55)))
+        if rotation_confidence > 0.0:
+            if strategy == preferred_family:
+                quality_floor = max(quality_floor - (quality_delta * rotation_confidence), 0.0)
+                edge_floor = max(edge_floor - (edge_delta_bps * rotation_confidence), 0.0)
+                if strategy in {"trend_breakout", "trend_pullback"}:
+                    trend_rr_floor = max(trend_rr_floor - (rr_delta * rotation_confidence), 0.0)
+                elif strategy == "mean_reversion":
+                    mean_reversion_rr_floor = max(mean_reversion_rr_floor - (rr_delta * rotation_confidence), 0.0)
+                if strategy == "trend_pullback":
+                    quality_floor = max(
+                        quality_floor - (float(getattr(self.config, "rotation_pullback_reliability_quality_delta", 0.06)) * rotation_confidence),
+                        0.0,
+                    )
+                    edge_floor = max(
+                        edge_floor - (float(getattr(self.config, "rotation_pullback_reliability_edge_delta_bps", 6.0)) * rotation_confidence),
+                        0.0,
+                    )
+                    trend_rr_floor = max(
+                        trend_rr_floor - (float(getattr(self.config, "rotation_pullback_reliability_rr_delta", 0.20)) * rotation_confidence),
+                        0.0,
+                    )
+            elif strategy == suppressed_family:
+                quality_floor += quality_delta * rotation_confidence
+                edge_floor += edge_delta_bps * rotation_confidence
+                if strategy in {"trend_breakout", "trend_pullback"}:
+                    trend_rr_floor += rr_delta * rotation_confidence
+                elif strategy == "mean_reversion":
+                    mean_reversion_rr_floor += rr_delta * rotation_confidence
 
         if proposal_count <= 0:
-            return False
+            return "no_proposals"
         if any(not math.isfinite(value) for value in numeric_values):
-            return False
+            return "non_finite_signal"
         if entry_price <= 0 or stop_loss <= 0 or take_profit <= 0:
-            return False
-        if confidence < float(getattr(self.config, "min_signal_quality_score", 0.55)):
-            return False
+            return "invalid_price_triplet"
+        if confidence < quality_floor:
+            return "signal_quality_below_threshold"
         if float(getattr(regime, "confidence", 0.0)) < float(getattr(self.config, "min_reliable_regime_confidence", 0.58)):
-            return False
-        if expected_edge_bps < float(getattr(self.config, "min_expected_edge_bps", 8.0)):
-            return False
+            return "regime_confidence_too_low"
+        if expected_edge_bps < edge_floor:
+            return "expected_edge_below_threshold"
+        if bool(learning_context.get("veto", False)):
+            return "learning_veto"
+        if (
+            float(calibration.get("effective_samples", 0.0) or 0.0) >= float(getattr(self.config, "learning_calibration_gate_min_samples", 6.0))
+            and float(calibration.get("calibrated_confidence", confidence) or confidence)
+            < (
+                float(getattr(self.config, "learning_min_calibrated_confidence", 0.50))
+                - (0.03 if positive_cell_evidence else 0.0)
+            )
+        ):
+            return "calibrated_confidence_too_low"
+        if (
+            float(opportunity.get("samples", 0.0) or 0.0) >= float(getattr(self.config, "learning_negative_opportunity_gate_min_samples", 10.0))
+            and float(opportunity.get("avg_forward_r", 0.0) or 0.0) <= float(getattr(self.config, "learning_negative_opportunity_gate_avg_forward_r", -0.20))
+            and not positive_cell_evidence
+        ):
+            return "negative_opportunity_history"
 
         if side in {"long", "buy"}:
             if not (stop_loss < entry_price < take_profit):
-                return False
+                return "invalid_long_ordering"
         elif side in {"short", "sell"}:
             if not (stop_loss > entry_price > take_profit):
-                return False
+                return "invalid_short_ordering"
         else:
-            return False
+            return "invalid_side"
 
         if not self._passes_research_checks(side, research_context):
-            return False
+            return "research_conflict"
 
         if strategy in {"trend_breakout", "trend_pullback"}:
-            if rr_ratio < float(getattr(self.config, "min_reliable_rr_ratio_trend", 1.35)):
-                return False
+            if rr_ratio < trend_rr_floor:
+                return "rr_ratio_too_low_trend"
         elif strategy == "mean_reversion":
-            if rr_ratio < float(getattr(self.config, "min_reliable_rr_ratio_mean_reversion", 1.10)):
-                return False
+            if rr_ratio < mean_reversion_rr_floor:
+                return "rr_ratio_too_low_mean_reversion"
 
         regime_name = str(getattr(regime, "regime", "unknown"))
         if strategy in {"trend_breakout", "trend_pullback"} and regime_name not in {"trending", "high_volatility"}:
-            return False
+            return "regime_mismatch_trend"
         if strategy == "mean_reversion" and regime_name not in {"mean_reverting", "choppy"}:
-            return False
+            return "regime_mismatch_mean_reversion"
 
         try:
             order_book = self.exch.get_order_book(symbol)
@@ -1539,11 +2050,21 @@ class SignalEngine:
             mid = (bid + ask) / 2.0
             if mid > 0:
                 entry_deviation = abs(entry_price - mid) / mid
-                if entry_deviation > float(getattr(self.config, "max_entry_deviation_from_mid_fraction", 0.0045)):
-                    return False
+                max_entry_deviation = float(getattr(self.config, "max_entry_deviation_from_mid_fraction", 0.0045))
+                if order_profile == "limit":
+                    max_entry_deviation *= 1.20
+                if strategy == "trend_pullback":
+                    max_entry_deviation *= 1.40
+                elif strategy == "mean_reversion":
+                    max_entry_deviation *= 1.60
+                elif strategy == "trend_breakout" and order_profile == "limit":
+                    max_entry_deviation *= 1.15
+                max_entry_deviation += min(max(expected_edge_bps - 18.0, 0.0) / 10000.0, 0.0015)
+                if entry_deviation > max_entry_deviation:
+                    return "entry_too_far_from_mid"
         except Exception:
             pass
-        return True
+        return None
 
     def _research_context(self, symbol: str) -> Dict[str, Any]:
         if not callable(self.research_context_provider):
@@ -1561,6 +2082,14 @@ class SignalEngine:
         except Exception:
             return {}
 
+    def _frequency_context(self, symbol: str, regime: Any | None = None) -> Dict[str, Any]:
+        if not callable(self.frequency_context_provider):
+            return {}
+        try:
+            return self.frequency_context_provider(symbol, regime) or {}
+        except Exception:
+            return {}
+
     def _passes_research_checks(self, side: str, research_context: Dict[str, Any]) -> bool:
         if not research_context:
             return True
@@ -1574,6 +2103,23 @@ class SignalEngine:
         if side in {"short", "sell"} and bullish >= float(getattr(self.config, "research_conflict_veto_confidence", 0.72)):
             return False
         return True
+
+    def _microstructure_context(self, symbol: str, entry_price: float) -> Dict[str, Any]:
+        try:
+            order_book = self.exch.get_order_book(symbol)
+            bid = float(order_book["bid"])
+            ask = float(order_book["ask"])
+            mid = (bid + ask) / 2.0
+            if mid <= 0:
+                return {}
+            spread_bps = ((ask - bid) / mid) * 10000.0
+            entry_deviation_bps = abs(float(entry_price or 0.0) - mid) / mid * 10000.0
+            return {
+                "spread_bps": spread_bps,
+                "entry_deviation_bps": entry_deviation_bps,
+            }
+        except Exception:
+            return {}
 
     @staticmethod
     def _reward_risk_ratio_for_signal(signal: Any) -> float:
@@ -2770,9 +3316,17 @@ class TradeBot:
         self.exec = ExecutionEngine(config, self.state, self.exch)
         self.reporter = Reporter(config, self.state)
         self.state_store = SQLiteStateStore(os.path.join(self.base_dir, STATE_DB_FILE))
+        self.learning_store = PersistentLearningStore(
+            self.state_store,
+            SQLiteStateStore(os.path.join(self.base_dir, LEARNING_DB_FILE)),
+        )
+        self.learning_backfill_summary = backfill_learning_from_sqlite_artifacts(
+            self.base_dir,
+            self.learning_store.global_store,
+        )
         self.metrics = MetricsCollector(port=8000) if enable_metrics else None
         self.decision_logger = JsonlDecisionLogger(os.path.join(self.base_dir, EVENT_LOG_FILE))
-        self.learning = TradeLearningEngine(config, self.state_store)
+        self.learning = TradeLearningEngine(config, self.learning_store)
         self.reconciler = BotReconciler(self)
         self.last_reconciliation_status = None
         self._shutdown_event = threading.Event()
@@ -2801,6 +3355,27 @@ class TradeBot:
         if self.state.peak_equity == 0.0:
             self.state.peak_equity = self.state.balance
 
+    def _refresh_control_status(self, *, status: str = "running") -> None:
+        try:
+            open_positions = 0
+            for value in (self.state.open_positions or {}).values():
+                open_positions += len(value) if isinstance(value, list) else 1
+            write_bot_status(
+                self.base_dir,
+                {
+                    "status": status,
+                    "pid": os.getpid(),
+                    "paper": bool(self.state.paper_mode),
+                    "trading_mode": getattr(self.config, "trading_mode", "spot"),
+                    "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "last_heartbeat": self.state.last_heartbeat.isoformat() if self.state.last_heartbeat else None,
+                    "balance": float(self.state.balance),
+                    "open_positions": int(open_positions),
+                },
+            )
+        except Exception:
+            return
+
     def answer_operator_question(self, question: str) -> Dict[str, Any]:
         """
         Operator-facing grounded assistant.
@@ -2815,14 +3390,14 @@ class TradeBot:
             "answer": response.answer,
             "retrieved_context": response.retrieved_context,
             "tool_results": response.tool_results,
-            "portfolio_snapshot": asdict(build_portfolio_snapshot(self)),
-            "risk_state": asdict(build_risk_decision(self)),
-            "reconciliation_status": asdict(self.last_reconciliation_status) if self.last_reconciliation_status else None,
-            "strategy_health": [asdict(item) for item in build_strategy_health(self)],
-            "event_risk": self.news_engine.event_risk_snapshot(),
-            "event_research": self.news_engine.recent_research_records(limit=10),
-            "system_health": self._build_system_health_summary(),
-            "readiness_report": asdict(build_readiness_report(self)),
+            "portfolio_snapshot": _sanitize_jsonish(build_portfolio_snapshot(self)),
+            "risk_state": _sanitize_jsonish(build_risk_decision(self)),
+            "reconciliation_status": _sanitize_jsonish(self.last_reconciliation_status),
+            "strategy_health": _sanitize_jsonish(build_strategy_health(self)),
+            "event_risk": _sanitize_jsonish(self.news_engine.event_risk_snapshot()),
+            "event_research": _sanitize_jsonish(self.news_engine.recent_research_records(limit=10)),
+            "system_health": _sanitize_jsonish(self._build_system_health_summary()),
+            "readiness_report": _sanitize_jsonish(build_readiness_report(self)),
         }
 
     def scan_binance_news(self) -> List[Dict[str, Any]]:
@@ -2861,6 +3436,7 @@ class TradeBot:
         try:
             save_bot_state(self.state, STATE_FILE)
             persist_runtime_snapshot(self, trace_id)
+            self._refresh_control_status(status="running")
         except Exception as e:
             print(f"[WARN] Failed to save state: {e}")
 
@@ -2888,6 +3464,38 @@ class TradeBot:
         if minutes <= 0:
             return
         setattr(self.state, attr_name, dt.datetime.now() + dt.timedelta(minutes=minutes))
+
+    def _hard_halt_reasons(self, now: Optional[dt.datetime] = None) -> List[str]:
+        now = now or dt.datetime.now()
+        reasons: List[str] = []
+        if self.last_reconciliation_status is not None and not bool(getattr(self.last_reconciliation_status, "ok", True)):
+            reasons.append("reconciliation_mismatch")
+        if self.risk.check_daily_loss_limit():
+            reasons.append("daily_loss_limit")
+        peak_equity = float(getattr(self.state, "peak_equity", 0.0) or 0.0)
+        balance = float(getattr(self.state, "balance", 0.0) or 0.0)
+        if peak_equity > 0:
+            drawdown = (balance - peak_equity) / peak_equity
+            if drawdown <= -0.20:
+                reasons.append("max_drawdown")
+        if self._cooldown_active("data_cooldown_until", now):
+            reasons.append("data_circuit_breaker")
+        if self._cooldown_active("execution_cooldown_until", now):
+            reasons.append("execution_circuit_breaker")
+        return reasons
+
+    def _recover_if_halt_cleared(self, now: Optional[dt.datetime] = None) -> None:
+        now = now or dt.datetime.now()
+        hard_halts = self._hard_halt_reasons(now)
+        if hard_halts:
+            return
+        if not self.state.emergency_mode:
+            return
+        self.state.emergency_mode = False
+        self.reporter.mentor_log(
+            "Emergency mode cleared automatically after halt conditions normalized.",
+            level="WARN",
+        )
 
     def _build_system_health_summary(self) -> Dict[str, Any]:
         metrics = self.state_store.load_operational_metrics() if getattr(self, "state_store", None) else {}
@@ -3131,6 +3739,8 @@ class TradeBot:
             self.save_state()
             return
 
+        self._recover_if_halt_cleared(now)
+
         # Dashboards
         if now.hour == self.config.morning_hour:
             self.reporter.morning_dashboard()
@@ -3141,6 +3751,7 @@ class TradeBot:
         # Heartbeat (will send only if interval passed)
         self.reporter.heartbeat()
         self.maybe_run_news_engine(now)
+        self.learning.evaluate_pending_shadow_decisions(self.exch, now)
         current_health = self._build_system_health_summary()
         self._notify_health_transition(previous_health, current_health)
         portfolio_snapshot = build_portfolio_snapshot(self)
@@ -3180,10 +3791,12 @@ class TradeBot:
             log_signal(self, cycle_trace_id, {"symbol": symbol, **signal})
 
             if not self.risk.can_open_new_position(symbol):
+                self.learning.record_shadow_decision(signal, status="skipped", reason="risk_capacity", trace_id=cycle_trace_id)
                 continue
 
             risk_decision = build_risk_decision(self, signal)
             if not risk_decision.allowed:
+                self.learning.record_shadow_decision(signal, status="skipped", reason=risk_decision.reason, trace_id=cycle_trace_id)
                 log_risk_halt(self, cycle_trace_id, risk_decision)
                 if self.metrics is not None:
                     self.metrics.inc_risk_halt(risk_decision.reason)
@@ -3195,10 +3808,12 @@ class TradeBot:
             entry_price = signal.get("entry_price")
             stop_loss = signal.get("stop_loss")
             take_profit = signal.get("take_profit")
-            fast_move = signal.get("fast_move", False)
+            metadata = dict(signal.get("metadata", {}) or {})
+            fast_move = bool(signal.get("fast_move", False)) and not bool(metadata.get("force_limit_entry", False))
             is_futures = signal.get("is_futures", False)
             normalized_side = (side or "").lower()
             if getattr(self.config, "trading_mode", "spot") == "spot" and normalized_side in ("short", "sell"):
+                self.learning.record_shadow_decision(signal, status="skipped", reason="spot_short_blocked", trace_id=cycle_trace_id)
                 continue
 
             # Enforce at most one LONG and one SHORT per symbol (no pyramiding
@@ -3219,10 +3834,16 @@ class TradeBot:
             if same_side_exists:
                 # A position of the same side already exists for this symbol ->
                 # skip new one
+                self.learning.record_shadow_decision(signal, status="skipped", reason="same_side_exists", trace_id=cycle_trace_id)
                 continue
 
             size = self.risk.calc_position_size(
-                entry_price or 0, stop_loss or 0)
+                entry_price or 0,
+                stop_loss or 0,
+                signal=signal,
+            )
+            learning_context = dict((signal.get("metadata", {}) or {}).get("learning_context", {}) or {})
+            size *= float(learning_context.get("risk_multiplier", 1.0) or 1.0)
             portfolio_decision = self.risk.evaluate_portfolio_risk(
                 symbol=symbol,
                 strategy=signal.get("strategy", "unknown"),
@@ -3231,6 +3852,7 @@ class TradeBot:
                 proposed_size=float(size or 0),
             )
             if not portfolio_decision.allowed:
+                self.learning.record_shadow_decision(signal, status="skipped", reason=portfolio_decision.reason, trace_id=cycle_trace_id)
                 log_risk_halt(self, cycle_trace_id, portfolio_decision)
                 if self.metrics is not None:
                     self.metrics.inc_risk_halt(portfolio_decision.reason)
@@ -3239,6 +3861,7 @@ class TradeBot:
                 continue
             size = float(portfolio_decision.capped_size or size)
             if size <= 0 or not entry_price or not stop_loss:
+                self.learning.record_shadow_decision(signal, status="skipped", reason="invalid_sized_trade", trace_id=cycle_trace_id)
                 continue
 
             success = self.exec.place_trade(
@@ -3268,6 +3891,14 @@ class TradeBot:
                 self.reporter.mentor_log(msg)
                 self.reporter.log_trade("OPEN " + msg)
 
+                execution_context = {
+                    "spread_bps": float(signal.get("metadata", {}).get("spread_bps", 0.0) or 0.0),
+                    "entry_deviation_bps": float(signal.get("metadata", {}).get("entry_deviation_bps", 0.0) or 0.0),
+                    "fill_fraction": float(getattr(getattr(self.exec, "last_fill", None), "metadata", {}).get("fill_fraction", 1.0) or 1.0),
+                    "latency_ms": float(getattr(getattr(self.exec, "last_fill", None), "metadata", {}).get("latency_ms", 0.0) or 0.0),
+                    "order_type": "market" if fast_move else "limit",
+                }
+
                 # Store as list of positions per symbol for multi-position
                 # support
                 new_pos = Position(
@@ -3283,8 +3914,9 @@ class TradeBot:
                     initial_stop_loss=stop_loss or 0,
                     initial_take_profit=take_profit or 0,
                     metadata={
-                        "decision_context": self.learning.build_trade_context(signal),
+                        "decision_context": self.learning.build_trade_context(signal, execution_context=execution_context),
                         "signal_snapshot": signal,
+                        "execution_context": execution_context,
                         "opened_trace_id": cycle_trace_id,
                     },
                 )
@@ -3312,6 +3944,7 @@ class TradeBot:
                 )
                 self.save_state()
             else:
+                self.learning.record_shadow_decision(signal, status="skipped", reason="execution_failed", trace_id=cycle_trace_id)
                 attempts = int(getattr(self.exec, "last_execution_report", {}).get("attempts", 1))
                 for _ in range(max(attempts - 1, 0)):
                     if self.metrics is not None:
@@ -3351,6 +3984,9 @@ class TradeBot:
 
     def render_status_report(self) -> str:
         health = self._build_system_health_summary()
+        learning = self.learning.summary_snapshot() if getattr(self, "learning", None) is not None else {}
+        drift = dict(learning.get("drift", {}) or {})
+        opportunity = dict(learning.get("opportunity", {}) or {})
         lines = [
             f"Balance: {self.state.balance:.2f} USDT",
             f"Emergency mode: {health['emergency_mode']}",
@@ -3362,9 +3998,37 @@ class TradeBot:
             f"Signal generation failures: {health['signal_generation_failures']}",
             f"Market data health failures: {health['market_data_health_failures']}",
             f"Consecutive order failures: {health['consecutive_order_failures']}",
+            f"Learning recent trades: {int(learning.get('recent_trades', 0) or 0)}",
+            f"Learning recent avg R: {float(learning.get('recent_avg_r_multiple', 0.0) or 0.0):.2f}",
+            f"Learning drift active: {bool(drift.get('active', False))}",
+            f"Learning opportunity avg R: {float(opportunity.get('avg_forward_r', 0.0) or 0.0):.2f}",
         ]
+        learning_store_info = self.learning_store.describe() if getattr(self, "learning_store", None) is not None else {}
+        global_learning = dict(learning_store_info.get("global", {}) or {})
+        if global_learning:
+            lines.extend(
+                [
+                    f"Learning memory path: {global_learning.get('path', 'n/a')}",
+                    f"Learning observations stored: {int(global_learning.get('observations', 0) or 0)}",
+                    f"Learning patterns stored: {int(global_learning.get('patterns', 0) or 0)}",
+                    f"Learning models stored: {int(global_learning.get('models', 0) or 0)}",
+                    f"Learning imports completed: {int(global_learning.get('imports', 0) or 0)}",
+                ]
+            )
+        if getattr(self, "learning_backfill_summary", None):
+            imported_files = int(self.learning_backfill_summary.get("imported_files", 0) or 0)
+            if imported_files > 0:
+                lines.append(
+                    "Learning backfill: "
+                    f"{imported_files} files, "
+                    f"{int(self.learning_backfill_summary.get('imported_observations', 0) or 0)} observations, "
+                    f"{int(self.learning_backfill_summary.get('imported_patterns', 0) or 0)} patterns, "
+                    f"{int(self.learning_backfill_summary.get('imported_models', 0) or 0)} models"
+                )
         if health["ranked_blockers"]:
             lines.append("Ranked blockers: " + ", ".join(health["ranked_blockers"]))
+        if learning.get("top_attributions"):
+            lines.append("Learning attributions: " + ", ".join(learning["top_attributions"]))
         return "\n".join(lines)
 
     def manage_open_positions(self):
@@ -3400,28 +4064,35 @@ class TradeBot:
                 close_price = None
                 exit_reason = "UNKNOWN"
 
-                # --- Dynamic risk management (long-only for now) ---
+                base_sl = pos.initial_stop_loss if pos.initial_stop_loss else pos.stop_loss
                 if pos.side == "long":
-                    # Risk distance based on original SL if available
-                    base_sl = pos.initial_stop_loss if pos.initial_stop_loss else pos.stop_loss
                     risk_dist = pos.entry_price - base_sl
-                    if risk_dist > 0:
+                else:
+                    risk_dist = base_sl - pos.entry_price
+                if risk_dist > 0:
+                    if pos.side == "long":
                         rr_move = (last_high - pos.entry_price) / risk_dist
-
-                        # Move to breakeven after breakeven_rr
                         if rr_move >= self.config.breakeven_rr and pos.stop_loss < pos.entry_price:
                             pos.stop_loss = pos.entry_price
+                    else:
+                        rr_move = (pos.entry_price - last_low) / risk_dist
+                        if rr_move >= self.config.breakeven_rr and pos.stop_loss > pos.entry_price:
+                            pos.stop_loss = pos.entry_price
 
-                        # Start ATR trailing after trailing_rr
-                        if rr_move >= self.config.trailing_rr:
-                            atr = self.signals.compute_atr(
-                                symbol,
-                                timeframe=self.config.trailing_timeframe,
-                                period=self.config.trailing_atr_period,
-                            )
-                            if atr is not None and atr > 0:
+                    if rr_move >= self.config.trailing_rr:
+                        atr = self.signals.compute_atr(
+                            symbol,
+                            timeframe=self.config.trailing_timeframe,
+                            period=self.config.trailing_atr_period,
+                        )
+                        if atr is not None and atr > 0:
+                            if pos.side == "long":
                                 new_sl = last_high - atr * self.config.trailing_atr_mult
                                 if new_sl > pos.stop_loss:
+                                    pos.stop_loss = new_sl
+                            else:
+                                new_sl = last_low + atr * self.config.trailing_atr_mult
+                                if new_sl < pos.stop_loss:
                                     pos.stop_loss = new_sl
 
                 if pos.side == "long":
@@ -3445,6 +4116,27 @@ class TradeBot:
                         close_price = pos.take_profit
                         exit_reason = "TP"
                         closed = True
+
+                if not closed and risk_dist > 0:
+                    signal_snapshot = dict((getattr(pos, "metadata", {}) or {}).get("signal_snapshot", {}) or {})
+                    expected_holding = float(signal_snapshot.get("expected_holding_minutes", 0.0) or 0.0)
+                    if expected_holding > 0 and getattr(pos, "opened_at", None) is not None:
+                        holding_minutes = max((dt.datetime.now() - pos.opened_at).total_seconds() / 60.0, 0.0)
+                        current_r = ((last_close - pos.entry_price) / risk_dist) if pos.side == "long" else ((pos.entry_price - last_close) / risk_dist)
+                        if (
+                            holding_minutes >= (expected_holding * self.config.time_stop_hard_holding_multiplier)
+                            and current_r < self.config.time_stop_hard_min_r_multiple
+                        ):
+                            close_price = last_close
+                            exit_reason = "TIME_HARD"
+                            closed = True
+                        elif (
+                            holding_minutes >= (expected_holding * self.config.time_stop_soft_holding_multiplier)
+                            and current_r < self.config.time_stop_soft_min_r_multiple
+                        ):
+                            close_price = last_close
+                            exit_reason = "TIME_SOFT"
+                            closed = True
 
                 if not closed:
                     remaining_positions.append(pos)
@@ -3547,6 +4239,7 @@ class TradeBot:
         while not self._shutdown_event.is_set():
             try:
                 self.run_once()
+                self._refresh_control_status(status="running")
             except KeyboardInterrupt:
                 self._request_shutdown()
             except Exception as e:
@@ -3558,7 +4251,34 @@ class TradeBot:
         self.save_state()
         self.reporter.mentor_log("Runtime loop stopped cleanly.", send_telegram=False)
 
-    
+from trade_bot.simulation import HistoricalReplayExchange as _HistoricalReplayExchange
+from trade_bot.simulation import HistoricalSimulationEngine as _HistoricalSimulationEngine
+
+
+class MockBacktestExchange(_HistoricalReplayExchange):
+    pass
+
+
+class BacktestEngine(_HistoricalSimulationEngine):
+    def __init__(self, config: BotConfig, **kwargs: Any):
+        super().__init__(
+            config,
+            signal_engine_cls=SignalEngine,
+            bot_state_cls=CoreBotState,
+            position_cls=CorePosition,
+            risk_manager_cls=CoreRiskManager,
+            **kwargs,
+        )
+
+    def run_backtest(self, symbol: str, timeframe: str = "15m", days: int = 180) -> Dict[str, Any]:
+        self.signal_engine_cls = SignalEngine
+        return super().run_backtest(symbol, timeframe=timeframe, days=days)
+
+    def run_campaign(self, symbols: Sequence[str], *, timeframe: str = "15m", days: int = 180) -> Dict[str, Any]:
+        self.signal_engine_cls = SignalEngine
+        return super().run_campaign(symbols, timeframe=timeframe, days=days)
+
+
 if __name__ == "__main__":
     from trade_bot.cli import main as cli_main
 

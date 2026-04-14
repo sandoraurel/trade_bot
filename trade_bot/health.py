@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict
 
 from .constants import STATE_DB_FILE
+from .process_service import read_bot_status
+from .simulation_service import read_simulation_batch_status
 from .state_store import SQLiteStateStore
 
 
@@ -67,6 +69,10 @@ def evaluate_runtime_health(base_dir: str, max_snapshot_age_seconds: int = 900) 
     readiness = snapshot.get("readiness", {}) or {}
     system_health = readiness.get("metrics", {}).get("system_health", {}) or {}
     top_blocker = system_health.get("top_blocker", "unknown")
+    bot_status = read_bot_status(base_dir)
+    simulation_batch_status = read_simulation_batch_status(base_dir)
+    bot_health = dict(bot_status.get("health", {}) or {})
+    simulation_health = dict(simulation_batch_status.get("health", {}) or {})
 
     unhealthy_reason = ""
     if age_seconds > max_snapshot_age_seconds:
@@ -77,6 +83,10 @@ def evaluate_runtime_health(base_dir: str, max_snapshot_age_seconds: int = 900) 
         "gross_exposure_cap",
     }:
         unhealthy_reason = f"risk_blocked:{risk.get('reason', 'unknown')}"
+    elif bot_health.get("status") in {"stale", "stale_pid"}:
+        unhealthy_reason = f"bot_process_unhealthy:{bot_health.get('reason', 'unknown')}"
+    elif simulation_health.get("status") in {"stale", "stale_pid"}:
+        unhealthy_reason = f"simulation_process_unhealthy:{simulation_health.get('reason', 'unknown')}"
     elif top_blocker not in {"healthy", "extended_no_signal_period", "unknown"}:
         unhealthy_reason = f"system_blocker:{top_blocker}"
 
@@ -89,6 +99,8 @@ def evaluate_runtime_health(base_dir: str, max_snapshot_age_seconds: int = 900) 
             "snapshot_age_seconds": round(age_seconds, 2),
             "top_blocker": top_blocker,
             "risk_reason": risk.get("reason", "ok"),
+            "bot_process_health": bot_health,
+            "simulation_process_health": simulation_health,
             "runtime_db_path": db_path,
         },
     )

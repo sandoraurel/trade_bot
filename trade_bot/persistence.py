@@ -11,6 +11,35 @@ from .constants import STATE_FILE
 from .state import BotState, Position
 
 
+def _sanitize_jsonish(value: Any, *, depth: int = 0, max_depth: int = 6, seen: set[int] | None = None) -> Any:
+    seen = set(seen or set())
+    if depth >= max_depth:
+        return str(type(value).__name__)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dt.datetime):
+        return value.isoformat()
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    if isinstance(value, (dict, list, tuple, set)) or is_dataclass(value) or hasattr(value, "__dict__"):
+        marker = id(value)
+        if marker in seen:
+            return "<recursive-ref>"
+        seen.add(marker)
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, item in value.items():
+            sanitized[str(key)] = _sanitize_jsonish(item, depth=depth + 1, max_depth=max_depth, seen=seen)
+        return sanitized
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_jsonish(item, depth=depth + 1, max_depth=max_depth, seen=seen) for item in value]
+    if is_dataclass(value):
+        return _sanitize_jsonish(getattr(value, "__dict__", str(value)), depth=depth + 1, max_depth=max_depth, seen=seen)
+    if hasattr(value, "__dict__"):
+        return _sanitize_jsonish(vars(value), depth=depth + 1, max_depth=max_depth, seen=seen)
+    return str(value)
+
+
 def save_bot_state(state: BotState, path: str = STATE_FILE) -> None:
     open_positions_list = []
     for value in state.open_positions.values():
@@ -39,7 +68,7 @@ def save_bot_state(state: BotState, path: str = STATE_FILE) -> None:
                     "last_update": pos.last_update.isoformat() if pos.last_update else None,
                     "initial_stop_loss": pos.initial_stop_loss,
                     "initial_take_profit": pos.initial_take_profit,
-                    "metadata": getattr(pos, "metadata", {}),
+                    "metadata": _sanitize_jsonish(getattr(pos, "metadata", {})),
                 }
             )
 
@@ -66,11 +95,11 @@ def save_bot_state(state: BotState, path: str = STATE_FILE) -> None:
         "last_equity_update": state.last_equity_update.isoformat() if state.last_equity_update else None,
         "multi_position_mode": getattr(state, "multi_position_mode", False),
         "last_news_scan_at": state.last_news_scan_at.isoformat() if state.last_news_scan_at else None,
-        "pending_news_commands": state.pending_news_commands,
-        "market_regime_alerts": state.market_regime_alerts,
+        "pending_news_commands": _sanitize_jsonish(state.pending_news_commands),
+        "market_regime_alerts": _sanitize_jsonish(state.market_regime_alerts),
         "data_cooldown_until": getattr(state, "data_cooldown_until", None).isoformat() if getattr(state, "data_cooldown_until", None) else None,
         "execution_cooldown_until": getattr(state, "execution_cooldown_until", None).isoformat() if getattr(state, "execution_cooldown_until", None) else None,
-        "health_summary": getattr(state, "health_summary", {}),
+        "health_summary": _sanitize_jsonish(getattr(state, "health_summary", {})),
         "open_positions": open_positions_list,
     }
 

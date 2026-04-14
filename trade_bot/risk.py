@@ -12,8 +12,11 @@ class RiskManager:
     def __init__(self, config: BotConfig, state: BotState):
         self.config = config
         self.state = state
+        self.now_provider = None
 
     def _now(self) -> dt.datetime:
+        if callable(self.now_provider):
+            return self.now_provider()
         return dt.datetime.now()
 
     def _count_open_positions(self) -> int:
@@ -43,17 +46,20 @@ class RiskManager:
     def can_take_more_trades_today(self) -> bool:
         return self.state.today_trades_count < self.config.max_trades_per_day_max
 
-    def can_open_new_position(self, symbol: str) -> bool:
+    def entry_capacity_status(self, symbol: str, pending_positions: int = 0) -> str:
         if self._is_in_cooldown():
-            return False
-        if self._count_open_positions() >= self.config.max_open_positions:
-            return False
+            return "cooldown"
+        if (self._count_open_positions() + max(int(pending_positions), 0)) >= self.config.max_open_positions:
+            return "max_open_positions"
         if not self.can_take_more_trades_today():
-            return False
+            return "daily_trade_limit"
         if not self._check_correlation_limit(symbol):
             print(f"[RISK] Correlation limit hit for {symbol}")
-            return False
-        return True
+            return "correlation_limit"
+        return "ok"
+
+    def can_open_new_position(self, symbol: str, pending_positions: int = 0) -> bool:
+        return self.entry_capacity_status(symbol, pending_positions=pending_positions) == "ok"
 
     def _check_correlation_limit(self, symbol: str) -> bool:
         return self._get_family_risk(symbol.split("/")[0]) < 0.25
@@ -128,7 +134,7 @@ class RiskManager:
         ):
             self.state.cooldown_until = self._now() + dt.timedelta(minutes=self.config.cooldown_minutes_after_loss_streak)
 
-    def calc_position_size(self, entry_price: float, stop_loss: float) -> float:
+    def calc_position_size(self, entry_price: float, stop_loss: float, signal: Dict[str, Any] | None = None) -> float:
         risk_amount = self.state.balance * self.current_risk_fraction()
         sl_distance = abs(entry_price - stop_loss)
         if sl_distance <= 0 or risk_amount <= 0:
@@ -143,7 +149,43 @@ class RiskManager:
             max_size = self.state.balance / entry_price
         else:
             max_size = (self.state.balance * leverage) / entry_price
-        return min(size, max_size)
+        metadata = dict((signal or {}).get("metadata", {}) or {})
+        strategy = str((signal or {}).get("strategy", metadata.get("strategy", "unknown")))
+        order_profile = str(metadata.get("preferred_order_type", "market" if bool((signal or {}).get("fast_move", False)) else "limit")).lower()
+        strategy_variant = str(metadata.get("strategy_variant", "base"))
+        volatility_percentile = float(metadata.get("realized_vol_percentile", 0.5) or 0.5)
+        entry_zscore = abs(float(metadata.get("entry_zscore", 0.0) or 0.0))
+        size_multiplier = 1.0
+        if volatility_percentile >= 0.88:
+            size_multiplier *= 0.76
+        elif volatility_percentile >= 0.74:
+            size_multiplier *= 0.88
+        if strategy == "trend_breakout" and order_profile == "market":
+            size_multiplier *= 0.88
+        if strategy == "trend_breakout" and strategy_variant == "confirmed_market" and volatility_percentile <= 0.78:
+            size_multiplier *= 1.06
+        momentum_crash_risk = float(metadata.get("momentum_crash_risk", 0.0) or 0.0)
+        if strategy == "trend_breakout" and momentum_crash_risk > 0:
+            size_multiplier *= max(0.55, 1.0 - (momentum_crash_risk * 0.35))
+        if strategy == "mean_reversion" and momentum_crash_risk >= 0.45 and volatility_percentile <= 0.82:
+            size_multiplier *= 1.05
+        if strategy == "mean_reversion" and volatility_percentile <= 0.58 and entry_zscore >= 1.35:
+            size_multiplier *= 1.04
+        rotation_policy = metadata.get("rotation_policy", {}) or {}
+        preferred_family = str(metadata.get("preferred_family", rotation_policy.get("preferred_family", "")) or "")
+        suppressed_family = str(metadata.get("suppressed_family", rotation_policy.get("suppressed_family", "")) or "")
+        rotation_confidence = float(metadata.get("rotation_confidence", rotation_policy.get("rotation_confidence", 0.0)) or 0.0)
+        if rotation_confidence > 0:
+            preferred_multiplier = float(getattr(self.config, "rotation_risk_preferred_multiplier", 1.06) or 1.06)
+            suppressed_multiplier = float(getattr(self.config, "rotation_risk_suppressed_multiplier", 0.90) or 0.90)
+            scaled_preferred = 1.0 + ((preferred_multiplier - 1.0) * max(0.0, min(rotation_confidence, 1.0)))
+            scaled_suppressed = 1.0 - ((1.0 - suppressed_multiplier) * max(0.0, min(rotation_confidence, 1.0)))
+            if strategy == preferred_family:
+                size_multiplier *= scaled_preferred
+            elif strategy == suppressed_family:
+                size_multiplier *= scaled_suppressed
+        sized = size * size_multiplier
+        return min(sized, max_size)
 
     def _iter_positions(self) -> list[Any]:
         positions: list[Any] = []
