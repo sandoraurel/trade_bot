@@ -24,6 +24,7 @@ from .simulation_service import (
     simulation_batch_dir,
     simulation_batch_paths,
     simulation_batch_stop_requested,
+    simulation_validation_paths,
     simulation_stop_requested,
     spawn_detached_simulation,
     spawn_detached_simulation_batch,
@@ -382,6 +383,198 @@ def run_simulation_batch_cli(
         print(_render_batch_status(final_status, as_json=as_json))
 
 
+def parse_validation_windows(raw: str | None) -> list[int]:
+    tokens = str(raw or "30,60,90").replace(";", ",").split(",")
+    windows: list[int] = []
+    seen: set[int] = set()
+    for token in tokens:
+        cleaned = token.strip().lower().removesuffix("d").strip()
+        if not cleaned:
+            continue
+        try:
+            value = int(cleaned)
+        except ValueError as exc:
+            raise ValueError(f"Invalid validation window: {token!r}") from exc
+        if value <= 0:
+            raise ValueError(f"Validation windows must be positive days: {token!r}")
+        if value not in seen:
+            windows.append(value)
+            seen.add(value)
+    if not windows:
+        raise ValueError("At least one validation window is required")
+    return windows
+
+
+def _attach_validation_suite_metadata(
+    summary: dict,
+    *,
+    windows: list[int],
+    repeat: int,
+    timeframe: str,
+    trading_mode: str,
+    use_default_universe: bool,
+) -> dict:
+    summary["validation_suite"] = {
+        "windows": list(windows),
+        "repeat_per_window": int(repeat),
+        "timeframe": timeframe,
+        "trading_mode": trading_mode,
+        "use_default_universe": bool(use_default_universe),
+        "total_expected_runs": int(len(windows) * repeat),
+    }
+    return summary
+
+
+def render_validation_suite_summary(summary: dict, *, as_json: bool = False) -> str:
+    if as_json:
+        return json.dumps(summary, indent=2, sort_keys=True, default=str)
+    if int(summary.get("num_runs", 0) or 0) <= 0:
+        return "No completed simulation validation runs found."
+    suite = dict(summary.get("validation_suite", {}) or {})
+    aggregates = dict(summary.get("aggregates", {}) or {})
+    candidate_verdict = dict(summary.get("candidate_verdict", {}) or {})
+    validation_harness = dict(summary.get("validation_harness", {}) or {})
+    validation_targets = dict(summary.get("validation_targets", {}) or {})
+    market_data = dict(summary.get("market_data", {}) or {})
+    windows = suite.get("windows", [])
+    lines = [
+        f"Validation Runs: {int(summary.get('num_runs', 0) or 0)}",
+        "Windows: " + ", ".join(f"{int(window)}d" for window in windows) if windows else "Windows: n/a",
+        f"Repeat Per Window: {int(suite.get('repeat_per_window', 0) or 0)}",
+        f"Avg Trades: {float(dict(aggregates.get('num_trades', {}) or {}).get('avg', 0.0) or 0.0):.2f}",
+        f"Avg Return: {float(dict(aggregates.get('total_return_pct', {}) or {}).get('avg', 0.0) or 0.0):.4f}%",
+        f"Avg Win Rate: {float(dict(aggregates.get('win_rate_pct', {}) or {}).get('avg', 0.0) or 0.0):.2f}%",
+    ]
+    if candidate_verdict:
+        reasons = list(candidate_verdict.get("reasons", []) or [])
+        lines.append(
+            "Candidate Verdict: "
+            f"{candidate_verdict.get('status', 'unknown')}"
+            + (f" ({', '.join(str(reason) for reason in reasons[:5])})" if reasons else "")
+        )
+    if validation_harness:
+        lines.append(
+            "Validation Harness: "
+            f"signal_to_submission={float(validation_harness.get('signal_to_submission_pct', 0.0) or 0.0):.2f}%, "
+            f"submission_to_fill={float(validation_harness.get('submission_to_fill_pct', 0.0) or 0.0):.2f}%, "
+            f"sl_negative_pl_share={float(validation_harness.get('stop_loss_negative_pl_share_pct', 0.0) or 0.0):.2f}%, "
+            f"fresh_setup_density={float(validation_harness.get('fresh_setup_block_density_pct', 0.0) or 0.0):.2f}%, "
+            f"triple_barrier_labels={int(validation_harness.get('triple_barrier_labels', 0) or 0)}, "
+            f"tb_tp_first={float(validation_harness.get('triple_barrier_tp_first_pct', 0.0) or 0.0):.2f}%, "
+            f"tb_sl_first={float(validation_harness.get('triple_barrier_sl_first_pct', 0.0) or 0.0):.2f}%, "
+            f"tb_time_exit={float(validation_harness.get('triple_barrier_time_exit_pct', 0.0) or 0.0):.2f}%, "
+            f"pullback_meta_blocks={int(validation_harness.get('pullback_meta_filter_blocks', 0) or 0)}"
+        )
+        candidate_flow = dict(validation_harness.get("candidate_flow", {}) or {})
+        if candidate_flow:
+            top_blockers = dict(candidate_flow.get("top_blockers", {}) or {})
+            blocker_text = ", ".join(f"{key}={value}" for key, value in list(top_blockers.items())[:5])
+            lines.append(
+                "Candidate Flow: "
+                f"starved_runs={int(candidate_flow.get('starved_runs', 0) or 0)}, "
+                f"starved_run_pct={float(candidate_flow.get('starved_run_pct', 0.0) or 0.0):.2f}%, "
+                f"proposals={int(candidate_flow.get('proposals', 0) or 0)}, "
+                f"raw={int(candidate_flow.get('raw_signals', 0) or 0)}, "
+                f"submitted={int(candidate_flow.get('submitted_orders', 0) or 0)}, "
+                f"filled={int(candidate_flow.get('filled_orders', 0) or 0)}, "
+                f"closed={int(candidate_flow.get('closed_trades', 0) or 0)}, "
+                f"top_blockers={blocker_text or 'none'}"
+            )
+    if validation_targets:
+        blockers = list(validation_targets.get("top_blockers", []) or [])
+        blocker_text = ", ".join(
+            f"{dict(item).get('name', 'unknown')}={float(dict(item).get('gap', 0.0) or 0.0):.2f}"
+            for item in blockers[:4]
+        )
+        lines.append(
+            "Goal Progress: "
+            f"readiness={float(validation_targets.get('readiness_score', 0.0) or 0.0):.1f}/100, "
+            f"trades/day={float(validation_targets.get('avg_trades_per_day', 0.0) or 0.0):.3f}/"
+            f"{float(validation_targets.get('target_trades_per_day_min', 2.0) or 2.0):.1f}-{float(validation_targets.get('target_trades_per_day_max', 3.0) or 3.0):.1f}, "
+            f"return_gap={float(validation_targets.get('return_gap_to_positive_pct', 0.0) or 0.0):.4f}%, "
+            f"top_blockers={blocker_text or 'none'}"
+        )
+        lines.append(
+            "Flow Status: "
+            f"{validation_targets.get('candidate_flow_status', 'unknown')}, "
+            f"flow_recovered={bool(validation_targets.get('flow_recovered', False))}, "
+            f"flow_starved={bool(validation_targets.get('flow_starved', False))}, "
+            f"readiness_penalty={float(validation_targets.get('readiness_penalty', 0.0) or 0.0):.1f}"
+        )
+    if market_data:
+        lines.append(
+            "Market Data: "
+            f"runs_with_data={int(market_data.get('runs_with_data', 0) or 0)}, "
+            f"runs_without_data={int(market_data.get('runs_without_data', 0) or 0)}, "
+            f"datasets_loaded={int(market_data.get('datasets_loaded', 0) or 0)}, "
+            f"datasets_missing={int(market_data.get('datasets_missing', 0) or 0)}, "
+            f"rows={int(market_data.get('total_rows', 0) or 0)}"
+        )
+    for label, horizon_summary in sorted(dict(summary.get("by_horizon", {}) or {}).items()):
+        horizon_aggregates = dict(horizon_summary.get("aggregates", {}) or {})
+        horizon_verdict = dict(horizon_summary.get("candidate_verdict", {}) or {})
+        lines.append(
+            f"Window {label}: "
+            f"runs={int(horizon_summary.get('num_runs', 0) or 0)}, "
+            f"avg_return={float(dict(horizon_aggregates.get('total_return_pct', {}) or {}).get('avg', 0.0) or 0.0):.4f}%, "
+            f"avg_trades={float(dict(horizon_aggregates.get('num_trades', {}) or {}).get('avg', 0.0) or 0.0):.2f}, "
+            f"avg_win_rate={float(dict(horizon_aggregates.get('win_rate_pct', {}) or {}).get('avg', 0.0) or 0.0):.2f}%, "
+            f"verdict={str(horizon_verdict.get('status', 'unknown'))}"
+        )
+    return "\n".join(lines)
+
+
+def run_simulation_validation_cli(
+    *,
+    symbol: str,
+    windows: list[int],
+    timeframe: str,
+    trading_mode: str,
+    as_json: bool,
+    repeat: int,
+    use_default_universe: bool,
+) -> None:
+    base_dir = resolve_runtime_base_dir()
+    paths = simulation_validation_paths(base_dir)
+    os.makedirs(paths["runs_dir"], exist_ok=True)
+    repeat = max(int(repeat or 1), 1)
+    config = BotConfig(
+        starting_balance=10000.0,
+        telegram_bot_token="",
+        telegram_chat_id="",
+        api_key="",
+        api_secret="",
+        use_paper_trading=True,
+        trading_mode=trading_mode,
+    )
+    reports: list[dict] = []
+    for days in windows:
+        for run_index in range(1, repeat + 1):
+            run_stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+            run_name = f"run_{int(days)}d_{run_index:04d}_{run_stamp}"
+            artifact_dir = os.path.join(paths["runs_dir"], run_name)
+            engine = BacktestEngine(config, artifact_dir=artifact_dir)
+            if use_default_universe:
+                result = engine.run_campaign(config.symbols, timeframe=timeframe, days=int(days))
+            else:
+                result = engine.run_backtest(symbol, timeframe, int(days))
+            result.setdefault("artifact_dir", artifact_dir)
+            with open(os.path.join(artifact_dir, "report.json"), "w", encoding="utf-8") as handle:
+                json.dump(result, handle, indent=2, sort_keys=True, default=str)
+            reports.append(result)
+    summary = _attach_validation_suite_metadata(
+        build_batch_summary(reports),
+        windows=windows,
+        repeat=repeat,
+        timeframe=timeframe,
+        trading_mode=trading_mode,
+        use_default_universe=use_default_universe,
+    )
+    with open(paths["summary"], "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True, default=str)
+    print(render_validation_suite_summary(summary, as_json=as_json))
+
+
 def render_simulation_batch_summary(base_dir: str, *, as_json: bool = False) -> str:
     paths = simulation_batch_paths(base_dir)
     reports = load_batch_reports(paths["runs_dir"])
@@ -508,6 +701,7 @@ def render_simulation_batch_summary(base_dir: str, *, as_json: bool = False) -> 
     exit_quality = dict(summary.get("exit_quality", {}) or {})
     fill_conversion_by_strategy = dict(summary.get("fill_conversion_by_strategy", {}) or {})
     universe_selection = dict(summary.get("universe_selection", {}) or {})
+    validation_harness = dict(summary.get("validation_harness", {}) or {})
     upgraded_by_strategy = sorted(dict(decision_totals.get("limit_to_market_upgrades_by_strategy", {}) or {}).items(), key=lambda item: item[1], reverse=True)[:5]
     queue_priority_by_strategy = sorted(dict(decision_totals.get("limit_queue_priority_assists_by_strategy", {}) or {}).items(), key=lambda item: item[1], reverse=True)[:5]
     latency_reduced_by_strategy = sorted(dict(decision_totals.get("limit_latency_reductions_by_strategy", {}) or {}).items(), key=lambda item: item[1], reverse=True)[:5]
@@ -545,6 +739,11 @@ def render_simulation_batch_summary(base_dir: str, *, as_json: bool = False) -> 
     top_exit_reason_expectancy = sorted(
         dict(exit_quality.get("by_exit_reason", {}) or {}).items(),
         key=lambda item: float(dict(item[1] or {}).get("trades", 0.0) or 0.0),
+        reverse=True,
+    )[:5]
+    top_exit_group_quality = sorted(
+        dict(exit_quality.get("by_exit_group", {}) or {}).items(),
+        key=lambda item: float(dict(item[1] or {}).get("negative_pl_share_pct", 0.0) or 0.0),
         reverse=True,
     )[:5]
     top_giveback_by_strategy = sorted(
@@ -647,6 +846,8 @@ def render_simulation_batch_summary(base_dir: str, *, as_json: bool = False) -> 
     top_realized_universe_adjustments_by_bucket = sorted(dict(universe_selection.get("realized_universe_adjustments_by_bucket", {}) or {}).items(), key=lambda item: abs(item[1]), reverse=True)[:5]
     top_realized_universe_vetoes = sorted(dict(universe_selection.get("realized_universe_vetoes", {}) or {}).items(), key=lambda item: item[1], reverse=True)[:5]
     top_realized_universe_vetoes_by_bucket = sorted(dict(universe_selection.get("realized_universe_vetoes_by_bucket", {}) or {}).items(), key=lambda item: item[1], reverse=True)[:5]
+    repeated_setup_blocks = int(validation_harness.get("repeated_setup_blocks", 0) or 0)
+    fresh_setup_blocks = int(validation_harness.get("fresh_setup_blocks", 0) or 0)
     if top_signal_sources:
         lines.append("Signals By Strategy: " + ", ".join(f"{key}={value}" for key, value in top_signal_sources))
     if top_skip_reasons:
@@ -682,6 +883,42 @@ def render_simulation_batch_summary(base_dir: str, *, as_json: bool = False) -> 
             f"touch_escalations={int(execution_totals.get('touch_escalations', 0) or 0)}, "
             f"partial_profit_takes={int(execution_totals.get('partial_profit_takes', 0) or 0)}"
         )
+    if validation_harness:
+        lines.append(
+            "Validation Harness: "
+            f"signal_to_submission={float(validation_harness.get('signal_to_submission_pct', 0.0) or 0.0):.2f}%, "
+            f"submission_to_fill={float(validation_harness.get('submission_to_fill_pct', 0.0) or 0.0):.2f}%, "
+            f"fill_to_close={float(validation_harness.get('fill_to_close_pct', 0.0) or 0.0):.2f}%, "
+            f"sl_negative_pl_share={float(validation_harness.get('stop_loss_negative_pl_share_pct', 0.0) or 0.0):.2f}%, "
+            f"repeated_setup_density={float(validation_harness.get('repeated_setup_density_pct', 0.0) or 0.0):.2f}%, "
+            f"repeated_setup_blocks={repeated_setup_blocks}, "
+            f"fresh_setup_density={float(validation_harness.get('fresh_setup_block_density_pct', 0.0) or 0.0):.2f}%, "
+            f"fresh_setup_blocks={fresh_setup_blocks}, "
+            f"triple_barrier_labels={int(validation_harness.get('triple_barrier_labels', 0) or 0)}, "
+            f"tb_tp_first={float(validation_harness.get('triple_barrier_tp_first_pct', 0.0) or 0.0):.2f}%, "
+            f"tb_sl_first={float(validation_harness.get('triple_barrier_sl_first_pct', 0.0) or 0.0):.2f}%, "
+            f"tb_time_exit={float(validation_harness.get('triple_barrier_time_exit_pct', 0.0) or 0.0):.2f}%, "
+            f"pullback_meta_blocks={int(validation_harness.get('pullback_meta_filter_blocks', 0) or 0)}"
+        )
+        candidate_flow = dict(validation_harness.get("candidate_flow", {}) or {})
+        if candidate_flow:
+            top_blockers = dict(candidate_flow.get("top_blockers", {}) or {})
+            blocker_text = ", ".join(f"{key}={value}" for key, value in list(top_blockers.items())[:5])
+            lines.append(
+                "Candidate Flow: "
+                f"starved_runs={int(candidate_flow.get('starved_runs', 0) or 0)}, "
+                f"starved_run_pct={float(candidate_flow.get('starved_run_pct', 0.0) or 0.0):.2f}%, "
+                f"proposals={int(candidate_flow.get('proposals', 0) or 0)}, "
+                f"raw={int(candidate_flow.get('raw_signals', 0) or 0)}, "
+                f"submitted={int(candidate_flow.get('submitted_orders', 0) or 0)}, "
+                f"filled={int(candidate_flow.get('filled_orders', 0) or 0)}, "
+                f"closed={int(candidate_flow.get('closed_trades', 0) or 0)}, "
+                f"top_blockers={blocker_text or 'none'}"
+            )
+    triple_barrier = dict(summary.get("triple_barrier", {}) or {})
+    top_triple_barrier_labels = sorted(dict(triple_barrier.get("label_counts", {}) or {}).items(), key=lambda item: item[1], reverse=True)[:5]
+    if top_triple_barrier_labels:
+        lines.append("Triple Barrier Labels: " + ", ".join(f"{key}={value}" for key, value in top_triple_barrier_labels))
     if top_acceptance:
         lines.append("Acceptance Totals: " + ", ".join(f"{key}={value}" for key, value in top_acceptance))
     if stability:
@@ -821,6 +1058,14 @@ def render_simulation_batch_summary(base_dir: str, *, as_json: bool = False) -> 
                 for reason, payload in top_exit_reason_expectancy
             )
         )
+    if top_exit_group_quality:
+        lines.append(
+            "Exit Damage By Group: "
+            + ", ".join(
+                f"{group}=expectancy:{float(dict(payload or {}).get('expectancy', 0.0) or 0.0):.4f}/neg_pl_share:{float(dict(payload or {}).get('negative_pl_share_pct', 0.0) or 0.0):.2f}%"
+                for group, payload in top_exit_group_quality
+            )
+        )
     if top_giveback_by_strategy:
         lines.append(
             "Winner Giveback By Strategy: "
@@ -832,11 +1077,38 @@ def render_simulation_batch_summary(base_dir: str, *, as_json: bool = False) -> 
     return "\n".join(lines)
 
 
+def render_simulation_validation_summary(base_dir: str, *, as_json: bool = False, windows: list[int] | None = None, repeat: int = 0) -> str:
+    paths = simulation_validation_paths(base_dir)
+    reports = load_batch_reports(paths["runs_dir"])
+    if os.path.exists(paths["summary"]):
+        with open(paths["summary"], "r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+    else:
+        summary = build_batch_summary(reports)
+    if "validation_suite" not in summary:
+        observed_windows = windows or sorted(
+            {
+                int(dict(dict(report.get("campaign_summary", {}) or {}).get("session", {}) or {}).get("days", report.get("days", 0)) or 0)
+                for report in reports
+                if int(dict(dict(report.get("campaign_summary", {}) or {}).get("session", {}) or {}).get("days", report.get("days", 0)) or 0) > 0
+            }
+        )
+        _attach_validation_suite_metadata(
+            summary,
+            windows=observed_windows,
+            repeat=int(repeat or 0),
+            timeframe="n/a",
+            trading_mode="n/a",
+            use_default_universe=False,
+        )
+    return render_validation_suite_summary(summary, as_json=as_json)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AI Trading Bot: Live | Backtest | Hyperopt | Status | Healthcheck")
     parser.add_argument(
         "mode",
-        choices=["live", "backtest", "hyperopt", "status", "healthcheck", "simulate", "simulation-status", "simulation-stop", "simulate-worker", "simulate-batch", "simulate-batch-worker", "simulation-batch-status", "simulation-batch-stop", "simulation-batch-summary", "telegram-operator"],
+        choices=["live", "backtest", "hyperopt", "status", "healthcheck", "simulate", "simulation-status", "simulation-stop", "simulate-worker", "simulate-batch", "simulate-batch-worker", "simulation-batch-status", "simulation-batch-stop", "simulation-batch-summary", "simulation-validation", "simulation-validation-summary", "telegram-operator"],
         help="Runtime mode",
     )
     parser.add_argument("--symbol", default="BTC/USDT", help="Trading pair")
@@ -850,6 +1122,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--detach", action="store_true", help="Run simulation as a detached background worker")
     parser.add_argument("--repeat", type=int, default=0, help="Number of repeated simulations for batch mode; 0 means run until stopped")
     parser.add_argument("--use-default-universe", action="store_true", help="Use the config default multi-symbol universe instead of --symbol")
+    parser.add_argument("--validation-windows", default="30,60,90", help="Comma-separated day windows for simulation-validation, for example 30,60,90")
     return parser
 
 
@@ -958,6 +1231,29 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.mode == "simulation-batch-summary":
         print(render_simulation_batch_summary(resolve_runtime_base_dir(), as_json=args.json))
+        return
+
+    if args.mode == "simulation-validation":
+        run_simulation_validation_cli(
+            symbol=args.symbol,
+            windows=parse_validation_windows(args.validation_windows),
+            timeframe=args.timeframe,
+            trading_mode=args.trading_mode,
+            as_json=bool(args.json),
+            repeat=max(int(args.repeat or 1), 1),
+            use_default_universe=bool(args.use_default_universe),
+        )
+        return
+
+    if args.mode == "simulation-validation-summary":
+        print(
+            render_simulation_validation_summary(
+                resolve_runtime_base_dir(),
+                as_json=args.json,
+                windows=parse_validation_windows(args.validation_windows),
+                repeat=max(int(args.repeat or 0), 0),
+            )
+        )
         return
 
     if args.mode == "status":

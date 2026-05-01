@@ -15,7 +15,7 @@ from typing import Optional, Dict, Any, Tuple, Sequence
 import time
 import datetime as dt
 import random
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from typing import Dict, List, Optional, Any
 from trade_bot.metrics import MetricsCollector
 from trade_bot.ai.assistant import BotOperatorAssistant, ensure_default_knowledge_base
@@ -336,6 +336,105 @@ class BotConfig:
     pullback_reclaim_close_location_min: float = 0.24
     pullback_reclaim_close_location_max: float = 0.76
     pullback_reclaim_buffer_atr_fraction: float = 0.04
+    spot_major_pullback_expansion_enabled: bool = True
+    spot_major_pullback_min_score: float = 1.45
+    spot_major_pullback_min_trend_persistence: float = 0.50
+    spot_major_pullback_min_volume_impulse: float = 1.05
+    spot_major_pullback_max_volatility_percentile: float = 0.66
+    spot_major_pullback_max_entry_zscore: float = 0.22
+    spot_core_htf_fallback_enabled: bool = True
+    spot_core_htf_fallback_min_pullback_score: float = 1.30
+    spot_core_htf_fallback_min_trend_persistence: float = 0.42
+    spot_core_htf_fallback_min_volume_impulse: float = 0.98
+    spot_core_htf_fallback_max_volatility_percentile: float = 0.78
+    spot_core_htf_fallback_max_stretch: float = 0.035
+    spot_core_partial_htf_enabled: bool = True
+    spot_core_partial_htf_min_pullback_score: float = 1.24
+    spot_core_partial_htf_min_trend_persistence: float = 0.38
+    spot_core_partial_htf_min_volume_impulse: float = 0.92
+    spot_core_partial_htf_min_trend_efficiency: float = 0.08
+    spot_core_partial_htf_max_volatility_percentile: float = 0.84
+    spot_core_partial_htf_max_stretch: float = 0.040
+    spot_core_alignment_bridge_enabled: bool = True
+    spot_core_alignment_bridge_min_regime_confidence: float = 0.62
+    spot_core_alignment_bridge_min_pullback_score: float = 1.28
+    spot_core_alignment_bridge_min_trend_persistence: float = 0.40
+    spot_core_alignment_bridge_min_volume_impulse: float = 0.96
+    spot_core_alignment_bridge_min_trend_efficiency: float = 0.10
+    spot_core_alignment_bridge_max_volatility_percentile: float = 0.76
+    spot_core_alignment_bridge_max_entry_zscore: float = 0.24
+    spot_core_alignment_bridge_max_stretch: float = 0.026
+    spot_core_alignment_bridge_min_close_location: float = 0.46
+    spot_core_alignment_bridge_min_body_fraction: float = 0.12
+    spot_core_liquid_value_pullback_enabled: bool = True
+    spot_core_liquid_value_pullback_min_score: float = 2.25
+    spot_core_liquid_value_pullback_min_trend_persistence: float = 0.27
+    spot_core_liquid_value_pullback_min_volume_impulse: float = 0.68
+    spot_core_liquid_value_pullback_min_trend_efficiency: float = 0.30
+    spot_core_liquid_value_pullback_max_volatility_percentile: float = 0.65
+    spot_core_liquid_value_pullback_max_entry_zscore: float = -0.30
+    spot_core_liquid_value_pullback_max_abs_stretch: float = 0.010
+    spot_core_liquid_value_pullback_max_fast_slow_gap_atr: float = 0.18
+    spot_core_liquid_value_pullback_min_slow_anchor_gap_atr: float = 0.05
+    spot_core_local_structure_enabled: bool = True
+    spot_core_local_structure_min_pullback_score: float = 1.22
+    spot_core_local_structure_min_trend_persistence: float = 0.36
+    spot_core_local_structure_min_volume_impulse: float = 0.90
+    spot_core_local_structure_min_trend_efficiency: float = 0.08
+    spot_core_local_structure_max_volatility_percentile: float = 0.84
+    spot_core_local_structure_max_entry_zscore: float = 0.35
+    spot_core_local_structure_max_stretch: float = 0.040
+    spot_core_micro_reclaim_enabled: bool = True
+    spot_core_micro_reclaim_min_score: float = 1.34
+    spot_core_micro_reclaim_min_trend_persistence: float = 0.44
+    spot_core_micro_reclaim_min_volume_impulse: float = 1.00
+    spot_core_micro_reclaim_max_volatility_percentile: float = 0.72
+    spot_core_micro_reclaim_max_entry_zscore: float = 0.18
+    spot_core_micro_reclaim_max_pullback_atr: float = 0.46
+    spot_core_micro_reclaim_min_close_location: float = 0.46
+    spot_core_micro_reclaim_min_body_fraction: float = 0.16
+    spot_core_safe_reopen_enabled: bool = True
+    spot_core_safe_reopen_symbols: Tuple[str, ...] = ("BTC/USDT", "ETH/USDT", "BNB/USDT", "XRP/USDT")
+    spot_core_safe_reopen_min_pullback_score: float = 1.42
+    spot_core_safe_reopen_min_trend_persistence: float = 0.46
+    spot_core_safe_reopen_min_volume_impulse: float = 0.96
+    spot_core_safe_reopen_min_trend_efficiency: float = 0.18
+    spot_core_safe_reopen_max_volatility_percentile: float = 0.74
+    spot_core_safe_reopen_max_entry_zscore: float = 0.24
+    spot_core_safe_reopen_max_stretch: float = 0.026
+    spot_core_safe_reopen_min_close_location: float = 0.38
+    spot_core_safe_reopen_min_body_fraction: float = 0.10
+    spot_core_safe_reopen_max_pullback_atr: float = 0.86
+    candidate_flow_rescue_enabled: bool = True
+    candidate_flow_rescue_symbols: Tuple[str, ...] = ("BTC/USDT", "ETH/USDT", "BNB/USDT", "XRP/USDT")
+    candidate_flow_rescue_min_regime_confidence: float = 0.64
+    candidate_flow_rescue_min_pullback_score: float = 0.88
+    candidate_flow_rescue_min_trend_persistence: float = 0.30
+    candidate_flow_rescue_min_volume_impulse: float = 0.55
+    candidate_flow_rescue_min_trend_efficiency: float = 0.04
+    candidate_flow_rescue_max_volatility_percentile: float = 0.86
+    candidate_flow_rescue_max_entry_zscore: float = 0.40
+    candidate_flow_rescue_max_abs_stretch: float = 0.040
+    candidate_flow_rescue_min_rank_score: float = 1.45
+    candidate_flow_rescue_calibration_floor: float = 0.34
+    candidate_flow_rescue_quality_gate_enabled: bool = True
+    candidate_flow_rescue_quality_gate_min_rank_score: float = 1.72
+    candidate_flow_rescue_quality_gate_sl_first_min_rank_score: float = 2.05
+    candidate_flow_rescue_quality_gate_min_pullback_score: float = 0.98
+    candidate_flow_rescue_quality_gate_min_trend_persistence: float = 0.34
+    candidate_flow_rescue_quality_gate_min_directional_efficiency: float = 0.08
+    candidate_flow_rescue_quality_gate_max_volatility_percentile: float = 0.82
+    spot_core_constructive_regime_enabled: bool = True
+    spot_core_constructive_regime_min_pullback_score: float = 1.30
+    spot_core_constructive_regime_min_trend_persistence: float = 0.42
+    spot_core_constructive_regime_min_volume_impulse: float = 0.98
+    spot_core_constructive_regime_min_directional_efficiency: float = 0.12
+    spot_core_constructive_regime_max_volatility_percentile: float = 0.78
+    spot_core_constructive_regime_max_stretch: float = 0.035
+    spot_core_infer_bullish_direction_enabled: bool = True
+    spot_core_infer_bullish_min_trend_efficiency: float = 0.08
+    spot_core_infer_bullish_min_volume_impulse: float = 0.90
+    spot_core_infer_bullish_max_volatility_percentile: float = 0.82
     min_signal_quality_score: float = 0.55
     min_reliable_regime_confidence: float = 0.54
     min_reliable_rr_ratio_trend: float = 1.35
@@ -351,6 +450,29 @@ class BotConfig:
     min_hurst_for_trend_breakout: float = 0.16
     min_hurst_for_trend_pullback: float = 0.18
     max_hurst_for_mean_reversion: float = 0.60
+    state_gate_breakout_min_trend_persistence: float = 0.42
+    state_gate_breakout_min_liquidity_score: float = 0.72
+    state_gate_breakout_min_directional_efficiency: float = 0.34
+    state_gate_breakout_max_crash_risk: float = 0.62
+    state_gate_pullback_min_trend_persistence: float = 0.48
+    state_gate_pullback_min_liquidity_score: float = 0.74
+    state_gate_pullback_min_pullback_score: float = 1.32
+    state_gate_pullback_max_realized_vol_percentile: float = 0.82
+    state_gate_pullback_constructive_regimes: Tuple[str, ...] = ("choppy", "neutral", "high_volatility")
+    state_gate_pullback_constructive_min_trend_persistence: float = 0.34
+    state_gate_pullback_constructive_min_liquidity_score: float = 0.68
+    state_gate_pullback_constructive_min_pullback_score: float = 0.96
+    state_gate_pullback_constructive_min_directional_efficiency: float = 0.08
+    state_gate_pullback_constructive_max_realized_vol_percentile: float = 0.88
+    state_gate_pullback_constructive_max_crash_risk: float = 0.68
+    state_gate_mean_reversion_min_liquidity_score: float = 0.78
+    state_gate_mean_reversion_min_score: float = 1.22
+    state_gate_mean_reversion_max_directional_efficiency: float = 0.30
+    spot_filter_short_proposals: bool = True
+    spot_long_state_gate_relaxation: float = 0.06
+    spot_long_quality_floor_delta: float = 0.03
+    spot_long_edge_floor_delta_bps: float = 4.0
+    spot_long_rr_floor_delta: float = 0.12
     mean_reversion_entry_zscore: float = 1.10
     mean_reversion_max_efficiency: float = 0.48
     mean_reversion_min_exhaustion_score: float = 0.42
@@ -368,6 +490,9 @@ class BotConfig:
     use_paper_trading: bool = False
     # Execution mode
     trading_mode: str = "spot"  # "spot", "futures", or "mixed"
+    historical_data_cache_enabled: bool = True
+    historical_data_cache_dir: str = "data/historical_cache"
+    historical_data_cache_max_staleness_hours: float = 168.0
     # Safety
     daily_loss_limit_fraction: float = 0.10  # 10% max daily loss
     consecutive_loss_threshold: int = 2
@@ -396,6 +521,10 @@ class BotConfig:
     profit_protect_breakout_lock_rr: float = 0.20
     profit_protect_pullback_lock_rr: float = 0.10
     profit_protect_mean_reversion_lock_rr: float = 0.18
+    high_beta_pullback_profit_protect_trigger_rr: float = 0.35
+    high_beta_pullback_profit_protect_lock_rr: float = 0.04
+    spot_core_pullback_profit_protect_trigger_rr: float = 0.40
+    spot_core_pullback_profit_protect_lock_rr: float = 0.03
     mean_reversion_profit_capture_trigger_rr: float = 0.45
     mean_reversion_profit_capture_lock_rr: float = 0.30
     mean_reversion_reclaim_failure_activation_rr: float = 0.25
@@ -404,6 +533,33 @@ class BotConfig:
     partial_profit_take_breakout_fraction: float = 0.35
     partial_profit_take_mean_reversion_trigger_rr: float = 0.70
     partial_profit_take_mean_reversion_fraction: float = 0.50
+    partial_profit_take_high_beta_pullback_trigger_rr: float = 0.35
+    partial_profit_take_high_beta_pullback_fraction: float = 0.45
+    partial_profit_take_high_beta_pullback_stop_lock_rr: float = 0.12
+    partial_profit_take_spot_core_pullback_trigger_rr: float = 0.40
+    partial_profit_take_spot_core_pullback_fraction: float = 0.35
+    partial_profit_take_spot_core_pullback_stop_lock_rr: float = 0.12
+    partial_profit_protected_exit_min_lock_rr: float = 0.04
+    partial_profit_fee_aware_stop_lock_enabled: bool = True
+    partial_profit_fee_aware_stop_lock_buffer_bps: float = 2.0
+    partial_profit_fee_aware_stop_lock_max_rr: float = 0.18
+    regime_exit_profiles_enabled: bool = True
+    regime_exit_trend_partial_lock_multiplier: float = 0.85
+    regime_exit_trend_trailing_rr_multiplier: float = 1.10
+    regime_exit_trend_trailing_atr_multiplier: float = 1.15
+    regime_exit_choppy_partial_lock_multiplier: float = 1.25
+    regime_exit_choppy_trailing_rr_multiplier: float = 0.85
+    regime_exit_choppy_trailing_atr_multiplier: float = 0.80
+    regime_exit_risk_off_partial_lock_multiplier: float = 1.50
+    regime_exit_risk_off_trailing_rr_multiplier: float = 0.70
+    regime_exit_risk_off_trailing_atr_multiplier: float = 0.65
+    regime_exit_risk_off_close_floor_rr: float = -0.06
+    regime_exit_choppy_close_floor_rr: float = -0.09
+    winner_follow_through_filter_enabled: bool = True
+    winner_follow_through_confirm_bars: int = 2
+    winner_follow_through_min_mfe_r: float = 0.35
+    winner_follow_through_min_progress_after_partial_rr: float = 0.10
+    winner_follow_through_max_giveback_rr: float = 0.22
     mean_reversion_reclaim_failure_cooldown_bars: int = 6
     breakout_volatility_exit_cooldown_bars: int = 8
     volatility_tightening_trigger_ratio: float = 1.30
@@ -509,6 +665,9 @@ class BotConfig:
     simulation_aggressive_entry_edge_floor_bps: float = 18.0
     simulation_aggressive_entry_max_distance_bps: float = 14.0
     simulation_aggressive_entry_rr_floor: float = 1.45
+    simulation_pullback_aggressive_market_enabled: bool = False
+    simulation_pullback_aggressive_min_close_location: float = 0.52
+    simulation_pullback_aggressive_min_body_fraction: float = 0.18
     simulation_breakout_aggressive_entry_quality_floor: float = 0.80
     simulation_breakout_aggressive_entry_edge_floor_bps: float = 26.0
     simulation_breakout_aggressive_entry_max_distance_bps: float = 8.0
@@ -555,6 +714,11 @@ class BotConfig:
     simulation_weak_cluster_min_trades: int = 2
     simulation_weak_cluster_negative_expectancy_floor: float = -1.0
     simulation_universe_top_n: int = 6
+    frequency_expansion_enabled: bool = True
+    frequency_expansion_min_closed_trades: int = 3
+    frequency_expansion_max_stop_loss_negative_pl_share_pct: float = 55.0
+    frequency_expansion_min_best_strategy_expectancy: float = 0.0
+    frequency_expansion_universe_top_n_delta: int = 2
     simulation_universe_tradability_floor: float = 45.0
     simulation_universe_spread_penalty_weight: float = 1.4
     simulation_universe_volatility_penalty_weight: float = 60.0
@@ -565,6 +729,9 @@ class BotConfig:
     simulation_universe_bucket_cap_high_beta_alts: int = 2
     simulation_universe_bucket_cap_slower_large_caps: int = 2
     simulation_universe_bucket_cap_other: int = 2
+    simulation_spot_core_symbol_reservation_enabled: bool = True
+    simulation_spot_core_symbol_min_count: int = 4
+    simulation_spot_core_symbols: List[str] = field(default_factory=lambda: ["BTC/USDT", "ETH/USDT", "BNB/USDT", "XRP/USDT"])
     simulation_universe_regime_lookback_bars: int = 20
     simulation_universe_regime_high_vol_threshold: float = 0.02
     simulation_universe_regime_trend_strength_threshold: float = 0.015
@@ -581,11 +748,75 @@ class BotConfig:
     simulation_universe_realized_boost_score: float = 5.0
     simulation_universe_realized_veto_min_trades: int = 2
     simulation_universe_realized_veto_expectancy_floor: float = -8.0
+    simulation_universe_strategy_rotation_enabled: bool = True
+    simulation_universe_strategy_rotation_min_trades: int = 2
+    simulation_universe_strategy_rotation_positive_floor: float = 2.0
+    simulation_universe_strategy_rotation_negative_floor: float = -8.0
+    simulation_universe_strategy_rotation_boost_score: float = 7.0
+    simulation_universe_strategy_rotation_penalty_score: float = 4.0
     simulation_symbol_probation_veto_min_trades: int = 1
     simulation_symbol_probation_veto_expectancy_floor: float = -20.0
     simulation_disable_trend_pullback: bool = False
     simulation_pullback_strategy_veto_min_trades: int = 2
     simulation_pullback_strategy_veto_expectancy_floor: float = -20.0
+    simulation_trend_symbol_min_liquidity_score: float = 0.72
+    simulation_pullback_symbol_min_liquidity_score: float = 0.76
+    simulation_mean_reversion_symbol_min_liquidity_score: float = 0.80
+    simulation_trend_allow_high_beta_only_in_trend_supportive: bool = True
+    simulation_spot_high_beta_requires_trend_supportive: bool = True
+    simulation_spot_high_beta_pullback_min_trend_persistence: float = 0.50
+    simulation_spot_high_beta_pullback_min_score: float = 1.55
+    simulation_spot_high_beta_quality_escape_enabled: bool = True
+    simulation_spot_high_beta_quality_escape_min_score: float = 1.35
+    simulation_spot_high_beta_quality_escape_min_trend_persistence: float = 0.38
+    simulation_spot_high_beta_quality_escape_min_signal_quality: float = 0.76
+    simulation_spot_high_beta_quality_escape_min_edge_bps: float = 35.0
+    simulation_spot_high_beta_quality_escape_max_volatility_percentile: float = 0.72
+    simulation_spot_high_beta_quality_escape_max_stretch: float = 0.030
+    high_beta_quality_escape_risk_multiplier: float = 0.55
+    high_beta_pullback_thesis_fail_close_rr: float = -0.08
+    simulation_symbol_expectancy_decay_half_life_trades: float = 6.0
+    simulation_strategy_symbol_veto_min_trades: int = 2
+    simulation_pullback_symbol_veto_expectancy_floor: float = -18.0
+    simulation_breakout_symbol_veto_expectancy_floor: float = -14.0
+    simulation_mean_reversion_symbol_veto_expectancy_floor: float = -12.0
+    simulation_strategy_symbol_penalty_score: float = 4.0
+    simulation_repeat_setup_suppression_bars: int = 24
+    simulation_repeat_setup_entry_tolerance_bps: float = 20.0
+    simulation_repeat_setup_quality_floor: float = 0.70
+    simulation_repeat_setup_density_penalty_score: float = 6.0
+    simulation_repeat_setup_no_trade_penalty_bps: float = 3.0
+    simulation_fresh_setup_min_entry_shift_bps: float = 32.0
+    simulation_fresh_setup_min_score_improvement: float = 0.18
+    simulation_fresh_setup_block_quality_floor: float = 0.55
+    triple_barrier_labeling_enabled: bool = True
+    triple_barrier_label_horizon_bars: int = 12
+    triple_barrier_label_min_bucket_samples: int = 1
+    pullback_meta_filter_enabled: bool = True
+    pullback_meta_filter_min_bucket_samples: int = 3
+    pullback_meta_filter_max_sl_first_pct: float = 60.0
+    pullback_meta_filter_min_tp_first_pct: float = 20.0
+    pullback_meta_filter_quality_escape_score: float = 0.82
+    pullback_meta_filter_quality_escape_edge_bps: float = 45.0
+    breakout_thesis_fail_activation_rr: float = 0.10
+    breakout_thesis_fail_close_rr: float = -0.20
+    pullback_thesis_fail_activation_rr: float = 0.05
+    pullback_thesis_fail_close_rr: float = -0.15
+    pullback_thesis_fail_min_trend_persistence: float = 0.50
+    pullback_thesis_fail_reclaim_buffer_rr: float = 0.06
+    pullback_thesis_fail_structure_buffer_rr: float = 0.10
+    breakout_thesis_fail_structure_buffer_rr: float = 0.08
+    mean_reversion_thesis_fail_close_rr: float = -0.12
+    simulation_execution_urgency_market_threshold: float = 0.84
+    simulation_execution_urgency_marketable_limit_threshold: float = 0.68
+    simulation_execution_urgent_limit_threshold: float = 0.72
+    simulation_execution_urgent_limit_queue_cap: float = 0.18
+    simulation_execution_urgent_limit_latency_bars: int = 1
+    simulation_execution_urgent_limit_offset_multiplier: float = 0.25
+    simulation_execution_urgent_limit_liquidity_bonus: float = 0.12
+    simulation_execution_urgency_spread_guard_bps: float = 18.0
+    simulation_execution_urgency_breakout_bonus: float = 0.08
+    simulation_execution_urgency_pullback_penalty: float = 0.04
     simulation_snapshot_interval_bars: int = 250
     simulation_checkpoint_interval_bars: int = 250
     simulation_enable_checkpointing: bool = True
@@ -594,6 +825,9 @@ class BotConfig:
     target_trades_per_day_max: float = 3.0
     target_trades_per_day_soft_floor: float = 1.5
     target_trades_per_day_soft_ceiling: float = 3.5
+    promotion_max_stop_loss_negative_pl_share_pct: float = 55.0
+    promotion_min_signal_to_submission_pct: float = 18.0
+    promotion_min_submission_to_fill_pct: float = 45.0
     simulation_stress_every_n_bars: int = 0
     simulation_stress_shock_bps: float = 0.0
     simulation_queue_model: str = "fractional_queue"
@@ -615,6 +849,12 @@ class BotConfig:
     learning_drift_cusum_decay: float = 0.92
     learning_calibration_prior_strength: float = 6.0
     learning_calibration_gap_alpha: float = 0.15
+    learning_calibration_gate_min_samples: float = 6.0
+    learning_min_calibrated_confidence: float = 0.50
+    pullback_quality_calibration_relax_enabled: bool = True
+    pullback_quality_calibration_min_score: float = 0.72
+    pullback_quality_calibration_relaxation: float = 0.06
+    pullback_quality_calibration_max_relaxed_floor: float = 0.44
     learning_positive_update_min_samples: float = 8.0
     learning_positive_update_max_calibration_gap: float = 0.18
     learning_opportunity_min_samples: float = 6.0
@@ -664,6 +904,50 @@ class BotConfig:
     learning_family_rotation_hard_penalty_risk_cap: float = 0.74
     learning_family_rotation_hard_boost_score: float = 1.35
     learning_family_rotation_hard_boost_risk: float = 0.06
+    replacement_opportunity_enabled: bool = True
+    replacement_min_confidence_delta: float = 0.03
+    replacement_min_edge_delta_bps: float = 3.0
+    replacement_min_rr_delta: float = 0.05
+    replacement_cross_symbol_enabled: bool = True
+    replacement_cross_symbol_max_per_scan: int = 1
+    replacement_near_miss_enabled: bool = True
+    replacement_max_per_day: int = 2
+    replacement_max_per_symbol_per_day: int = 1
+    replacement_near_miss_min_regime_confidence: float = 0.85
+    replacement_near_miss_min_trend_persistence: float = 0.39
+    replacement_near_miss_min_volume_impulse: float = 1.02
+    replacement_near_miss_max_entry_zscore: float = 0.30
+    replacement_near_miss_max_volatility_percentile: float = 0.72
+    replacement_near_miss_min_liquidity_score: float = 0.85
+    replacement_near_miss_min_score: float = 1.58
+    replacement_near_miss_min_rank_score: float = 2.55
+    replacement_near_miss_bucket_rank_bonus_majors: float = 0.32
+    replacement_near_miss_bucket_rank_bonus_exchange_beta: float = 0.20
+    replacement_near_miss_bucket_rank_bonus_high_beta_alts: float = 0.14
+    replacement_profitability_filter_enabled: bool = True
+    replacement_profitability_min_opportunity_samples: float = 6.0
+    replacement_profitability_min_avg_forward_r: float = -0.05
+    replacement_profitability_min_positive_ratio: float = 0.48
+    second_best_candidate_enabled: bool = True
+    second_best_candidate_max_score_gap: float = 6.0
+    second_best_candidate_min_rr_improvement: float = 0.10
+    second_best_candidate_min_confidence: float = 0.60
+    second_best_candidate_min_edge_bps: float = 12.0
+    single_candidate_escape_enabled: bool = True
+    single_candidate_escape_min_confidence: float = 0.55
+    single_candidate_escape_min_edge_bps: float = 8.0
+    single_candidate_escape_min_rr: float = 1.05
+    single_candidate_escape_min_net_expectancy_bps: float = -50.0
+    single_candidate_escape_max_momentum_crash_risk: float = 0.66
+    single_candidate_escape_symbols: Tuple[str, ...] = ("BTC/USDT", "ETH/USDT")
+    pullback_confirmation_near_miss_enabled: bool = True
+    pullback_confirmation_near_miss_min_score: float = 1.58
+    pullback_confirmation_near_miss_min_trend_persistence: float = 0.40
+    pullback_confirmation_near_miss_min_volume_impulse: float = 1.02
+    pullback_confirmation_near_miss_max_entry_zscore: float = 0.28
+    pullback_confirmation_near_miss_max_stretch: float = 0.022
+    pullback_confirmation_near_miss_min_close_location: float = 0.42
+    pullback_confirmation_near_miss_min_body_fraction: float = 0.14
 
     def validate(self):
         """Basic configuration validation"""
@@ -1325,6 +1609,776 @@ class SignalEngine:
             **payload,
         }
 
+    def _replacement_candidate_snapshot(
+        self,
+        *,
+        symbol: str,
+        signal: Dict[str, Any],
+        regime: Any,
+        rejection_reason: str,
+    ) -> Dict[str, Any]:
+        metadata = dict(signal.get("metadata", {}) or {})
+        learning_context = dict(metadata.get("learning_context", {}) or {})
+        calibration = dict(learning_context.get("calibration", {}) or {})
+        return {
+            "symbol": symbol,
+            "strategy": str(signal.get("strategy", "unknown") or "unknown"),
+            "side": str(signal.get("side", "unknown") or "unknown"),
+            "rejection_reason": str(rejection_reason or "unknown"),
+            "raw_confidence": float(signal.get("signal_quality", signal.get("confidence", 0.0)) or 0.0),
+            "calibrated_confidence": float(calibration.get("calibrated_confidence", signal.get("signal_quality", 0.0)) or 0.0),
+            "calibration_samples": float(calibration.get("effective_samples", 0.0) or 0.0),
+            "expected_edge_bps": float(signal.get("expected_edge_bps", 0.0) or 0.0),
+            "rr_ratio": float(signal.get("rr_ratio", 0.0) or 0.0),
+            "regime": str(getattr(regime, "regime", signal.get("regime", "unknown")) or "unknown"),
+            "regime_confidence": float(getattr(regime, "confidence", 0.0) or 0.0),
+            "symbol_bucket": str(metadata.get("symbol_bucket", "") or ""),
+            "strategy_variant": str(metadata.get("strategy_variant", "") or ""),
+            "preferred_order_type": str(metadata.get("preferred_order_type", "") or ""),
+        }
+
+    def _near_miss_snapshot(
+        self,
+        *,
+        symbol: str,
+        strategy_name: str,
+        rejection_reason: str,
+        rejection_details: Dict[str, Any] | None = None,
+        regime: Any,
+        hurst: float,
+        research_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        regime_meta = dict(getattr(regime, "metadata", {}) or {})
+        details = dict(rejection_details or {})
+        return {
+            "symbol": symbol,
+            "strategy": str(strategy_name or "unknown"),
+            "rejection_reason": str(rejection_reason or "unknown"),
+            "regime": str(getattr(regime, "regime", "unknown") or "unknown"),
+            "regime_confidence": float(getattr(regime, "confidence", 0.0) or 0.0),
+            "trend_direction": str(regime_meta.get("trend_direction", "") or ""),
+            "pullback_score": float(regime_meta.get("pullback_score", 0.0) or 0.0),
+            "trend_persistence": float(regime_meta.get("trend_persistence", 0.0) or 0.0),
+            "volume_impulse": float(regime_meta.get("volume_impulse", 0.0) or 0.0),
+            "directional_efficiency": float(regime_meta.get("directional_efficiency", 0.0) or 0.0),
+            "entry_zscore": float(regime_meta.get("entry_zscore", 0.0) or 0.0),
+            "realized_vol_percentile": float(regime_meta.get("realized_vol_percentile", 0.0) or 0.0),
+            "stretch_from_mean": float(regime_meta.get("stretch_from_mean", 0.0) or 0.0),
+            "hurst_exponent": float(hurst or 0.0),
+            "research_state": str(dict(research_context or {}).get("state", "") or ""),
+            "rejection_detail": str(details.get("primary_detail", "") or ""),
+            "rejection_details": details,
+        }
+
+    def _replacement_symbol_bucket(self, symbol: str) -> str:
+        base = str(symbol or "").split("/")[0].upper()
+        if base in {"BTC", "ETH"}:
+            return "majors"
+        if base in {"BNB", "XRP"}:
+            return "exchange_beta"
+        if base in {"SOL", "AVAX"}:
+            return "high_beta_alts"
+        if base in {"ADA", "DOT", "LINK", "TON"}:
+            return "slower_large_caps"
+        return "other"
+
+    def _replacement_near_miss_rank_score(self, *, symbol: str, regime: Any) -> float:
+        bucket = self._replacement_symbol_bucket(symbol)
+        regime_meta = dict(getattr(regime, "metadata", {}) or {})
+        pullback_score = float(regime_meta.get("pullback_score", 0.0) or 0.0)
+        trend_persistence = float(regime_meta.get("trend_persistence", 0.0) or 0.0)
+        volume_impulse = float(regime_meta.get("volume_impulse", 0.0) or 0.0)
+        liquidity_score = float(getattr(regime, "liquidity_score", 0.0) or 0.0)
+        regime_confidence = float(getattr(regime, "confidence", 0.0) or 0.0)
+        realized_vol = float(regime_meta.get("realized_vol_percentile", 1.0) or 1.0)
+        entry_zscore = float(regime_meta.get("entry_zscore", 0.0) or 0.0)
+        score = (
+            pullback_score * 0.70
+            + trend_persistence * 0.95
+            + max(volume_impulse - 1.0, 0.0) * 1.15
+            + liquidity_score * 0.45
+            + regime_confidence * 0.55
+            - max(realized_vol - 0.55, 0.0) * 0.45
+            - max(entry_zscore - 0.20, 0.0) * 0.85
+        )
+        if bucket == "majors":
+            score += float(getattr(self.config, "replacement_near_miss_bucket_rank_bonus_majors", 0.32) or 0.32)
+        elif bucket == "exchange_beta":
+            score += float(getattr(self.config, "replacement_near_miss_bucket_rank_bonus_exchange_beta", 0.20) or 0.20)
+        elif bucket == "high_beta_alts":
+            score += float(getattr(self.config, "replacement_near_miss_bucket_rank_bonus_high_beta_alts", 0.14) or 0.14)
+        return score
+
+    def _replacement_profitability_reason(self, signal_payload: Dict[str, Any]) -> str | None:
+        if not bool(getattr(self.config, "replacement_profitability_filter_enabled", True)):
+            return None
+        metadata = dict(signal_payload.get("metadata", {}) or {})
+        learning_context = dict(metadata.get("learning_context", {}) or {})
+        if bool(learning_context.get("veto", False)):
+            return "replacement_learning_veto"
+        opportunity = dict(learning_context.get("opportunity", {}) or {})
+        samples = float(opportunity.get("samples", 0.0) or 0.0)
+        avg_forward_r = float(opportunity.get("avg_forward_r", 0.0) or 0.0)
+        positive_ratio = float(opportunity.get("positive_ratio", 0.0) or 0.0)
+        min_samples = float(getattr(self.config, "replacement_profitability_min_opportunity_samples", 6.0) or 6.0)
+        if samples < min_samples:
+            return None
+        if avg_forward_r < float(getattr(self.config, "replacement_profitability_min_avg_forward_r", -0.05) or -0.05):
+            return "replacement_negative_opportunity_expectancy"
+        if positive_ratio < float(getattr(self.config, "replacement_profitability_min_positive_ratio", 0.48) or 0.48):
+            return "replacement_low_opportunity_positive_ratio"
+        return None
+
+    @staticmethod
+    def _compact_ensemble_proposals(proposals: List[Dict[str, Any]], *, limit: int = 3) -> List[Dict[str, Any]]:
+        compact: List[Dict[str, Any]] = []
+        ranked = sorted(
+            [dict(item or {}) for item in list(proposals or [])],
+            key=lambda item: float(item.get("ensemble_score", float("-inf")) or float("-inf")),
+            reverse=True,
+        )
+        for item in ranked[: max(int(limit or 0), 0)]:
+            compact.append(
+                {
+                    "strategy": str(item.get("strategy", "unknown") or "unknown"),
+                    "ensemble_score": float(item.get("ensemble_score", 0.0) or 0.0),
+                    "net_expectancy_bps": float(item.get("net_expectancy_bps", 0.0) or 0.0),
+                    "rr_ratio": float(item.get("rr_ratio", 0.0) or 0.0),
+                    "confidence": float(item.get("confidence", 0.0) or 0.0),
+                    "expected_edge_bps": float(item.get("expected_edge_bps", 0.0) or 0.0),
+                    "frequency_reason": str(item.get("frequency_reason", "inactive") or "inactive"),
+                }
+            )
+        return compact
+
+    def _find_second_best_candidate_payload(
+        self,
+        *,
+        symbol: str,
+        proposals: List[Any],
+        regime: Any,
+        hurst: float,
+        research_context: Dict[str, Any],
+        decision: Any,
+    ) -> Optional[Dict[str, Any]]:
+        if not bool(getattr(self.config, "second_best_candidate_enabled", True)):
+            return None
+        proposal_rows = list(getattr(decision, "proposals", []) or [])
+        if len(proposals) < 2 or len(proposal_rows) < 2:
+            return None
+        ranked_rows = sorted(proposal_rows, key=lambda item: float(dict(item or {}).get("ensemble_score", float("-inf")) or float("-inf")), reverse=True)
+        top_row = dict(ranked_rows[0] or {})
+        second_row = dict(ranked_rows[1] or {})
+        top_score = float(top_row.get("ensemble_score", 0.0) or 0.0)
+        second_score = float(second_row.get("ensemble_score", 0.0) or 0.0)
+        if (top_score - second_score) > float(getattr(self.config, "second_best_candidate_max_score_gap", 6.0) or 6.0):
+            return None
+        if float(second_row.get("rr_ratio", 0.0) or 0.0) < float(top_row.get("rr_ratio", 0.0) or 0.0) + float(getattr(self.config, "second_best_candidate_min_rr_improvement", 0.10) or 0.10):
+            return None
+        if float(second_row.get("confidence", 0.0) or 0.0) < float(getattr(self.config, "second_best_candidate_min_confidence", 0.60) or 0.60):
+            return None
+        if float(second_row.get("expected_edge_bps", 0.0) or 0.0) < float(getattr(self.config, "second_best_candidate_min_edge_bps", 12.0) or 12.0):
+            return None
+
+        proposal_by_strategy = {
+            str(proposal.signal.strategy): proposal
+            for proposal in proposals
+        }
+        candidate_proposal = proposal_by_strategy.get(str(second_row.get("strategy", "") or ""))
+        if candidate_proposal is None:
+            return None
+        payload = self._signal_payload_from_model(
+            symbol=symbol,
+            signal=candidate_proposal.signal,
+            hurst=hurst,
+            research_context=research_context,
+            decision=decision,
+            regime=regime,
+        )
+        if self._reliability_rejection_reason(symbol, payload, regime, len(proposals)) is not None:
+            return None
+        metadata = dict(payload.get("metadata", {}) or {})
+        metadata["replacement_opportunity"] = {
+            "active": True,
+            "type": "second_best_candidate",
+            "top_strategy": str(top_row.get("strategy", "unknown") or "unknown"),
+            "score_gap": top_score - second_score,
+            "rr_improvement": float(second_row.get("rr_ratio", 0.0) or 0.0) - float(top_row.get("rr_ratio", 0.0) or 0.0),
+        }
+        payload["metadata"] = metadata
+        return payload
+
+    def _find_single_candidate_escape_payload(
+        self,
+        *,
+        symbol: str,
+        proposals: List[Any],
+        regime: Any,
+        hurst: float,
+        research_context: Dict[str, Any],
+        decision: Any,
+    ) -> Optional[Dict[str, Any]]:
+        if not bool(getattr(self.config, "single_candidate_escape_enabled", True)):
+            return None
+        if len(proposals) != 1:
+            return None
+        proposal_rows = list(getattr(decision, "proposals", []) or [])
+        if len(proposal_rows) != 1:
+            return None
+        rejected_reasons = [str(reason or "") for reason in list(getattr(decision, "rejected_reasons", []) or [])]
+        hard_veto_tokens = (
+            ":learning_veto",
+            ":research_conflict",
+            ":unstable_regime",
+            ":momentum_crash_risk",
+            ":rr_too_low",
+            ":edge_below_threshold",
+        )
+        if any(any(token in reason for token in hard_veto_tokens) for reason in rejected_reasons):
+            return None
+        proposal = proposals[0]
+        signal = proposal.signal
+        if str(signal.strategy) != "trend_pullback":
+            return None
+        row = dict(proposal_rows[0] or {})
+        metadata = dict(getattr(signal, "metadata", {}) or {})
+        rescue_active = bool(dict(metadata.get("candidate_flow_rescue", {}) or {}).get("active", False))
+        constructive_profile = str(metadata.get("profile_preference", "") or "") in {
+            "candidate_flow_rescue",
+            "constructive_core",
+            "safe_reopen",
+        }
+        allowed_symbols = {
+            str(item).strip().upper()
+            for item in getattr(self.config, "single_candidate_escape_symbols", ("BTC/USDT", "ETH/USDT")) or ()
+            if str(item).strip()
+        }
+        liquid_core_profile = str(symbol).upper() in allowed_symbols
+        if not rescue_active and not constructive_profile and not liquid_core_profile:
+            return None
+        confidence = float(row.get("confidence", getattr(signal, "confidence", 0.0)) or 0.0)
+        expected_edge = float(row.get("expected_edge_bps", getattr(signal, "expected_edge_bps", 0.0)) or 0.0)
+        risk = abs(float(getattr(signal, "entry_price", 0.0) or 0.0) - float(getattr(signal, "stop_loss", 0.0) or 0.0))
+        reward = abs(float(getattr(signal, "take_profit", 0.0) or 0.0) - float(getattr(signal, "entry_price", 0.0) or 0.0))
+        fallback_rr = reward / risk if risk > 0.0 else 0.0
+        rr_ratio = float(row.get("rr_ratio", fallback_rr) or 0.0)
+        net_expectancy = float(row.get("net_expectancy_bps", 0.0) or 0.0)
+        crash_risk = float(row.get("momentum_crash_risk", getattr(regime, "metadata", {}).get("momentum_crash_risk", 0.0)) or 0.0)
+        if confidence < float(getattr(self.config, "single_candidate_escape_min_confidence", 0.63) or 0.63):
+            return None
+        if expected_edge < float(getattr(self.config, "single_candidate_escape_min_edge_bps", 15.0) or 15.0):
+            return None
+        if rr_ratio < float(getattr(self.config, "single_candidate_escape_min_rr", 1.45) or 1.45):
+            return None
+        if net_expectancy < float(getattr(self.config, "single_candidate_escape_min_net_expectancy_bps", 2.0) or 2.0):
+            return None
+        if crash_risk > float(getattr(self.config, "single_candidate_escape_max_momentum_crash_risk", 0.66) or 0.66):
+            return None
+
+        payload = self._signal_payload_from_model(
+            symbol=symbol,
+            signal=signal,
+            hurst=hurst,
+            research_context=research_context,
+            decision=decision,
+            regime=regime,
+        )
+        reliability_reason = self._reliability_rejection_reason(symbol, payload, regime, len(proposals))
+        soft_reliability_reasons = {
+            "state_gate_pullback_regime",
+            "regime_mismatch_trend",
+            "signal_quality_below_threshold",
+            "expected_edge_below_threshold",
+            "calibrated_confidence_too_low",
+        }
+        if reliability_reason is not None and reliability_reason not in soft_reliability_reasons:
+            return None
+        payload_metadata = dict(payload.get("metadata", {}) or {})
+        payload_metadata["single_candidate_escape"] = {
+            "active": True,
+            "source_rejection": "negative_net_expectancy",
+            "soft_reliability_reason": reliability_reason,
+            "net_expectancy_bps": net_expectancy,
+            "confidence": confidence,
+            "expected_edge_bps": expected_edge,
+            "rr_ratio": rr_ratio,
+        }
+        payload_metadata["replacement_opportunity"] = {
+            "active": True,
+            "type": "single_candidate_escape",
+            "source_reason": "negative_net_expectancy",
+            "net_expectancy_bps": net_expectancy,
+        }
+        payload["metadata"] = payload_metadata
+        return payload
+
+    def _find_near_miss_replacement_signal_payload(
+        self,
+        *,
+        symbol: str,
+        strategy_rejection_reasons: Dict[str, str],
+        regime: Any,
+        hurst: float,
+        research_context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not bool(getattr(self.config, "replacement_near_miss_enabled", True)):
+            return None
+        if str(strategy_rejection_reasons.get("trend_pullback", "") or "") != "bullish_confirmation_missing":
+            return None
+        if str(getattr(regime, "regime", "") or "") != "trending":
+            return None
+        if float(getattr(regime, "confidence", 0.0) or 0.0) < float(getattr(self.config, "replacement_near_miss_min_regime_confidence", 0.85) or 0.85):
+            return None
+        if float(getattr(regime, "liquidity_score", 0.0) or 0.0) < float(getattr(self.config, "replacement_near_miss_min_liquidity_score", 0.85) or 0.85):
+            return None
+        regime_meta = dict(getattr(regime, "metadata", {}) or {})
+        if str(regime_meta.get("trend_direction", "") or "") != "bullish":
+            return None
+        if float(regime_meta.get("pullback_score", 0.0) or 0.0) < float(getattr(self.config, "replacement_near_miss_min_score", 1.58) or 1.58):
+            return None
+        if float(regime_meta.get("trend_persistence", 0.0) or 0.0) < float(getattr(self.config, "replacement_near_miss_min_trend_persistence", 0.39) or 0.39):
+            return None
+        if float(regime_meta.get("volume_impulse", 0.0) or 0.0) < float(getattr(self.config, "replacement_near_miss_min_volume_impulse", 1.02) or 1.02):
+            return None
+        if float(regime_meta.get("entry_zscore", 0.0) or 0.0) > float(getattr(self.config, "replacement_near_miss_max_entry_zscore", 0.30) or 0.30):
+            return None
+        if float(regime_meta.get("realized_vol_percentile", 0.0) or 0.0) > float(getattr(self.config, "replacement_near_miss_max_volatility_percentile", 0.72) or 0.72):
+            return None
+        bucket = self._replacement_symbol_bucket(symbol)
+        if bucket not in {"majors", "exchange_beta", "high_beta_alts"}:
+            return None
+        rank_score = self._replacement_near_miss_rank_score(symbol=symbol, regime=regime)
+        if rank_score < float(getattr(self.config, "replacement_near_miss_min_rank_score", 2.55) or 2.55):
+            return None
+
+        trend_pullback_strategy = next(
+            (strategy for strategy in list(getattr(self, "strategy_modules", []) or []) if str(getattr(strategy, "name", "") or "") == "trend_pullback"),
+            None,
+        )
+        if trend_pullback_strategy is None:
+            return None
+        override_config = replace(
+            self.config,
+            pullback_confirmation_near_miss_enabled=True,
+            pullback_confirmation_near_miss_min_score=min(
+                float(getattr(self.config, "pullback_confirmation_near_miss_min_score", 1.58) or 1.58),
+                float(getattr(self.config, "replacement_near_miss_min_score", 1.58) or 1.58),
+            ),
+            pullback_confirmation_near_miss_min_trend_persistence=min(
+                float(getattr(self.config, "pullback_confirmation_near_miss_min_trend_persistence", 0.40) or 0.40),
+                float(getattr(self.config, "replacement_near_miss_min_trend_persistence", 0.39) or 0.39),
+            ),
+            pullback_confirmation_near_miss_min_volume_impulse=min(
+                float(getattr(self.config, "pullback_confirmation_near_miss_min_volume_impulse", 1.02) or 1.02),
+                float(getattr(self.config, "replacement_near_miss_min_volume_impulse", 1.02) or 1.02),
+            ),
+            pullback_confirmation_near_miss_max_entry_zscore=max(
+                float(getattr(self.config, "pullback_confirmation_near_miss_max_entry_zscore", 0.28) or 0.28),
+                float(getattr(self.config, "replacement_near_miss_max_entry_zscore", 0.30) or 0.30),
+            ),
+            pullback_confirmation_near_miss_max_stretch=max(
+                float(getattr(self.config, "pullback_confirmation_near_miss_max_stretch", 0.022) or 0.022),
+                0.022,
+            ),
+        )
+        override_strategy = type(trend_pullback_strategy)(override_config, trend_pullback_strategy.exch, trend_pullback_strategy.helpers)
+        proposal = override_strategy.evaluate(symbol, regime)
+        if proposal is None:
+            return None
+
+        fallback_decision = type(
+            "_FallbackDecision",
+            (),
+            {
+                "signal": proposal.signal,
+                "selected_strategy": proposal.signal.strategy,
+                "proposals": [],
+                "rejected_reasons": [],
+                "regime": {
+                    "regime": getattr(regime, "regime", "unknown"),
+                    "confidence": float(getattr(regime, "confidence", 0.0) or 0.0),
+                },
+            },
+        )
+
+        payload = self._signal_payload_from_model(
+            symbol=symbol,
+            signal=proposal.signal,
+            hurst=hurst,
+            research_context=research_context,
+            decision=fallback_decision,
+            regime=regime,
+        )
+        reliability_reason = self._reliability_rejection_reason(symbol, payload, regime, 1)
+        if reliability_reason is not None:
+            return None
+        profitability_reason = self._replacement_profitability_reason(payload)
+        if profitability_reason is not None:
+            return None
+        metadata = dict(payload.get("metadata", {}) or {})
+        metadata["replacement_opportunity"] = {
+            "active": True,
+            "type": "near_miss_pullback",
+            "source_reason": "bullish_confirmation_missing",
+            "bucket": bucket,
+            "rank_score": rank_score,
+        }
+        metadata["near_miss_replacement"] = True
+        payload["metadata"] = metadata
+        payload["replacement_rank_score"] = rank_score
+        return payload
+
+    def _find_candidate_flow_rescue_signal_payload(
+        self,
+        *,
+        symbol: str,
+        strategy_rejection_reasons: Dict[str, str],
+        regime: Any,
+        hurst: float,
+        research_context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not bool(getattr(self.config, "candidate_flow_rescue_enabled", True)):
+            return None
+        pullback_rejection = str(strategy_rejection_reasons.get("trend_pullback", "") or "")
+        if pullback_rejection not in {
+            "regime_not_trend",
+            "bullish_higher_timeframe_not_aligned",
+            "bullish_pullback_shape_not_qualified",
+            "bullish_confirmation_missing",
+            "state_gate_pullback_regime",
+        }:
+            return None
+        allowed_symbols = {
+            str(item).strip().upper()
+            for item in getattr(self.config, "candidate_flow_rescue_symbols", ("BTC/USDT", "ETH/USDT", "BNB/USDT", "XRP/USDT")) or ()
+            if str(item).strip()
+        }
+        if symbol.upper() not in allowed_symbols:
+            return None
+        bucket = self._replacement_symbol_bucket(symbol)
+        if bucket not in {"majors", "exchange_beta"}:
+            return None
+        regime_meta = dict(getattr(regime, "metadata", {}) or {})
+        if str(regime_meta.get("trend_direction", "") or "") != "bullish":
+            return None
+        regime_confidence = float(getattr(regime, "confidence", 0.0) or 0.0)
+        pullback_score = float(regime_meta.get("pullback_score", 0.0) or 0.0)
+        trend_persistence = float(regime_meta.get("trend_persistence", 0.0) or 0.0)
+        volume_impulse = float(regime_meta.get("volume_impulse", 0.0) or 0.0)
+        trend_efficiency = float(regime_meta.get("directional_efficiency", 0.0) or 0.0)
+        realized_vol = float(regime_meta.get("realized_vol_percentile", 1.0) or 1.0)
+        entry_zscore = float(regime_meta.get("entry_zscore", 0.0) or 0.0)
+        stretch = abs(float(regime_meta.get("stretch_from_mean", 0.0) or 0.0))
+        liquidity_score = float(getattr(regime, "liquidity_score", 0.0) or 0.0)
+        if regime_confidence < float(getattr(self.config, "candidate_flow_rescue_min_regime_confidence", 0.64) or 0.64):
+            return None
+        if pullback_score < float(getattr(self.config, "candidate_flow_rescue_min_pullback_score", 0.88) or 0.88):
+            return None
+        if trend_persistence < float(getattr(self.config, "candidate_flow_rescue_min_trend_persistence", 0.30) or 0.30):
+            return None
+        if volume_impulse < float(getattr(self.config, "candidate_flow_rescue_min_volume_impulse", 0.55) or 0.55):
+            return None
+        if trend_efficiency < float(getattr(self.config, "candidate_flow_rescue_min_trend_efficiency", 0.04) or 0.04):
+            return None
+        if realized_vol > float(getattr(self.config, "candidate_flow_rescue_max_volatility_percentile", 0.86) or 0.86):
+            return None
+        if entry_zscore > float(getattr(self.config, "candidate_flow_rescue_max_entry_zscore", 0.40) or 0.40):
+            return None
+        if stretch > float(getattr(self.config, "candidate_flow_rescue_max_abs_stretch", 0.040) or 0.040):
+            return None
+        rank_score = (
+            pullback_score * 0.70
+            + trend_persistence * 0.80
+            + max(volume_impulse - 0.55, 0.0) * 0.45
+            + trend_efficiency * 0.60
+            + liquidity_score * 0.35
+            + regime_confidence * 0.40
+            - max(realized_vol - 0.70, 0.0) * 0.55
+            - max(entry_zscore - 0.25, 0.0) * 0.45
+        )
+        if bucket == "majors":
+            rank_score += 0.25
+        if rank_score < float(getattr(self.config, "candidate_flow_rescue_min_rank_score", 1.45) or 1.45):
+            return None
+
+        trend_pullback_strategy = next(
+            (strategy for strategy in list(getattr(self, "strategy_modules", []) or []) if str(getattr(strategy, "name", "") or "") == "trend_pullback"),
+            None,
+        )
+        if trend_pullback_strategy is None:
+            return None
+        override_config = replace(
+            self.config,
+            spot_core_safe_reopen_enabled=True,
+            spot_core_safe_reopen_symbols=tuple(sorted(allowed_symbols)),
+            spot_core_safe_reopen_min_pullback_score=min(float(getattr(self.config, "spot_core_safe_reopen_min_pullback_score", 1.42) or 1.42), pullback_score),
+            spot_core_safe_reopen_min_trend_persistence=min(float(getattr(self.config, "spot_core_safe_reopen_min_trend_persistence", 0.46) or 0.46), trend_persistence),
+            spot_core_safe_reopen_min_volume_impulse=min(float(getattr(self.config, "spot_core_safe_reopen_min_volume_impulse", 0.96) or 0.96), volume_impulse),
+            spot_core_safe_reopen_min_trend_efficiency=min(float(getattr(self.config, "spot_core_safe_reopen_min_trend_efficiency", 0.18) or 0.18), trend_efficiency),
+            spot_core_safe_reopen_max_volatility_percentile=max(float(getattr(self.config, "spot_core_safe_reopen_max_volatility_percentile", 0.74) or 0.74), realized_vol),
+            spot_core_safe_reopen_max_entry_zscore=max(float(getattr(self.config, "spot_core_safe_reopen_max_entry_zscore", 0.24) or 0.24), entry_zscore),
+            spot_core_safe_reopen_max_stretch=max(float(getattr(self.config, "spot_core_safe_reopen_max_stretch", 0.026) or 0.026), stretch),
+            spot_core_safe_reopen_min_close_location=0.18,
+            spot_core_safe_reopen_min_body_fraction=0.04,
+            spot_core_safe_reopen_max_pullback_atr=1.15,
+            spot_core_constructive_regime_min_pullback_score=min(float(getattr(self.config, "spot_core_constructive_regime_min_pullback_score", 1.30) or 1.30), pullback_score),
+            spot_core_constructive_regime_min_trend_persistence=min(float(getattr(self.config, "spot_core_constructive_regime_min_trend_persistence", 0.42) or 0.42), trend_persistence),
+            spot_core_constructive_regime_min_volume_impulse=min(float(getattr(self.config, "spot_core_constructive_regime_min_volume_impulse", 0.98) or 0.98), volume_impulse),
+            spot_core_constructive_regime_min_directional_efficiency=min(float(getattr(self.config, "spot_core_constructive_regime_min_directional_efficiency", 0.12) or 0.12), trend_efficiency),
+            spot_core_constructive_regime_max_volatility_percentile=max(float(getattr(self.config, "spot_core_constructive_regime_max_volatility_percentile", 0.78) or 0.78), realized_vol),
+            spot_core_constructive_regime_max_stretch=max(float(getattr(self.config, "spot_core_constructive_regime_max_stretch", 0.035) or 0.035), stretch),
+        )
+        override_strategy = type(trend_pullback_strategy)(override_config, trend_pullback_strategy.exch, trend_pullback_strategy.helpers)
+        proposal = override_strategy.evaluate(symbol, regime)
+        if proposal is None:
+            candles = self.exch.fetch_ohlcv(symbol, "15m", limit=40)
+            if not candles or len(candles) < 20:
+                return None
+            atr = self.compute_atr(symbol, "15m", period=14)
+            if atr is None or atr <= 0.0:
+                return None
+            last = candles[-1]
+            prev = candles[-2]
+            last_close = float(last[4])
+            prev_close = float(prev[4])
+            recent_low = min(float(candle[3]) for candle in candles[-8:])
+            recent_high = max(float(candle[2]) for candle in candles[-12:])
+            if last_close <= 0.0 or last_close < prev_close - (atr * 0.35):
+                return None
+            stop_loss = min(last_close - (atr * 0.88), recent_low - (atr * 0.10))
+            if stop_loss <= 0.0 or stop_loss >= last_close:
+                return None
+            risk = last_close - stop_loss
+            if risk < atr * 0.24 or risk > atr * 1.90:
+                return None
+            take_profit = max(recent_high, last_close + (risk * 1.58))
+            if take_profit <= last_close:
+                return None
+            reward = take_profit - last_close
+            rr_ratio = reward / risk if risk > 0.0 else 0.0
+            confidence = min(
+                0.78,
+                max(
+                    0.60,
+                    0.54
+                    + pullback_score * 0.06
+                    + trend_persistence * 0.05
+                    + max(volume_impulse - 0.80, 0.0) * 0.03
+                    - max(realized_vol - 0.72, 0.0) * 0.04,
+                ),
+            )
+            win_probability = min(0.64, max(0.52, confidence - 0.04))
+            expected_edge_bps = ((win_probability * reward) - ((1.0 - win_probability) * risk)) / last_close * 10000.0
+            metadata = {
+                "candidate_flow_rescue": {
+                    "active": True,
+                    "source_reason": pullback_rejection,
+                    "bucket": bucket,
+                    "rank_score": rank_score,
+                    "direct_synthesis": True,
+                },
+                "replacement_opportunity": {
+                    "active": True,
+                    "type": "candidate_flow_rescue_pullback",
+                    "source_reason": pullback_rejection,
+                    "bucket": bucket,
+                    "rank_score": rank_score,
+                },
+                "strategy_variant": "candidate_flow_rescue_pullback",
+                "profile_preference": "candidate_flow_rescue",
+                "confirmation_variant": "candidate_flow_rescue",
+                "symbol_bucket": bucket,
+                "trend_direction": "bullish",
+                "pullback_score": pullback_score,
+                "trend_persistence": trend_persistence,
+                "volume_impulse": volume_impulse,
+                "directional_efficiency": trend_efficiency,
+                "realized_vol_percentile": realized_vol,
+                "entry_zscore": entry_zscore,
+                "liquidity_score": liquidity_score,
+                "regime_confidence": regime_confidence,
+                "preferred_order_type": "limit",
+                "order_expiry_bars": 3,
+            }
+            payload = {
+                "symbol": symbol,
+                "side": "long",
+                "entry_price": last_close,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "strategy": "trend_pullback",
+                "fast_move": False,
+                "is_futures": False,
+                "signal_quality": confidence,
+                "expected_edge_bps": expected_edge_bps,
+                "expected_holding_minutes": 5 * 60,
+                "timeframe": "15m",
+                "regime": getattr(regime, "regime", "unknown"),
+                "rr_ratio": rr_ratio,
+                "hurst_exponent": hurst,
+                "metadata": metadata,
+                "research_context": research_context,
+                "ensemble": {
+                    "selected_strategy": "trend_pullback",
+                    "proposals": [],
+                    "rejected_reasons": [],
+                    "regime": {
+                        "regime": getattr(regime, "regime", "unknown"),
+                        "confidence": regime_confidence,
+                    },
+                },
+            }
+            metadata["learning_context"] = self._learning_context(symbol, payload, regime)
+            payload["metadata"] = metadata
+        else:
+            fallback_decision = type(
+                "_CandidateFlowRescueDecision",
+                (),
+                {
+                    "signal": proposal.signal,
+                    "selected_strategy": proposal.signal.strategy,
+                    "proposals": [],
+                    "rejected_reasons": [],
+                    "regime": {
+                        "regime": getattr(regime, "regime", "unknown"),
+                        "confidence": regime_confidence,
+                    },
+                },
+            )
+            payload = self._signal_payload_from_model(
+                symbol=symbol,
+                signal=proposal.signal,
+                hurst=hurst,
+                research_context=research_context,
+                decision=fallback_decision,
+                regime=regime,
+            )
+        reliability_reason = self._reliability_rejection_reason(symbol, payload, regime, 1)
+        if reliability_reason is not None and reliability_reason not in {"state_gate_pullback_regime", "regime_mismatch_trend"}:
+            return None
+        metadata = dict(payload.get("metadata", {}) or {})
+        metadata["candidate_flow_rescue"] = {
+            "active": True,
+            "source_reason": pullback_rejection,
+            "bucket": bucket,
+            "rank_score": rank_score,
+        }
+        metadata["replacement_opportunity"] = {
+            "active": True,
+            "type": "candidate_flow_rescue_pullback",
+            "source_reason": pullback_rejection,
+            "bucket": bucket,
+            "rank_score": rank_score,
+        }
+        payload["metadata"] = metadata
+        payload["replacement_rank_score"] = rank_score
+        return payload
+
+    def _signal_payload_from_model(
+        self,
+        *,
+        symbol: str,
+        signal: Any,
+        hurst: float,
+        research_context: Dict[str, Any],
+        decision: Any,
+        regime: Any,
+    ) -> Dict[str, Any]:
+        risk = abs(float(signal.entry_price) - float(signal.stop_loss))
+        reward = abs(float(signal.take_profit) - float(signal.entry_price))
+        rr_ratio = reward / risk if risk > 0 else 0.0
+        return {
+            "symbol": symbol,
+            "side": signal.side,
+            "entry_price": signal.entry_price,
+            "stop_loss": signal.stop_loss,
+            "take_profit": signal.take_profit,
+            "strategy": signal.strategy,
+            "fast_move": signal.fast_move,
+            "is_futures": signal.is_futures,
+            "signal_quality": signal.confidence,
+            "expected_edge_bps": signal.expected_edge_bps,
+            "expected_holding_minutes": signal.expected_holding_minutes,
+            "timeframe": signal.timeframe,
+            "regime": signal.regime,
+            "rr_ratio": rr_ratio,
+            "hurst_exponent": hurst,
+            "metadata": signal.metadata,
+            "research_context": research_context,
+            "ensemble": {
+                "selected_strategy": decision.selected_strategy,
+                "proposals": decision.proposals,
+                "rejected_reasons": decision.rejected_reasons,
+                "regime": decision.regime,
+            },
+        }
+
+    def _find_replacement_signal_payload(
+        self,
+        *,
+        symbol: str,
+        rejected_payload: Dict[str, Any],
+        proposals: List[Any],
+        regime: Any,
+        hurst: float,
+        research_context: Dict[str, Any],
+        decision: Any,
+        rejection_reason: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not bool(getattr(self.config, "replacement_opportunity_enabled", True)):
+            return None
+        rejected_strategy = str(rejected_payload.get("strategy", "unknown") or "unknown")
+        rejected_confidence = float(rejected_payload.get("signal_quality", 0.0) or 0.0)
+        rejected_edge = float(rejected_payload.get("expected_edge_bps", 0.0) or 0.0)
+        rejected_rr = float(rejected_payload.get("rr_ratio", 0.0) or 0.0)
+        min_confidence_delta = float(getattr(self.config, "replacement_min_confidence_delta", 0.03) or 0.03)
+        min_edge_delta = float(getattr(self.config, "replacement_min_edge_delta_bps", 3.0) or 3.0)
+        min_rr_delta = float(getattr(self.config, "replacement_min_rr_delta", 0.05) or 0.05)
+        candidates: List[Dict[str, Any]] = []
+        for proposal in proposals:
+            candidate_signal = proposal.signal
+            if candidate_signal is getattr(decision, "signal", None):
+                continue
+            payload = self._signal_payload_from_model(
+                symbol=symbol,
+                signal=candidate_signal,
+                hurst=hurst,
+                research_context=research_context,
+                decision=decision,
+                regime=regime,
+            )
+            candidate_strategy = str(payload.get("strategy", "unknown") or "unknown")
+            confidence = float(payload.get("signal_quality", 0.0) or 0.0)
+            edge = float(payload.get("expected_edge_bps", 0.0) or 0.0)
+            rr_ratio = float(payload.get("rr_ratio", 0.0) or 0.0)
+            if candidate_strategy == rejected_strategy:
+                continue
+            if confidence < rejected_confidence + min_confidence_delta:
+                continue
+            if edge < rejected_edge + min_edge_delta:
+                continue
+            if rr_ratio < rejected_rr + min_rr_delta:
+                continue
+            if self._reliability_rejection_reason(symbol, payload, regime, len(proposals)) is not None:
+                continue
+            metadata = dict(payload.get("metadata", {}) or {})
+            metadata["replacement_opportunity"] = {
+                "active": True,
+                "replaced_strategy": rejected_strategy,
+                "rejection_reason": str(rejection_reason or "unknown"),
+                "confidence_delta": confidence - rejected_confidence,
+                "edge_delta_bps": edge - rejected_edge,
+                "rr_delta": rr_ratio - rejected_rr,
+            }
+            payload["metadata"] = metadata
+            payload["_replacement_rank_score"] = (confidence * 100.0) + edge + (rr_ratio * 8.0)
+            candidates.append(payload)
+        if not candidates:
+            return None
+        best = max(candidates, key=lambda item: float(item.get("_replacement_rank_score", 0.0) or 0.0))
+        best.pop("_replacement_rank_score", None)
+        return best
+
     def compute_hurst_exponent(self, symbol: str, timeframe: str = "1h", lookback: int = 100) -> float:
         """
         Hurst exponent becslése Detrended Fluctuation Analysis (DFA) módszerrel.
@@ -1709,10 +2763,19 @@ class SignalEngine:
     def generate_signal(self, symbol: str) -> Optional[Dict[str, Any]]:
         regime = self.regime_engine.classify(symbol)
         proposals = []
+        strategy_rejection_reasons: Dict[str, str] = {}
+        strategy_rejection_details: Dict[str, Dict[str, Any]] = {}
         hurst = self.compute_hurst_exponent(symbol, timeframe=self.config.timeframes.get("trend", "1h"), lookback=80)
         research_context = self._research_context(symbol)
         for strategy in self.strategy_modules:
             proposal = strategy.evaluate(symbol, regime)
+            if proposal is None:
+                rejection_reason = str(getattr(strategy, "last_rejection_reason", "") or "")
+                if rejection_reason:
+                    strategy_rejection_reasons[str(getattr(strategy, "name", "unknown") or "unknown")] = rejection_reason
+                    rejection_details = dict(getattr(strategy, "last_rejection_details", {}) or {})
+                    if rejection_details:
+                        strategy_rejection_details[str(getattr(strategy, "name", "unknown") or "unknown")] = rejection_details
             if proposal is not None:
                 signal_stub = {
                     "symbol": proposal.signal.symbol,
@@ -1737,6 +2800,20 @@ class SignalEngine:
                 proposal.signal.metadata["hurst_exponent"] = hurst
                 proposal.signal.metadata["research_context"] = research_context
                 proposal.signal.metadata.update(self._microstructure_context(symbol, proposal.signal.entry_price))
+                proposal.signal.metadata.update(
+                    {
+                        "regime_confidence": float(getattr(regime, "confidence", 0.0) or 0.0),
+                        "trend_strength": float(getattr(regime, "trend_strength", 0.0) or 0.0),
+                        "liquidity_score": float(getattr(regime, "liquidity_score", 0.0) or 0.0),
+                        "trend_persistence": float(getattr(regime, "metadata", {}).get("trend_persistence", 0.0) or 0.0),
+                        "directional_efficiency": float(getattr(regime, "metadata", {}).get("directional_efficiency", 0.0) or 0.0),
+                        "realized_vol_percentile": float(getattr(regime, "metadata", {}).get("realized_vol_percentile", 0.0) or 0.0),
+                        "momentum_crash_risk": float(getattr(regime, "metadata", {}).get("momentum_crash_risk", 0.0) or 0.0),
+                        "breakout_score": float(getattr(regime, "metadata", {}).get("breakout_score", 0.0) or 0.0),
+                        "pullback_score": float(getattr(regime, "metadata", {}).get("pullback_score", 0.0) or 0.0),
+                        "mean_reversion_score": float(getattr(regime, "metadata", {}).get("mean_reversion_score", 0.0) or 0.0),
+                    }
+                )
                 proposal.signal.metadata["learning_context"] = learning_context
                 proposal.signal.confidence = max(
                     0.0,
@@ -1745,14 +2822,126 @@ class SignalEngine:
                 proposals.append(proposal)
 
         proposal_count = len(proposals)
+        short_proposals_filtered = 0
+        if (
+            proposal_count > 0
+            and getattr(self.config, "trading_mode", "spot") == "spot"
+            and bool(getattr(self.config, "spot_filter_short_proposals", True))
+        ):
+            spot_compatible = [
+                proposal
+                for proposal in proposals
+                if str(getattr(proposal.signal, "side", "") or "").lower() not in {"short", "sell"}
+            ]
+            short_proposals_filtered = proposal_count - len(spot_compatible)
+            proposals = spot_compatible
+            proposal_count = len(proposals)
         if proposal_count <= 0:
+            candidate_flow_rescue = self._find_candidate_flow_rescue_signal_payload(
+                symbol=symbol,
+                strategy_rejection_reasons=strategy_rejection_reasons,
+                regime=regime,
+                hurst=hurst,
+                research_context=research_context,
+            )
+            near_miss_replacement = self._find_near_miss_replacement_signal_payload(
+                symbol=symbol,
+                strategy_rejection_reasons=strategy_rejection_reasons,
+                regime=regime,
+                hurst=hurst,
+                research_context=research_context,
+            )
+            near_miss_candidates = [
+                self._near_miss_snapshot(
+                    symbol=symbol,
+                    strategy_name=str(strategy_name),
+                    rejection_reason=str(strategy_reason),
+                    rejection_details=dict(strategy_rejection_details.get(str(strategy_name), {}) or {}),
+                    regime=regime,
+                    hurst=hurst,
+                    research_context=research_context,
+                )
+                for strategy_name, strategy_reason in dict(sorted(strategy_rejection_reasons.items())).items()
+            ]
+            if candidate_flow_rescue is not None:
+                selected_strategy = str(candidate_flow_rescue.get("strategy", "unknown") or "unknown")
+                source_reason = str(dict(candidate_flow_rescue.get("metadata", {}) or {}).get("candidate_flow_rescue", {}).get("source_reason", "proposal_starved") or "proposal_starved")
+                self._store_generation_diagnostics(
+                    symbol,
+                    {
+                        "outcome": "selected",
+                        "reason": "candidate_flow_rescue_selected_for_submission",
+                        "proposal_count": 1,
+                        "proposal_strategies": [selected_strategy],
+                        "strategy_rejection_reasons": dict(sorted(strategy_rejection_reasons.items())),
+                        "strategy_rejection_details": dict(sorted(strategy_rejection_details.items())),
+                        "near_miss_candidates": near_miss_candidates,
+                        "spot_short_proposals_filtered": short_proposals_filtered,
+                        "selected_strategy": selected_strategy,
+                        "replacement_selected": True,
+                        "replacement_selected_strategy": selected_strategy,
+                        "replacement_candidate": {
+                            "symbol": symbol,
+                            "strategy": selected_strategy,
+                            "rejection_reason": source_reason,
+                            "replacement_type": "candidate_flow_rescue_pullback",
+                        },
+                        "replacement_candidates": [
+                            {
+                                "symbol": symbol,
+                                "strategy": selected_strategy,
+                                "rejection_reason": source_reason,
+                                "replacement_type": "candidate_flow_rescue_pullback",
+                            }
+                        ],
+                        "regime": regime.regime,
+                    },
+                )
+                return candidate_flow_rescue
+            if near_miss_replacement is not None:
+                self._store_generation_diagnostics(
+                    symbol,
+                    {
+                        "outcome": "selected",
+                        "reason": "near_miss_replacement_selected_for_submission",
+                        "proposal_count": 1,
+                        "proposal_strategies": [str(near_miss_replacement.get("strategy", "unknown") or "unknown")],
+                        "strategy_rejection_reasons": dict(sorted(strategy_rejection_reasons.items())),
+                        "strategy_rejection_details": dict(sorted(strategy_rejection_details.items())),
+                        "near_miss_candidates": near_miss_candidates,
+                        "spot_short_proposals_filtered": short_proposals_filtered,
+                        "selected_strategy": str(near_miss_replacement.get("strategy", "unknown") or "unknown"),
+                        "replacement_selected": True,
+                        "replacement_selected_strategy": str(near_miss_replacement.get("strategy", "unknown") or "unknown"),
+                        "replacement_candidate": {
+                            "symbol": symbol,
+                            "strategy": str(near_miss_replacement.get("strategy", "unknown") or "unknown"),
+                            "rejection_reason": "bullish_confirmation_missing",
+                            "replacement_type": "near_miss_pullback",
+                        },
+                        "replacement_candidates": [
+                            {
+                                "symbol": symbol,
+                                "strategy": str(near_miss_replacement.get("strategy", "unknown") or "unknown"),
+                                "rejection_reason": "bullish_confirmation_missing",
+                                "replacement_type": "near_miss_pullback",
+                            }
+                        ],
+                        "regime": regime.regime,
+                    },
+                )
+                return near_miss_replacement
             self._store_generation_diagnostics(
                 symbol,
                 {
-                    "outcome": "no_proposal",
-                    "reason": "strategy_produced_no_proposal",
+                    "outcome": "spot_short_only" if short_proposals_filtered else "no_proposal",
+                    "reason": "spot_short_only_proposals" if short_proposals_filtered else "strategy_produced_no_proposal",
                     "proposal_count": 0,
                     "proposal_strategies": [],
+                    "strategy_rejection_reasons": dict(sorted(strategy_rejection_reasons.items())),
+                    "strategy_rejection_details": dict(sorted(strategy_rejection_details.items())),
+                    "near_miss_candidates": near_miss_candidates,
+                    "spot_short_proposals_filtered": short_proposals_filtered,
                     "regime": regime.regime,
                 },
             )
@@ -1775,14 +2964,90 @@ class SignalEngine:
             for item in list(decision.proposals or [])
             if str(item.get("frequency_reason", "inactive")) not in {"inactive", "neutral"}
         ]
+        ensemble_proposals = self._compact_ensemble_proposals(list(decision.proposals or []), limit=3)
+        top_ensemble_score = float(ensemble_proposals[0]["ensemble_score"]) if ensemble_proposals else 0.0
+        second_ensemble_score = float(ensemble_proposals[1]["ensemble_score"]) if len(ensemble_proposals) > 1 else 0.0
+        ensemble_score_gap = top_ensemble_score - second_ensemble_score if len(ensemble_proposals) > 1 else 0.0
         if decision.signal is None:
+            second_best_payload = self._find_second_best_candidate_payload(
+                symbol=symbol,
+                proposals=proposals,
+                regime=regime,
+                hurst=hurst,
+                research_context=research_context,
+                decision=decision,
+            )
+            if second_best_payload is not None:
+                selected_strategy = str(second_best_payload.get("strategy", "unknown") or "unknown")
+                self._store_generation_diagnostics(
+                    symbol,
+                    {
+                        "outcome": "selected",
+                        "reason": "second_best_candidate_selected_for_submission",
+                        "proposal_count": proposal_count,
+                        "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                        "strategy_rejection_reasons": dict(sorted(strategy_rejection_reasons.items())),
+                        "spot_short_proposals_filtered": short_proposals_filtered,
+                        "selected_strategy": selected_strategy,
+                        "replacement_selected": True,
+                        "replacement_selected_strategy": selected_strategy,
+                        "ensemble_proposals": ensemble_proposals,
+                        "top_ensemble_score": top_ensemble_score,
+                        "ensemble_score_gap": ensemble_score_gap,
+                        "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
+                        "frequency_adjustments": frequency_adjustments,
+                        "regime": regime.regime,
+                    },
+                )
+                return second_best_payload
+            single_candidate_payload = self._find_single_candidate_escape_payload(
+                symbol=symbol,
+                proposals=proposals,
+                regime=regime,
+                hurst=hurst,
+                research_context=research_context,
+                decision=decision,
+            )
+            if single_candidate_payload is not None:
+                selected_strategy = str(single_candidate_payload.get("strategy", "unknown") or "unknown")
+                self._store_generation_diagnostics(
+                    symbol,
+                    {
+                        "outcome": "selected",
+                        "reason": "single_candidate_escape_selected_for_submission",
+                        "proposal_count": proposal_count,
+                        "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                        "strategy_rejection_reasons": dict(sorted(strategy_rejection_reasons.items())),
+                        "spot_short_proposals_filtered": short_proposals_filtered,
+                        "selected_strategy": selected_strategy,
+                        "replacement_selected": True,
+                        "replacement_selected_strategy": selected_strategy,
+                        "ensemble_proposals": ensemble_proposals,
+                        "top_ensemble_score": top_ensemble_score,
+                        "ensemble_score_gap": ensemble_score_gap,
+                        "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
+                        "frequency_adjustments": frequency_adjustments,
+                        "regime": regime.regime,
+                    },
+                )
+                return single_candidate_payload
+            ensemble_rejection_reason = "no_ensemble_selection"
+            if decision.rejected_reasons:
+                first_rejection = str(list(decision.rejected_reasons or [])[0] or "").replace(":", "_")
+                if first_rejection:
+                    ensemble_rejection_reason = f"ensemble_rejected_{first_rejection}"
             self._store_generation_diagnostics(
                 symbol,
                 {
                     "outcome": "ensemble_rejected",
-                    "reason": "no_ensemble_selection",
+                    "reason": ensemble_rejection_reason,
                     "proposal_count": proposal_count,
                     "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                    "strategy_rejection_reasons": dict(sorted(strategy_rejection_reasons.items())),
+                    "spot_short_proposals_filtered": short_proposals_filtered,
+                    "ensemble_proposals": ensemble_proposals,
+                    "top_ensemble_score": top_ensemble_score,
+                    "ensemble_score_gap": ensemble_score_gap,
                     "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
                     "frequency_adjustments": frequency_adjustments,
                     "regime": regime.regime,
@@ -1798,7 +3063,12 @@ class SignalEngine:
                     "reason": "hurst_breakout_blocked",
                     "proposal_count": proposal_count,
                     "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                    "strategy_rejection_reasons": dict(sorted(strategy_rejection_reasons.items())),
+                    "spot_short_proposals_filtered": short_proposals_filtered,
                     "selected_strategy": signal.strategy,
+                    "ensemble_proposals": ensemble_proposals,
+                    "top_ensemble_score": top_ensemble_score,
+                    "ensemble_score_gap": ensemble_score_gap,
                     "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
                     "frequency_adjustments": frequency_adjustments,
                     "regime": regime.regime,
@@ -1813,7 +3083,12 @@ class SignalEngine:
                     "reason": "hurst_pullback_blocked",
                     "proposal_count": proposal_count,
                     "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                    "strategy_rejection_reasons": dict(sorted(strategy_rejection_reasons.items())),
+                    "spot_short_proposals_filtered": short_proposals_filtered,
                     "selected_strategy": signal.strategy,
+                    "ensemble_proposals": ensemble_proposals,
+                    "top_ensemble_score": top_ensemble_score,
+                    "ensemble_score_gap": ensemble_score_gap,
                     "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
                     "frequency_adjustments": frequency_adjustments,
                     "regime": regime.regime,
@@ -1828,7 +3103,12 @@ class SignalEngine:
                     "reason": "hurst_mean_reversion_blocked",
                     "proposal_count": proposal_count,
                     "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                    "strategy_rejection_reasons": dict(sorted(strategy_rejection_reasons.items())),
+                    "spot_short_proposals_filtered": short_proposals_filtered,
                     "selected_strategy": signal.strategy,
+                    "ensemble_proposals": ensemble_proposals,
+                    "top_ensemble_score": top_ensemble_score,
+                    "ensemble_score_gap": ensemble_score_gap,
                     "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
                     "frequency_adjustments": frequency_adjustments,
                     "regime": regime.regime,
@@ -1843,45 +3123,70 @@ class SignalEngine:
                     "reason": "signal_quality_below_threshold",
                     "proposal_count": proposal_count,
                     "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                    "strategy_rejection_reasons": dict(sorted(strategy_rejection_reasons.items())),
+                    "spot_short_proposals_filtered": short_proposals_filtered,
                     "selected_strategy": signal.strategy,
+                    "ensemble_proposals": ensemble_proposals,
+                    "top_ensemble_score": top_ensemble_score,
+                    "ensemble_score_gap": ensemble_score_gap,
                     "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
                     "frequency_adjustments": frequency_adjustments,
                     "regime": regime.regime,
                 },
             )
             return None
-        rr_ratio = 0.0
-        risk = abs(float(signal.entry_price) - float(signal.stop_loss))
-        reward = abs(float(signal.take_profit) - float(signal.entry_price))
-        if risk > 0:
-            rr_ratio = reward / risk
-        signal_payload = {
-            "symbol": symbol,
-            "side": signal.side,
-            "entry_price": signal.entry_price,
-            "stop_loss": signal.stop_loss,
-            "take_profit": signal.take_profit,
-            "strategy": signal.strategy,
-            "fast_move": signal.fast_move,
-            "is_futures": signal.is_futures,
-            "signal_quality": signal.confidence,
-            "expected_edge_bps": signal.expected_edge_bps,
-            "expected_holding_minutes": signal.expected_holding_minutes,
-            "timeframe": signal.timeframe,
-            "regime": signal.regime,
-            "rr_ratio": rr_ratio,
-            "hurst_exponent": hurst,
-            "metadata": signal.metadata,
-            "research_context": research_context,
-            "ensemble": {
-                "selected_strategy": decision.selected_strategy,
-                "proposals": decision.proposals,
-                "rejected_reasons": decision.rejected_reasons,
-                "regime": decision.regime,
-            },
-        }
+        signal_payload = self._signal_payload_from_model(
+            symbol=symbol,
+            signal=signal,
+            hurst=hurst,
+            research_context=research_context,
+            decision=decision,
+            regime=regime,
+        )
         reliability_reason = self._reliability_rejection_reason(symbol, signal_payload, regime, len(proposals))
         if reliability_reason is not None:
+            replacement_candidate = self._replacement_candidate_snapshot(
+                symbol=symbol,
+                signal=signal_payload,
+                regime=regime,
+                rejection_reason=reliability_reason,
+            )
+            replacement_payload = self._find_replacement_signal_payload(
+                symbol=symbol,
+                rejected_payload=signal_payload,
+                proposals=proposals,
+                regime=regime,
+                hurst=hurst,
+                research_context=research_context,
+                decision=decision,
+                rejection_reason=reliability_reason,
+            )
+            if replacement_payload is not None:
+                replacement_strategy = str(replacement_payload.get("strategy", "unknown") or "unknown")
+                self._store_generation_diagnostics(
+                    symbol,
+                    {
+                        "outcome": "selected",
+                        "reason": "replacement_selected_for_submission",
+                        "proposal_count": proposal_count,
+                        "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                        "strategy_rejection_reasons": dict(sorted(strategy_rejection_reasons.items())),
+                        "spot_short_proposals_filtered": short_proposals_filtered,
+                        "selected_strategy": replacement_strategy,
+                        "replaced_strategy": signal.strategy,
+                        "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
+                        "frequency_adjustments": frequency_adjustments,
+                        "replacement_candidate": replacement_candidate,
+                        "replacement_candidates": [replacement_candidate],
+                        "replacement_selected": True,
+                        "replacement_selected_strategy": replacement_strategy,
+                        "ensemble_proposals": ensemble_proposals,
+                        "top_ensemble_score": top_ensemble_score,
+                        "ensemble_score_gap": ensemble_score_gap,
+                        "regime": regime.regime,
+                    },
+                )
+                return replacement_payload
             self._store_generation_diagnostics(
                 symbol,
                 {
@@ -1889,9 +3194,16 @@ class SignalEngine:
                     "reason": reliability_reason,
                     "proposal_count": proposal_count,
                     "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                    "strategy_rejection_reasons": dict(sorted(strategy_rejection_reasons.items())),
+                    "spot_short_proposals_filtered": short_proposals_filtered,
                     "selected_strategy": signal.strategy,
+                    "ensemble_proposals": ensemble_proposals,
+                    "top_ensemble_score": top_ensemble_score,
+                    "ensemble_score_gap": ensemble_score_gap,
                     "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
                     "frequency_adjustments": frequency_adjustments,
+                    "replacement_candidate": replacement_candidate,
+                    "replacement_candidates": [replacement_candidate],
                     "regime": regime.regime,
                 },
             )
@@ -1903,7 +3215,12 @@ class SignalEngine:
                 "reason": "selected_for_submission",
                 "proposal_count": proposal_count,
                 "proposal_strategies": [proposal.signal.strategy for proposal in proposals],
+                "strategy_rejection_reasons": dict(sorted(strategy_rejection_reasons.items())),
+                "spot_short_proposals_filtered": short_proposals_filtered,
                 "selected_strategy": signal.strategy,
+                "ensemble_proposals": ensemble_proposals,
+                "top_ensemble_score": top_ensemble_score,
+                "ensemble_score_gap": ensemble_score_gap,
                 "ensemble_rejected_reasons": list(decision.rejected_reasons or []),
                 "frequency_adjustments": frequency_adjustments,
                 "regime": regime.regime,
@@ -1919,6 +3236,35 @@ class SignalEngine:
         proposal_count: int,
     ) -> bool:
         return SignalEngine._reliability_rejection_reason(self, symbol, signal, regime, proposal_count) is None
+
+    def _pullback_state_profile(self, regime: Any, metadata: Dict[str, Any]) -> str:
+        regime_name = str(getattr(regime, "regime", regime) or "unknown")
+        regime_meta = dict(getattr(regime, "metadata", {}) or {})
+        if regime_name == "trending":
+            return "trend"
+        if bool(metadata.get("candidate_flow_rescue", False)) or bool(dict(metadata.get("candidate_flow_rescue", {}) or {}).get("active", False)):
+            return "rescue"
+        if bool(metadata.get("safe_reopen_bridge_used", False)):
+            return "rescue"
+        constructive_regimes = {
+            str(item)
+            for item in getattr(self.config, "state_gate_pullback_constructive_regimes", ("choppy", "neutral", "high_volatility")) or ()
+        }
+        constructive_flag = bool(metadata.get("constructive_spot_core_regime", False) or regime_meta.get("constructive_spot_core_regime", False))
+        preferred_family = str(metadata.get("preferred_family", regime_meta.get("preferred_family", "")) or "")
+        symbol_bucket = str(metadata.get("symbol_bucket", "") or "")
+        direction = str(metadata.get("trend_direction", regime_meta.get("trend_direction", "")) or "")
+        if (
+            regime_name in constructive_regimes
+            and (direction == "bullish" or constructive_flag)
+            and (
+                constructive_flag
+                or preferred_family == "trend_pullback"
+                or symbol_bucket in {"majors", "exchange_beta"}
+            )
+        ):
+            return "constructive_core"
+        return "blocked"
 
     def _reliability_rejection_reason(
         self,
@@ -1939,6 +3285,7 @@ class SignalEngine:
         numeric_values = [entry_price, stop_loss, take_profit, confidence, expected_edge_bps, rr_ratio, hurst]
         research_context = signal.get("research_context", {}) or {}
         metadata = dict(signal.get("metadata", {}) or {})
+        metadata.setdefault("side", side)
         learning_context = dict(metadata.get("learning_context", {}) or {})
         calibration = dict(learning_context.get("calibration", {}) or {})
         opportunity = dict(learning_context.get("opportunity", {}) or {})
@@ -1955,6 +3302,16 @@ class SignalEngine:
         edge_floor = float(getattr(self.config, "min_expected_edge_bps", 8.0))
         trend_rr_floor = float(getattr(self.config, "min_reliable_rr_ratio_trend", 1.35))
         mean_reversion_rr_floor = float(getattr(self.config, "min_reliable_rr_ratio_mean_reversion", 1.10))
+        spot_long_relaxation_active = (
+            getattr(self.config, "trading_mode", "spot") == "spot"
+            and side in {"long", "buy"}
+            and not (strategy == suppressed_family and rotation_confidence >= 0.50)
+        )
+        if spot_long_relaxation_active:
+            quality_floor = max(quality_floor - float(getattr(self.config, "spot_long_quality_floor_delta", 0.03)), 0.0)
+            edge_floor = max(edge_floor - float(getattr(self.config, "spot_long_edge_floor_delta_bps", 4.0)), 0.0)
+            trend_rr_floor = max(trend_rr_floor - float(getattr(self.config, "spot_long_rr_floor_delta", 0.12)), 0.0)
+            mean_reversion_rr_floor = max(mean_reversion_rr_floor - float(getattr(self.config, "spot_long_rr_floor_delta", 0.12)), 0.0)
         if strategy == "trend_pullback":
             quality_floor = max(quality_floor, float(getattr(self.config, "min_signal_quality_score_pullback", 0.62)))
             edge_floor = max(edge_floor, float(getattr(self.config, "min_expected_edge_bps_pullback", 14.0)))
@@ -2002,11 +3359,47 @@ class SignalEngine:
             return "expected_edge_below_threshold"
         if bool(learning_context.get("veto", False)):
             return "learning_veto"
+        pullback_quality_score = 0.0
+        if strategy == "trend_pullback":
+            pullback_score = float(metadata.get("pullback_score", 0.0) or 0.0)
+            trend_persistence = float(metadata.get("trend_persistence", 0.0) or 0.0)
+            volume_impulse = float(metadata.get("volume_impulse", 0.0) or 0.0)
+            directional_efficiency = float(metadata.get("directional_efficiency", 0.0) or 0.0)
+            realized_vol = float(metadata.get("realized_vol_percentile", 1.0) or 1.0)
+            liquidity_score = float(metadata.get("liquidity_score", getattr(regime, "liquidity_score", 0.0)) or 0.0)
+            entry_zscore = float(metadata.get("entry_zscore", 0.0) or 0.0)
+            rr_score = min(max((rr_ratio - 1.2) / 0.8, 0.0), 1.0)
+            pullback_quality_score = (
+                min(pullback_score / 2.4, 1.0) * 0.24
+                + min(trend_persistence / 0.55, 1.0) * 0.14
+                + min(volume_impulse / 1.05, 1.0) * 0.14
+                + min(directional_efficiency / 0.45, 1.0) * 0.14
+                + min(liquidity_score, 1.0) * 0.12
+                + max(1.0 - realized_vol, 0.0) * 0.10
+                + (0.06 if entry_zscore <= 0.25 else 0.0)
+                + rr_score * 0.06
+            )
+        calibration_floor = float(getattr(self.config, "learning_min_calibrated_confidence", 0.50))
+        if (
+            bool(getattr(self.config, "pullback_quality_calibration_relax_enabled", True))
+            and strategy == "trend_pullback"
+            and pullback_quality_score >= float(getattr(self.config, "pullback_quality_calibration_min_score", 0.72))
+        ):
+            calibration_floor = max(
+                calibration_floor - float(getattr(self.config, "pullback_quality_calibration_relaxation", 0.04)),
+                float(getattr(self.config, "pullback_quality_calibration_max_relaxed_floor", 0.46)),
+            )
+        candidate_flow_rescue_active = bool(dict(metadata.get("candidate_flow_rescue", {}) or {}).get("active", False))
+        if candidate_flow_rescue_active:
+            calibration_floor = min(
+                calibration_floor,
+                float(getattr(self.config, "candidate_flow_rescue_calibration_floor", 0.34) or 0.34),
+            )
         if (
             float(calibration.get("effective_samples", 0.0) or 0.0) >= float(getattr(self.config, "learning_calibration_gate_min_samples", 6.0))
             and float(calibration.get("calibrated_confidence", confidence) or confidence)
             < (
-                float(getattr(self.config, "learning_min_calibrated_confidence", 0.50))
+                calibration_floor
                 - (0.03 if positive_cell_evidence else 0.0)
             )
         ):
@@ -2037,8 +3430,19 @@ class SignalEngine:
             if rr_ratio < mean_reversion_rr_floor:
                 return "rr_ratio_too_low_mean_reversion"
 
+        state_gate_reason = SignalEngine._strategy_state_gate_reason(self, strategy, regime, metadata)
+        if state_gate_reason is not None:
+            return state_gate_reason
+
         regime_name = str(getattr(regime, "regime", "unknown"))
-        if strategy in {"trend_breakout", "trend_pullback"} and regime_name not in {"trending", "high_volatility"}:
+        constructive_spot_core_regime = bool(metadata.get("constructive_spot_core_regime", False))
+        pullback_state_profile = SignalEngine._pullback_state_profile(self, regime, metadata) if strategy == "trend_pullback" else "n/a"
+        if (
+            strategy in {"trend_breakout", "trend_pullback"}
+            and regime_name not in {"trending", "high_volatility"}
+            and not (strategy == "trend_pullback" and constructive_spot_core_regime)
+            and not (strategy == "trend_pullback" and pullback_state_profile in {"constructive_core", "rescue"})
+        ):
             return "regime_mismatch_trend"
         if strategy == "mean_reversion" and regime_name not in {"mean_reverting", "choppy"}:
             return "regime_mismatch_mean_reversion"
@@ -2064,6 +3468,93 @@ class SignalEngine:
                     return "entry_too_far_from_mid"
         except Exception:
             pass
+        return None
+
+    def _strategy_state_gate_reason(self, strategy: str, regime: Any, metadata: Dict[str, Any]) -> Optional[str]:
+        regime_name = str(getattr(regime, "regime", regime) or "unknown")
+        regime_meta = dict(getattr(regime, "metadata", {}) or {})
+        trend_persistence = float(metadata.get("trend_persistence", regime_meta.get("trend_persistence", 0.0)) or 0.0)
+        liquidity_score = float(metadata.get("liquidity_score", getattr(regime, "liquidity_score", 0.0)) or 0.0)
+        directional_efficiency = float(metadata.get("directional_efficiency", regime_meta.get("directional_efficiency", 0.0)) or 0.0)
+        realized_vol_percentile = float(metadata.get("realized_vol_percentile", regime_meta.get("realized_vol_percentile", 0.0)) or 0.0)
+        momentum_crash_risk = float(metadata.get("momentum_crash_risk", regime_meta.get("momentum_crash_risk", 0.0)) or 0.0)
+        breakout_score = float(metadata.get("breakout_score", regime_meta.get("breakout_score", 0.0)) or 0.0)
+        pullback_score = float(metadata.get("pullback_score", regime_meta.get("pullback_score", 0.0)) or 0.0)
+        mean_reversion_score = float(metadata.get("mean_reversion_score", regime_meta.get("mean_reversion_score", 0.0)) or 0.0)
+        preferred_family = str(metadata.get("preferred_family", regime_meta.get("preferred_family", "")) or "")
+        preferred_relaxation = 0.03 if strategy == preferred_family else 0.0
+        side = str(metadata.get("side", "") or "").lower()
+        if (
+            getattr(self.config, "trading_mode", "spot") == "spot"
+            and side in {"long", "buy", ""}
+        ):
+            preferred_relaxation += float(getattr(self.config, "spot_long_state_gate_relaxation", 0.06) or 0.0)
+
+        if strategy == "trend_breakout":
+            if regime_name != "trending":
+                return "state_gate_breakout_regime"
+            if trend_persistence > 0.0 and trend_persistence + preferred_relaxation < float(getattr(self.config, "state_gate_breakout_min_trend_persistence", 0.42)):
+                return "state_gate_breakout_persistence"
+            if liquidity_score > 0.0 and liquidity_score + preferred_relaxation < float(getattr(self.config, "state_gate_breakout_min_liquidity_score", 0.72)):
+                return "state_gate_breakout_liquidity"
+            if directional_efficiency > 0.0 and directional_efficiency + preferred_relaxation < float(getattr(self.config, "state_gate_breakout_min_directional_efficiency", 0.34)):
+                return "state_gate_breakout_efficiency"
+            if momentum_crash_risk > 0.0 and momentum_crash_risk > float(getattr(self.config, "state_gate_breakout_max_crash_risk", 0.62)):
+                return "state_gate_breakout_crash_risk"
+            if breakout_score > 0.0 and breakout_score + preferred_relaxation < max(float(getattr(self.config, "regime_continuation_score_threshold", 1.4)), 1.45):
+                return "state_gate_breakout_score"
+            return None
+
+        if strategy == "trend_pullback":
+            pullback_state_profile = SignalEngine._pullback_state_profile(self, regime, metadata)
+            if pullback_state_profile == "blocked":
+                return "state_gate_pullback_regime"
+            if pullback_state_profile == "constructive_core":
+                min_trend_persistence = float(getattr(self.config, "state_gate_pullback_constructive_min_trend_persistence", 0.34))
+                min_liquidity = float(getattr(self.config, "state_gate_pullback_constructive_min_liquidity_score", 0.68))
+                min_pullback = float(getattr(self.config, "state_gate_pullback_constructive_min_pullback_score", 0.96))
+                max_vol = float(getattr(self.config, "state_gate_pullback_constructive_max_realized_vol_percentile", 0.88))
+                min_efficiency = float(getattr(self.config, "state_gate_pullback_constructive_min_directional_efficiency", 0.08))
+                max_crash = float(getattr(self.config, "state_gate_pullback_constructive_max_crash_risk", 0.68))
+            elif pullback_state_profile == "rescue":
+                min_trend_persistence = float(getattr(self.config, "candidate_flow_rescue_min_trend_persistence", 0.30))
+                min_liquidity = float(getattr(self.config, "state_gate_pullback_constructive_min_liquidity_score", 0.68))
+                min_pullback = float(getattr(self.config, "candidate_flow_rescue_min_pullback_score", 0.88))
+                max_vol = float(getattr(self.config, "candidate_flow_rescue_max_volatility_percentile", 0.86))
+                min_efficiency = float(getattr(self.config, "candidate_flow_rescue_min_trend_efficiency", 0.04))
+                max_crash = float(getattr(self.config, "state_gate_pullback_constructive_max_crash_risk", 0.68))
+            else:
+                min_trend_persistence = float(getattr(self.config, "state_gate_pullback_min_trend_persistence", 0.48))
+                min_liquidity = float(getattr(self.config, "state_gate_pullback_min_liquidity_score", 0.74))
+                min_pullback = float(getattr(self.config, "state_gate_pullback_min_pullback_score", 1.32))
+                max_vol = float(getattr(self.config, "state_gate_pullback_max_realized_vol_percentile", 0.82))
+                min_efficiency = 0.0
+                max_crash = 1.0
+            if trend_persistence > 0.0 and trend_persistence + preferred_relaxation < min_trend_persistence:
+                return "state_gate_pullback_persistence"
+            if liquidity_score > 0.0 and liquidity_score + preferred_relaxation < min_liquidity:
+                return "state_gate_pullback_liquidity"
+            if pullback_score > 0.0 and pullback_score + preferred_relaxation < min_pullback:
+                return "state_gate_pullback_score"
+            if directional_efficiency > 0.0 and directional_efficiency + preferred_relaxation < min_efficiency:
+                return "state_gate_pullback_efficiency"
+            if momentum_crash_risk > 0.0 and momentum_crash_risk > max_crash:
+                return "state_gate_pullback_crash_risk"
+            if realized_vol_percentile > 0.0 and realized_vol_percentile > max_vol:
+                return "state_gate_pullback_volatility"
+            return None
+
+        if strategy == "mean_reversion":
+            if regime_name not in {"mean_reverting", "choppy"}:
+                return "state_gate_mean_reversion_regime"
+            if liquidity_score > 0.0 and liquidity_score < float(getattr(self.config, "state_gate_mean_reversion_min_liquidity_score", 0.78)):
+                return "state_gate_mean_reversion_liquidity"
+            if mean_reversion_score > 0.0 and mean_reversion_score < float(getattr(self.config, "state_gate_mean_reversion_min_score", 1.22)):
+                return "state_gate_mean_reversion_score"
+            if directional_efficiency > 0.0 and directional_efficiency > float(getattr(self.config, "state_gate_mean_reversion_max_directional_efficiency", 0.30)):
+                return "state_gate_mean_reversion_efficiency"
+            return None
+
         return None
 
     def _research_context(self, symbol: str) -> Dict[str, Any]:

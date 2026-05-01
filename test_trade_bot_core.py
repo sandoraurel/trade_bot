@@ -4,6 +4,7 @@ import json
 import os
 import random
 import sqlite3
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -14,7 +15,7 @@ from trade_bot.backtest_reporting import build_backtest_report, build_batch_summ
 from trade_bot.conversation_api import ConversationAPIApp, build_conversation_api
 from trade_bot.ensemble import EnsembleAllocator
 from trade_bot.health import evaluate_runtime_health
-from trade_bot.cli import build_parser, build_runtime_config
+from trade_bot.cli import build_parser, build_runtime_config, parse_validation_windows, render_validation_suite_summary
 from trade_bot.learning import TradeLearningEngine
 from trade_bot.main import BacktestEngine, BotConfig, BotState, ExecutionEngine, MockBacktestExchange, Position, RiskManager, SignalEngine, TradeBot
 from trade_bot.models import Signal
@@ -125,6 +126,206 @@ class QuietSignalEngine:
 
 
 class TradeBotCoreTests(unittest.TestCase):
+    def _triple_barrier_engine(self, rows):
+        frame = pd.DataFrame(rows).set_index("timestamp")
+        config = BotConfig(
+            starting_balance=1000.0,
+            historical_data_cache_enabled=False,
+            triple_barrier_label_horizon_bars=3,
+        )
+        engine = HistoricalSimulationEngine(config, signal_engine_cls=QuietSignalEngine)
+        engine._reset_run_state()
+        engine.exchange = HistoricalReplayExchange({("BTC/USDT", "15m"): frame}, "BTC/USDT", base_timeframe="15m", config=config)
+        engine.exchange.set_cursor(0)
+        return engine
+
+    def _triple_barrier_signal(self):
+        return {
+            "symbol": "BTC/USDT",
+            "strategy": "trend_pullback",
+            "side": "long",
+            "entry_price": 100.0,
+            "stop_loss": 98.0,
+            "take_profit": 104.0,
+            "regime": "trend_supportive",
+            "metadata": {
+                "pullback_score": 2.1,
+                "realized_vol_percentile": 0.42,
+                "liquidity_score": 0.86,
+            },
+        }
+
+    def test_simulation_engine_triple_barrier_labels_tp_first(self):
+        start = pd.Timestamp("2026-01-01 00:00:00")
+        engine = self._triple_barrier_engine(
+            [
+                {"timestamp": start, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+                {"timestamp": start + pd.Timedelta(minutes=15), "open": 100.0, "high": 104.5, "low": 99.5, "close": 104.0, "volume": 1000.0},
+                {"timestamp": start + pd.Timedelta(minutes=30), "open": 104.0, "high": 105.0, "low": 103.0, "close": 104.5, "volume": 1000.0},
+            ]
+        )
+
+        label = engine._label_triple_barrier_signal(self._triple_barrier_signal())
+
+        self.assertEqual(label["label"], "TP_FIRST")
+        self.assertEqual(label["bars_to_label"], 1)
+        self.assertIn("trend_pullback|BTC/USDT|trend_supportive", label["bucket_key"])
+
+    def test_simulation_engine_triple_barrier_labels_sl_first(self):
+        start = pd.Timestamp("2026-01-01 00:00:00")
+        engine = self._triple_barrier_engine(
+            [
+                {"timestamp": start, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+                {"timestamp": start + pd.Timedelta(minutes=15), "open": 100.0, "high": 101.0, "low": 97.5, "close": 98.0, "volume": 1000.0},
+                {"timestamp": start + pd.Timedelta(minutes=30), "open": 98.0, "high": 99.0, "low": 97.0, "close": 98.5, "volume": 1000.0},
+            ]
+        )
+
+        label = engine._label_triple_barrier_signal(self._triple_barrier_signal())
+
+        self.assertEqual(label["label"], "SL_FIRST")
+        self.assertEqual(label["bars_to_label"], 1)
+
+    def test_simulation_engine_triple_barrier_labels_time_exit_and_records_bucket_stats(self):
+        start = pd.Timestamp("2026-01-01 00:00:00")
+        engine = self._triple_barrier_engine(
+            [
+                {"timestamp": start, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+                {"timestamp": start + pd.Timedelta(minutes=15), "open": 100.0, "high": 101.5, "low": 99.0, "close": 100.5, "volume": 1000.0},
+                {"timestamp": start + pd.Timedelta(minutes=30), "open": 100.5, "high": 102.0, "low": 99.5, "close": 101.0, "volume": 1000.0},
+            ]
+        )
+        signal = self._triple_barrier_signal()
+        label = engine._label_triple_barrier_signal(signal)
+
+        engine._record_triple_barrier_label(signal, label)
+        summary = engine._build_triple_barrier_summary()
+        validation = engine._build_validation_harness_summary({})
+
+        self.assertEqual(label["label"], "TIME_EXIT")
+        self.assertEqual(summary["labels"], 1)
+        self.assertEqual(summary["label_counts"]["TIME_EXIT"], 1)
+        self.assertEqual(validation["triple_barrier_labels"], 1)
+        self.assertEqual(validation["triple_barrier_time_exit_pct"], 100.0)
+
+    def test_simulation_engine_pullback_meta_filter_blocks_stop_first_bucket(self):
+        engine = self._triple_barrier_engine(
+            [
+                {"timestamp": pd.Timestamp("2026-01-01 00:00:00"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+                {"timestamp": pd.Timestamp("2026-01-01 00:15:00"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+            ]
+        )
+        signal = self._triple_barrier_signal()
+        bucket_key = engine._triple_barrier_bucket_key(signal)
+        for _ in range(3):
+            engine._record_triple_barrier_label(signal, {"label": "SL_FIRST", "bucket_key": bucket_key, "side": "long", "bars_to_label": 1})
+        signal["metadata"]["triple_barrier_label"] = {"label": "TP_FIRST", "bucket_key": bucket_key}
+
+        reason = engine._pullback_meta_filter_reason(signal)
+
+        self.assertEqual(reason, "pullback_meta_filter_stop_first_bucket")
+        self.assertEqual(signal["metadata"]["pullback_meta_filter"]["samples"], 3)
+
+    def test_simulation_engine_pullback_meta_filter_allows_high_quality_escape(self):
+        engine = self._triple_barrier_engine(
+            [
+                {"timestamp": pd.Timestamp("2026-01-01 00:00:00"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+                {"timestamp": pd.Timestamp("2026-01-01 00:15:00"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+            ]
+        )
+        signal = self._triple_barrier_signal()
+        signal["signal_quality"] = 0.86
+        signal["expected_edge_bps"] = 50.0
+        bucket_key = engine._triple_barrier_bucket_key(signal)
+        for _ in range(3):
+            engine._record_triple_barrier_label(signal, {"label": "SL_FIRST", "bucket_key": bucket_key, "side": "long", "bars_to_label": 1})
+        signal["metadata"]["triple_barrier_label"] = {"label": "TP_FIRST", "bucket_key": bucket_key}
+
+        self.assertIsNone(engine._pullback_meta_filter_reason(signal))
+
+    def test_simulation_engine_pullback_meta_filter_ignores_non_pullback_strategy(self):
+        engine = self._triple_barrier_engine(
+            [
+                {"timestamp": pd.Timestamp("2026-01-01 00:00:00"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+                {"timestamp": pd.Timestamp("2026-01-01 00:15:00"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+            ]
+        )
+        signal = self._triple_barrier_signal()
+        signal["strategy"] = "trend_breakout"
+        bucket_key = engine._triple_barrier_bucket_key(signal)
+        for _ in range(3):
+            engine._record_triple_barrier_label(signal, {"label": "SL_FIRST", "bucket_key": bucket_key, "side": "long", "bars_to_label": 1})
+        signal["metadata"]["triple_barrier_label"] = {"label": "TP_FIRST", "bucket_key": bucket_key}
+
+        self.assertIsNone(engine._pullback_meta_filter_reason(signal))
+
+    def test_candidate_flow_rescue_quality_gate_blocks_low_rank_signal(self):
+        engine = self._triple_barrier_engine(
+            [
+                {"timestamp": pd.Timestamp("2026-01-01 00:00:00"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+                {"timestamp": pd.Timestamp("2026-01-01 00:15:00"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+            ]
+        )
+        signal = self._triple_barrier_signal()
+        signal["metadata"].update(
+            {
+                "candidate_flow_rescue": {"active": True, "rank_score": 1.50},
+                "pullback_score": 1.10,
+                "trend_persistence": 0.42,
+                "directional_efficiency": 0.12,
+                "realized_vol_percentile": 0.70,
+                "triple_barrier_label": {"label": "TP_FIRST"},
+            }
+        )
+
+        reason = engine._candidate_flow_rescue_quality_reason(signal)
+
+        self.assertEqual(reason, "candidate_flow_rescue_rank_gate")
+
+    def test_candidate_flow_rescue_quality_gate_tightens_sl_first_signal(self):
+        engine = self._triple_barrier_engine(
+            [
+                {"timestamp": pd.Timestamp("2026-01-01 00:00:00"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+                {"timestamp": pd.Timestamp("2026-01-01 00:15:00"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+            ]
+        )
+        signal = self._triple_barrier_signal()
+        signal["metadata"].update(
+            {
+                "candidate_flow_rescue": {"active": True, "rank_score": 1.90},
+                "pullback_score": 1.10,
+                "trend_persistence": 0.42,
+                "directional_efficiency": 0.12,
+                "realized_vol_percentile": 0.70,
+                "triple_barrier_label": {"label": "SL_FIRST"},
+            }
+        )
+
+        reason = engine._candidate_flow_rescue_quality_reason(signal)
+
+        self.assertEqual(reason, "candidate_flow_rescue_sl_first_gate")
+
+    def test_candidate_flow_rescue_quality_gate_allows_strong_rescue_signal(self):
+        engine = self._triple_barrier_engine(
+            [
+                {"timestamp": pd.Timestamp("2026-01-01 00:00:00"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+                {"timestamp": pd.Timestamp("2026-01-01 00:15:00"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+            ]
+        )
+        signal = self._triple_barrier_signal()
+        signal["metadata"].update(
+            {
+                "candidate_flow_rescue": {"active": True, "rank_score": 2.20},
+                "pullback_score": 1.20,
+                "trend_persistence": 0.46,
+                "directional_efficiency": 0.14,
+                "realized_vol_percentile": 0.70,
+                "triple_barrier_label": {"label": "TP_FIRST"},
+            }
+        )
+
+        self.assertIsNone(engine._candidate_flow_rescue_quality_reason(signal))
+
     def test_runtime_health_reports_missing_snapshot(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = os.path.join(tmpdir, "data")
@@ -554,6 +755,24 @@ class TradeBotCoreTests(unittest.TestCase):
                     "campaign_summary": {
                         "exit_quality": {
                             "by_exit_reason": {
+                                "SL": {
+                                    "trades": 1,
+                                    "wins": 0,
+                                    "losses": 1,
+                                    "total_pl": -4.0,
+                                    "total_mfe_r": 0.2,
+                                    "total_mae_r": 1.0,
+                                    "total_giveback_r": 0.2,
+                                },
+                                "PROFIT_PROTECT_STOP": {
+                                    "trades": 1,
+                                    "wins": 0,
+                                    "losses": 1,
+                                    "total_pl": -1.0,
+                                    "total_mfe_r": 0.6,
+                                    "total_mae_r": 0.2,
+                                    "total_giveback_r": 0.4,
+                                },
                                 "TIME_HARD": {
                                     "trades": 1,
                                     "wins": 0,
@@ -562,6 +781,15 @@ class TradeBotCoreTests(unittest.TestCase):
                                     "total_mfe_r": 1.1,
                                     "total_mae_r": 0.8,
                                     "total_giveback_r": 0.9,
+                                },
+                                "PULLBACK_STRUCTURE_FAIL": {
+                                    "trades": 1,
+                                    "wins": 0,
+                                    "losses": 1,
+                                    "total_pl": -2.0,
+                                    "total_mfe_r": 0.3,
+                                    "total_mae_r": 0.6,
+                                    "total_giveback_r": 0.3,
                                 }
                             },
                             "giveback_by_strategy": {
@@ -582,6 +810,12 @@ class TradeBotCoreTests(unittest.TestCase):
         self.assertAlmostEqual(summary["exit_quality"]["by_exit_reason"]["TIME_HARD"]["avg_giveback_r"], 0.9)
         self.assertAlmostEqual(summary["exit_quality"]["giveback_by_strategy"]["trend_breakout"]["avg_giveback_r"], 0.55)
         self.assertEqual(summary["exit_quality"]["giveback_by_strategy"]["trend_pullback"]["gave_back_below_0_25r_count"], 1.0)
+        self.assertAlmostEqual(summary["exit_quality"]["by_exit_group"]["stop_loss"]["expectancy"], -4.0)
+        self.assertAlmostEqual(summary["exit_quality"]["by_exit_group"]["profit_protection"]["expectancy"], -1.0)
+        self.assertAlmostEqual(summary["exit_quality"]["by_exit_group"]["thesis_failure"]["expectancy"], -2.0)
+        self.assertAlmostEqual(summary["exit_quality"]["by_exit_group"]["stop_loss"]["negative_pl_share_pct"], 40.0)
+        self.assertAlmostEqual(summary["exit_quality"]["by_exit_group"]["profit_protection"]["negative_pl_share_pct"], 10.0)
+        self.assertAlmostEqual(summary["exit_quality"]["by_exit_group"]["thesis_failure"]["negative_pl_share_pct"], 20.0)
 
     def test_build_batch_summary_aggregates_universe_selection_diagnostics(self):
         summary = build_batch_summary(
@@ -593,6 +827,7 @@ class TradeBotCoreTests(unittest.TestCase):
                     "campaign_summary": {
                         "universe_selection": {
                             "eligible_symbols": ["BTC/USDT", "ETH/USDT"],
+                            "reserved_core_symbols": ["BTC/USDT"],
                             "eligible_bucket_counts": {"majors": 2},
                             "rejected_symbols": {
                                 "ADA/USDT": {"reason": "bucket_cap_reached", "bucket": "high_beta_alts"},
@@ -612,6 +847,7 @@ class TradeBotCoreTests(unittest.TestCase):
                     "campaign_summary": {
                         "universe_selection": {
                             "eligible_symbols": ["BTC/USDT"],
+                            "reserved_core_symbols": ["BTC/USDT"],
                             "eligible_bucket_counts": {"majors": 1},
                             "rejected_symbols": {
                                 "SOL/USDT": {"reason": "realized_negative_expectancy_veto", "bucket": "high_beta_alts"},
@@ -627,6 +863,7 @@ class TradeBotCoreTests(unittest.TestCase):
         )
         self.assertEqual(summary["universe_selection"]["eligible_symbols"]["BTC/USDT"], 2)
         self.assertEqual(summary["universe_selection"]["eligible_symbols"]["ETH/USDT"], 1)
+        self.assertEqual(summary["universe_selection"]["reserved_core_symbols"]["BTC/USDT"], 2)
         self.assertEqual(summary["universe_selection"]["rejected_symbols"]["ADA/USDT:bucket_cap_reached"], 1)
         self.assertEqual(summary["universe_selection"]["rejected_symbols"]["SOL/USDT:realized_negative_expectancy_veto"], 1)
         self.assertEqual(summary["universe_selection"]["eligible_buckets"]["majors"], 3)
@@ -709,6 +946,196 @@ class TradeBotCoreTests(unittest.TestCase):
         self.assertEqual(universe["eligible_bucket_counts"]["exchange_beta"], 1)
         self.assertEqual(universe["rejected_symbols"]["ETH/USDT"]["reason"], "bucket_cap_reached")
         self.assertEqual(result["campaign_summary"]["trade_flow"]["raw_signals"], 2)
+
+    def test_spot_universe_reserves_core_symbols_even_when_ranked_below_top_n(self):
+        timestamps = pd.date_range("2025-01-01", periods=21, freq="15min")
+
+        def build_df(volume: float) -> pd.DataFrame:
+            return pd.DataFrame(
+                [
+                    {
+                        "timestamp": ts,
+                        "open": 100.0,
+                        "high": 100.5,
+                        "low": 99.5,
+                        "close": 100.0,
+                        "volume": volume,
+                    }
+                    for ts in timestamps
+                ]
+            ).set_index("timestamp")
+
+        datasets = {
+            "ADA/USDT": build_df(200000.0),
+            "SOL/USDT": build_df(150000.0),
+            "BTC/USDT": build_df(50.0),
+            "ETH/USDT": build_df(60.0),
+        }
+
+        class LocalSimulationEngine(HistoricalSimulationEngine):
+            def load_historical_data(self, symbol, timeframe, days=180):
+                return datasets[symbol].copy()
+
+        engine = LocalSimulationEngine(
+            BotConfig(
+                starting_balance=1000.0,
+                trading_mode="spot",
+                backtest_warmup_candles=20,
+                simulation_universe_top_n=2,
+                simulation_universe_tradability_floor=1.0,
+                simulation_spot_core_symbol_min_count=2,
+                simulation_spot_core_symbols=["BTC/USDT", "ETH/USDT"],
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+
+        result = engine.run_campaign(["ADA/USDT", "SOL/USDT", "BTC/USDT", "ETH/USDT"], timeframe="15m", days=10)
+        universe = result["campaign_summary"]["universe_selection"]
+
+        self.assertIn("BTC/USDT", universe["eligible_symbols"])
+        self.assertIn("ETH/USDT", universe["eligible_symbols"])
+        self.assertEqual(universe["reserved_core_symbols"], ["BTC/USDT", "ETH/USDT"])
+
+    def test_spot_universe_default_reserves_full_core_symbol_set(self):
+        timestamps = pd.date_range("2025-01-01", periods=21, freq="15min")
+
+        def build_df(volume: float) -> pd.DataFrame:
+            return pd.DataFrame(
+                [
+                    {
+                        "timestamp": ts,
+                        "open": 100.0,
+                        "high": 100.5,
+                        "low": 99.5,
+                        "close": 100.0,
+                        "volume": volume,
+                    }
+                    for ts in timestamps
+                ]
+            ).set_index("timestamp")
+
+        datasets = {
+            "ADA/USDT": build_df(200000.0),
+            "SOL/USDT": build_df(150000.0),
+            "AVAX/USDT": build_df(125000.0),
+            "DOT/USDT": build_df(100000.0),
+            "BTC/USDT": build_df(50.0),
+            "ETH/USDT": build_df(60.0),
+            "BNB/USDT": build_df(70.0),
+            "XRP/USDT": build_df(80.0),
+        }
+
+        class LocalSimulationEngine(HistoricalSimulationEngine):
+            def load_historical_data(self, symbol, timeframe, days=180):
+                return datasets[symbol].copy()
+
+        engine = LocalSimulationEngine(
+            BotConfig(
+                starting_balance=1000.0,
+                trading_mode="spot",
+                backtest_warmup_candles=20,
+                simulation_universe_top_n=2,
+                simulation_universe_tradability_floor=1.0,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+
+        result = engine.run_campaign(list(datasets), timeframe="15m", days=10)
+        universe = result["campaign_summary"]["universe_selection"]
+
+        for symbol in ["BTC/USDT", "ETH/USDT", "BNB/USDT", "XRP/USDT"]:
+            self.assertIn(symbol, universe["eligible_symbols"])
+        self.assertEqual(universe["reserved_core_symbols"], ["BNB/USDT", "BTC/USDT", "ETH/USDT", "XRP/USDT"])
+
+    def test_historical_data_loader_writes_cache_after_successful_fetch(self):
+        class FakeBinance:
+            def __init__(self, *_args, **_kwargs):
+                self.calls = 0
+
+            def fetch_ohlcv(self, *_args, **_kwargs):
+                self.calls += 1
+                if self.calls > 1:
+                    return []
+                return [
+                    [1704067200000, 100.0, 101.0, 99.0, 100.5, 1000.0],
+                    [1704068100000, 100.5, 102.0, 100.0, 101.5, 1200.0],
+                ]
+
+        class FakeCcxt:
+            binance = FakeBinance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = HistoricalSimulationEngine(
+                BotConfig(historical_data_cache_dir=tmpdir),
+                signal_engine_cls=QuietSignalEngine,
+            )
+            with mock.patch.dict(sys.modules, {"ccxt": FakeCcxt}):
+                frame = engine.load_historical_data("BTC/USDT", "15m", 7)
+
+            self.assertEqual(len(frame), 2)
+            self.assertTrue(os.path.exists(engine._historical_cache_path("BTC/USDT", "15m", 7)))
+
+    def test_historical_data_loader_falls_back_to_stale_cache_on_network_failure(self):
+        class FailingBinance:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def fetch_ohlcv(self, *_args, **_kwargs):
+                raise RuntimeError("network down")
+
+        class FakeCcxt:
+            binance = FailingBinance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = HistoricalSimulationEngine(
+                BotConfig(
+                    historical_data_cache_dir=tmpdir,
+                    historical_data_cache_max_staleness_hours=0.0,
+                ),
+                signal_engine_cls=QuietSignalEngine,
+            )
+            cached = pd.DataFrame(
+                [
+                    {
+                        "open": 100.0,
+                        "high": 101.0,
+                        "low": 99.0,
+                        "close": 100.5,
+                        "volume": 1000.0,
+                    }
+                ],
+                index=pd.DatetimeIndex([pd.Timestamp("2024-01-01 00:00:00")], name="timestamp"),
+            )
+            engine._write_historical_cache("ETH/USDT", "15m", 7, cached)
+
+            with mock.patch.dict(sys.modules, {"ccxt": FakeCcxt}):
+                frame = engine.load_historical_data("ETH/USDT", "15m", 7)
+
+            self.assertEqual(len(frame), 1)
+            self.assertAlmostEqual(float(frame.iloc[0]["close"]), 100.5)
+
+    def test_historical_data_loader_returns_empty_frame_when_network_fails_without_cache(self):
+        class FailingBinance:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def fetch_ohlcv(self, *_args, **_kwargs):
+                raise RuntimeError("network down")
+
+        class FakeCcxt:
+            binance = FailingBinance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = HistoricalSimulationEngine(
+                BotConfig(historical_data_cache_dir=tmpdir),
+                signal_engine_cls=QuietSignalEngine,
+            )
+
+            with mock.patch.dict(sys.modules, {"ccxt": FakeCcxt}):
+                frame = engine.load_historical_data("SOL/USDT", "15m", 7)
+
+            self.assertTrue(frame.empty)
+            self.assertEqual(list(frame.columns), ["open", "high", "low", "close", "volume"])
 
     def test_simulation_campaign_universe_scoring_uses_realized_symbol_expectancy(self):
         timestamps = pd.date_range("2025-01-01", periods=21, freq="15min")
@@ -846,6 +1273,75 @@ class TradeBotCoreTests(unittest.TestCase):
         self.assertEqual(universe, ["BTC/USDT"])
         self.assertTrue(engine._latest_universe_selection["scored_symbols"]["DOT/USDT"]["realized_veto_active"])
         self.assertEqual(rejected["DOT/USDT"]["reason"], "realized_negative_expectancy_veto")
+
+    def test_universe_strategy_rotation_preserves_symbol_with_positive_family_edge(self):
+        timestamps = pd.date_range("2025-01-01", periods=21, freq="15min")
+
+        def build_df(volume: float) -> pd.DataFrame:
+            return pd.DataFrame(
+                [
+                    {
+                        "timestamp": ts,
+                        "open": 100.0,
+                        "high": 100.5,
+                        "low": 99.5,
+                        "close": 100.0,
+                        "volume": volume,
+                    }
+                    for ts in timestamps
+                ]
+            ).set_index("timestamp")
+
+        datasets = {
+            "DOT/USDT": build_df(3000.0),
+            "BTC/USDT": build_df(3000.0),
+        }
+
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                starting_balance=1000.0,
+                trading_mode="futures",
+                simulation_universe_top_n=2,
+                simulation_universe_tradability_floor=1.0,
+                simulation_universe_realized_veto_min_trades=2,
+                simulation_universe_realized_veto_expectancy_floor=-2.0,
+                simulation_universe_strategy_rotation_min_trades=2,
+                simulation_universe_strategy_rotation_positive_floor=2.0,
+                simulation_universe_strategy_rotation_negative_floor=-8.0,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        engine._simulation_symbol_universe = ["DOT/USDT", "BTC/USDT"]
+        engine._base_timeframe = "15m"
+        engine.exchange = HistoricalReplayExchange(
+            {
+                ("DOT/USDT", "15m"): datasets["DOT/USDT"],
+                ("BTC/USDT", "15m"): datasets["BTC/USDT"],
+            },
+            "BTC/USDT",
+            base_timeframe="15m",
+            config=engine.config,
+        )
+        engine.exchange.set_time(timestamps[-1].to_pydatetime() + dt.timedelta(minutes=15))
+        engine.trades = [
+            {"symbol": "DOT/USDT", "strategy": "trend_breakout", "pl": -20.0},
+            {"symbol": "DOT/USDT", "strategy": "trend_breakout", "pl": -20.0},
+            {"symbol": "DOT/USDT", "strategy": "trend_pullback", "pl": 3.0},
+            {"symbol": "DOT/USDT", "strategy": "trend_pullback", "pl": 3.0},
+            {"symbol": "BTC/USDT", "strategy": "trend_pullback", "pl": 1.0},
+            {"symbol": "BTC/USDT", "strategy": "trend_pullback", "pl": 1.0},
+        ]
+        engine._closed_by_symbol = {"DOT/USDT": 4, "BTC/USDT": 2}
+
+        universe = engine._eligible_universe_symbols(["DOT/USDT", "BTC/USDT"])
+        scored = engine._latest_universe_selection["scored_symbols"]
+
+        self.assertIn("DOT/USDT", universe)
+        self.assertFalse(scored["DOT/USDT"]["realized_veto_active"])
+        self.assertTrue(scored["DOT/USDT"]["strategy_rotation_positive_override"])
+        self.assertIn("trend_pullback", scored["DOT/USDT"]["strategy_rotation"])
+        self.assertEqual(scored["DOT/USDT"]["strategy_rotation"]["trend_pullback"]["state"], "positive_rotation")
 
     def test_universe_bucket_cap_tightens_high_beta_alts_in_risk_off_state(self):
         timestamps = pd.date_range("2025-01-01", periods=21, freq="15min")
@@ -1178,10 +1674,274 @@ class TradeBotCoreTests(unittest.TestCase):
         self.assertEqual(summary["decision_totals"]["realized_performance_no_trade_blocks"]["strategy_negative_expectancy"], 1)
         self.assertEqual(summary["decision_totals"]["realized_performance_no_trade_blocks"]["symbol_negative_expectancy"], 2)
         self.assertEqual(summary["realized_performance_penalty_by_strategy"]["trend_pullback"]["symbol_negative_expectancy"], 2)
-        self.assertEqual(summary["realized_performance_no_trade_by_strategy"]["mean_reversion"]["symbol_negative_expectancy"], 2)
-        self.assertEqual(summary["duplicate_bucket_throttle_by_strategy"]["trend_pullback"], 1)
-        self.assertEqual(summary["duplicate_bucket_throttle_by_strategy"]["mean_reversion"], 2)
-        self.assertEqual(summary["weak_cluster_throttle_by_strategy"]["trend_pullback"], 3)
+
+    def test_build_batch_summary_aggregates_validation_harness_metrics(self):
+        summary = build_batch_summary(
+            [
+                {
+                    "artifact_dir": "run1",
+                    "num_trades": 2,
+                    "raw_signals": 5,
+                    "campaign_summary": {
+                        "validation_harness": {
+                            "signal_to_submission_pct": 20.0,
+                            "submission_to_fill_pct": 50.0,
+                            "fill_to_close_pct": 100.0,
+                            "stop_loss_negative_pl_share_pct": 70.0,
+                            "repeated_setup_density_pct": 25.0,
+                            "fresh_setup_block_density_pct": 30.0,
+                            "repeated_setup_blocks": 2,
+                            "fresh_setup_blocks": 3,
+                            "candidate_flow": {
+                                "starved": True,
+                                "proposals": 8,
+                                "raw_signals": 5,
+                                "submitted_orders": 1,
+                                "filled_orders": 0,
+                                "closed_trades": 0,
+                                "pre_selection_rejections": {"state_blocked": 4},
+                                "strategy_rejections": {"trend_pullback:meta_filter_blocked": 2},
+                                "post_selection_rejections": {"cooldown": 1},
+                            },
+                        }
+                    },
+                    "decision_diagnostics": {"repeated_setup_blocks": 2, "fresh_setup_blocks": 3},
+                },
+                {
+                    "artifact_dir": "run2",
+                    "num_trades": 1,
+                    "raw_signals": 4,
+                    "campaign_summary": {
+                        "validation_harness": {
+                            "signal_to_submission_pct": 30.0,
+                            "submission_to_fill_pct": 60.0,
+                            "fill_to_close_pct": 50.0,
+                            "stop_loss_negative_pl_share_pct": 40.0,
+                            "repeated_setup_density_pct": 10.0,
+                            "fresh_setup_block_density_pct": 20.0,
+                            "repeated_setup_blocks": 1,
+                            "fresh_setup_blocks": 1,
+                            "candidate_flow": {
+                                "starved": False,
+                                "proposals": 12,
+                                "raw_signals": 4,
+                                "submitted_orders": 3,
+                                "filled_orders": 2,
+                                "closed_trades": 1,
+                                "generation_outcomes": {"no_signal": 6},
+                                "pre_selection_rejections": {"state_blocked": 1},
+                                "strategy_rejections": {"trend_pullback:meta_filter_blocked": 3},
+                            },
+                        }
+                    },
+                    "decision_diagnostics": {"repeated_setup_blocks": 1, "fresh_setup_blocks": 1},
+                },
+            ]
+        )
+        self.assertAlmostEqual(summary["validation_harness"]["signal_to_submission_pct"], 25.0)
+        self.assertAlmostEqual(summary["validation_harness"]["submission_to_fill_pct"], 55.0)
+        self.assertAlmostEqual(summary["validation_harness"]["stop_loss_negative_pl_share_pct"], 55.0)
+        self.assertAlmostEqual(summary["validation_harness"]["repeated_setup_density_pct"], 17.5)
+        self.assertAlmostEqual(summary["validation_harness"]["fresh_setup_block_density_pct"], 25.0)
+        self.assertEqual(summary["validation_harness"]["repeated_setup_blocks"], 3)
+        self.assertEqual(summary["validation_harness"]["fresh_setup_blocks"], 4)
+        self.assertEqual(summary["validation_harness"]["candidate_flow"]["starved_runs"], 1)
+        self.assertAlmostEqual(summary["validation_harness"]["candidate_flow"]["starved_run_pct"], 50.0)
+        self.assertEqual(summary["validation_harness"]["candidate_flow"]["proposals"], 20)
+        self.assertEqual(summary["validation_harness"]["candidate_flow"]["raw_signals"], 9)
+        self.assertEqual(summary["validation_harness"]["candidate_flow"]["submitted_orders"], 4)
+        self.assertEqual(summary["validation_harness"]["candidate_flow"]["filled_orders"], 2)
+        self.assertEqual(
+            summary["validation_harness"]["candidate_flow"]["top_blockers"]["strategy:trend_pullback:meta_filter_blocked"],
+            5,
+        )
+        self.assertIn("readiness_score", summary["validation_targets"])
+        self.assertEqual(summary["validation_targets"]["candidate_flow_status"], "candidate_flow_starved")
+        self.assertFalse(summary["validation_targets"]["flow_recovered"])
+        self.assertTrue(summary["validation_targets"]["flow_starved"])
+        self.assertGreaterEqual(summary["validation_targets"]["readiness_score"], 0.0)
+        self.assertLessEqual(summary["validation_targets"]["readiness_score"], 100.0)
+        self.assertIn("top_blockers", summary["validation_targets"])
+
+    def test_build_batch_summary_penalizes_starved_candidate_flow(self):
+        summary = build_batch_summary(
+            [
+                {
+                    "artifact_dir": "run1",
+                    "num_trades": 0,
+                    "raw_signals": 0,
+                    "win_rate_pct": 0.0,
+                    "total_return_pct": 0.0,
+                    "campaign_summary": {
+                        "validation_harness": {
+                            "signal_to_submission_pct": 0.0,
+                            "submission_to_fill_pct": 0.0,
+                            "fill_to_close_pct": 0.0,
+                            "stop_loss_negative_pl_share_pct": 0.0,
+                            "candidate_flow": {
+                                "starved": True,
+                                "proposals": 0,
+                                "raw_signals": 0,
+                                "submitted_orders": 0,
+                                "filled_orders": 0,
+                                "closed_trades": 0,
+                            },
+                        },
+                        "acceptance": {
+                            "checks": {"drawdown_within_limit": True},
+                            "passes_all": False,
+                        },
+                    },
+                }
+            ]
+        )
+
+        targets = summary["validation_targets"]
+        self.assertEqual(targets["candidate_flow_status"], "candidate_flow_starved")
+        self.assertTrue(targets["flow_starved"])
+        self.assertFalse(targets["flow_recovered"])
+        self.assertGreater(targets["readiness_penalty"], 0.0)
+        self.assertLess(targets["readiness_score"], targets["base_readiness_score"])
+        self.assertIn("candidate_flow_starved", summary["candidate_verdict"]["reasons"])
+
+    def test_build_batch_summary_verdict_flags_validation_harness_failures(self):
+        summary = build_batch_summary(
+            [
+                {
+                    "artifact_dir": "run1",
+                    "num_trades": 2,
+                    "raw_signals": 20,
+                    "campaign_summary": {
+                        "validation_harness": {
+                            "signal_to_submission_pct": 10.0,
+                            "submission_to_fill_pct": 30.0,
+                            "fill_to_close_pct": 100.0,
+                            "stop_loss_negative_pl_share_pct": 80.0,
+                        },
+                        "acceptance": {
+                            "checks": {"drawdown_within_limit": True},
+                            "passes_all": False,
+                        },
+                    },
+                }
+            ]
+        )
+
+        self.assertEqual(summary["candidate_verdict"]["status"], "not_ready")
+        self.assertIn("stop_loss_damage_too_high", summary["candidate_verdict"]["reasons"])
+        self.assertIn("signal_to_submission_too_low", summary["candidate_verdict"]["reasons"])
+        self.assertIn("submission_to_fill_too_low", summary["candidate_verdict"]["reasons"])
+
+    def test_build_batch_summary_flags_missing_market_data(self):
+        summary = build_batch_summary(
+            [
+                {
+                    "artifact_dir": "run1",
+                    "num_trades": 0,
+                    "raw_signals": 0,
+                    "campaign_summary": {
+                        "market_data": {
+                            "data_available": False,
+                            "datasets_loaded": 0,
+                            "datasets_missing": 4,
+                            "total_rows": 0,
+                        },
+                        "acceptance": {
+                            "checks": {},
+                            "passes_all": False,
+                        },
+                    },
+                }
+            ]
+        )
+
+        self.assertEqual(summary["market_data"]["runs_without_data"], 1)
+        self.assertEqual(summary["market_data"]["datasets_missing"], 4)
+        self.assertIn("market_data_unavailable", summary["candidate_verdict"]["reasons"])
+
+    def test_parse_validation_windows_accepts_d_suffix_and_deduplicates(self):
+        self.assertEqual(parse_validation_windows("30, 60d, 90, 60"), [30, 60, 90])
+
+    def test_parse_validation_windows_rejects_invalid_values(self):
+        with self.assertRaises(ValueError):
+            parse_validation_windows("30, nope")
+        with self.assertRaises(ValueError):
+            parse_validation_windows("0")
+
+    def test_render_validation_suite_summary_surfaces_window_metrics(self):
+        summary = {
+            "num_runs": 2,
+            "validation_suite": {
+                "windows": [30, 60],
+                "repeat_per_window": 1,
+            },
+            "aggregates": {
+                "num_trades": {"avg": 4.0},
+                "total_return_pct": {"avg": 1.25},
+                "win_rate_pct": {"avg": 42.0},
+            },
+            "candidate_verdict": {
+                "status": "not_ready",
+                "reasons": ["signal_to_submission_too_low"],
+            },
+            "validation_harness": {
+                "signal_to_submission_pct": 16.0,
+                "submission_to_fill_pct": 55.0,
+                "stop_loss_negative_pl_share_pct": 62.0,
+                "fresh_setup_block_density_pct": 9.0,
+                "candidate_flow": {
+                    "starved_runs": 1,
+                    "starved_run_pct": 50.0,
+                    "proposals": 3,
+                    "raw_signals": 0,
+                    "submitted_orders": 0,
+                    "filled_orders": 0,
+                    "closed_trades": 0,
+                    "top_blockers": {"pre:state_blocked": 3},
+                },
+            },
+            "validation_targets": {
+                "readiness_score": 42.5,
+                "avg_trades_per_day": 0.25,
+                "target_trades_per_day_min": 2.0,
+                "target_trades_per_day_max": 3.0,
+                "return_gap_to_positive_pct": 0.0,
+                "top_blockers": [{"name": "trade_frequency", "gap": 1.75}],
+            },
+            "by_horizon": {
+                "30d": {
+                    "num_runs": 1,
+                    "aggregates": {
+                        "total_return_pct": {"avg": 0.5},
+                        "num_trades": {"avg": 3.0},
+                        "win_rate_pct": {"avg": 40.0},
+                    },
+                    "candidate_verdict": {"status": "promising"},
+                },
+                "60d": {
+                    "num_runs": 1,
+                    "aggregates": {
+                        "total_return_pct": {"avg": 2.0},
+                        "num_trades": {"avg": 5.0},
+                        "win_rate_pct": {"avg": 44.0},
+                    },
+                    "candidate_verdict": {"status": "not_ready"},
+                },
+            },
+        }
+
+        rendered = render_validation_suite_summary(summary)
+
+        self.assertIn("Validation Runs: 2", rendered)
+        self.assertIn("Windows: 30d, 60d", rendered)
+        self.assertIn("Validation Harness:", rendered)
+        self.assertIn("Candidate Flow:", rendered)
+        self.assertIn("top_blockers=pre:state_blocked=3", rendered)
+        self.assertIn("Goal Progress:", rendered)
+        self.assertIn("Flow Status:", rendered)
+        self.assertIn("readiness=42.5/100", rendered)
+        self.assertIn("Window 30d:", rendered)
+        self.assertIn("Window 60d:", rendered)
 
     def test_campaign_diagnostics_include_consolidated_learning_controls(self):
         timestamps = pd.date_range("2025-01-01", periods=130, freq="15min")
@@ -2546,6 +3306,136 @@ class TradeBotCoreTests(unittest.TestCase):
 
         self.assertAlmostEqual(position.stop_loss, 98.0)
 
+    def test_simulation_engine_high_beta_pullback_profit_protection_locks_early(self):
+        engine = BacktestEngine(
+            BotConfig(
+                breakeven_rr=10.0,
+                trailing_rr=10.0,
+                profit_protect_pullback_trigger_rr=10.0,
+                high_beta_pullback_profit_protect_trigger_rr=0.35,
+                high_beta_pullback_profit_protect_lock_rr=0.04,
+            )
+        )
+        position = Position(
+            symbol="AVAX/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+        )
+        position.metadata = {"signal_snapshot": {"metadata": {"high_beta_quality_escape": True}}}
+        bar = pd.Series({"open": 100.0, "high": 100.9, "low": 99.9, "close": 100.7})
+
+        engine._update_dynamic_risk(position, "AVAX/USDT", bar)
+
+        self.assertAlmostEqual(position.stop_loss, 100.08)
+
+    def test_simulation_engine_trend_supportive_partial_pullback_keeps_looser_lock(self):
+        engine = BacktestEngine(
+            BotConfig(
+                breakeven_rr=10.0,
+                trailing_rr=10.0,
+                partial_profit_take_spot_core_pullback_trigger_rr=0.40,
+                partial_profit_take_spot_core_pullback_fraction=0.35,
+                partial_profit_take_spot_core_pullback_stop_lock_rr=0.12,
+                partial_profit_fee_aware_stop_lock_enabled=False,
+            )
+        )
+        engine._partial_profit_takes = 0
+        engine._partial_profit_takes_by_strategy = {}
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+            metadata={
+                "signal_snapshot": {
+                    "metadata": {
+                        "symbol_bucket": "majors",
+                        "regime_state": "trend_supportive",
+                    }
+                }
+            },
+        )
+        bar = pd.Series({"open": 100.0, "high": 100.9, "low": 99.9, "close": 100.8})
+
+        engine._maybe_partial_profit_take(position, bar)
+
+        self.assertAlmostEqual(position.metadata["partial_profit_stop_lock_rr"], 0.102)
+        self.assertEqual(position.metadata["regime_exit_profile"], "trend_supportive")
+
+    def test_simulation_engine_risk_off_partial_pullback_tightens_lock(self):
+        engine = BacktestEngine(
+            BotConfig(
+                breakeven_rr=10.0,
+                trailing_rr=10.0,
+                partial_profit_take_spot_core_pullback_trigger_rr=0.40,
+                partial_profit_take_spot_core_pullback_fraction=0.35,
+                partial_profit_take_spot_core_pullback_stop_lock_rr=0.12,
+                partial_profit_fee_aware_stop_lock_enabled=False,
+            )
+        )
+        engine._partial_profit_takes = 0
+        engine._partial_profit_takes_by_strategy = {}
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+            metadata={
+                "signal_snapshot": {
+                    "metadata": {
+                        "symbol_bucket": "majors",
+                        "regime_state": "risk_off",
+                    }
+                }
+            },
+        )
+        bar = pd.Series({"open": 100.0, "high": 100.9, "low": 99.9, "close": 100.8})
+
+        engine._maybe_partial_profit_take(position, bar)
+
+        self.assertAlmostEqual(position.metadata["partial_profit_stop_lock_rr"], 0.18)
+        self.assertEqual(position.metadata["regime_exit_profile"], "risk_off")
+
+    def test_simulation_engine_spot_core_pullback_profit_protection_locks_early(self):
+        engine = BacktestEngine(
+            BotConfig(
+                breakeven_rr=10.0,
+                trailing_rr=10.0,
+                profit_protect_pullback_trigger_rr=10.0,
+                spot_core_pullback_profit_protect_trigger_rr=0.40,
+                spot_core_pullback_profit_protect_lock_rr=0.03,
+            )
+        )
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+        )
+        position.metadata = {"signal_snapshot": {"metadata": {"symbol_bucket": "majors"}}}
+        bar = pd.Series({"open": 100.0, "high": 100.9, "low": 99.9, "close": 100.7})
+
+        engine._update_dynamic_risk(position, "BTC/USDT", bar)
+
+        self.assertAlmostEqual(position.stop_loss, 100.06)
+
     def test_simulation_engine_mean_reversion_profit_capture_locks_earlier(self):
         engine = BacktestEngine(
             BotConfig(
@@ -2601,6 +3491,274 @@ class TradeBotCoreTests(unittest.TestCase):
         self.assertAlmostEqual(position.size, 1.0)
         self.assertTrue(position.metadata["partial_profit_taken"])
         self.assertAlmostEqual(float(position.metadata["partial_realized_gross_pl"]), expected_partial_gross)
+
+    def test_simulation_engine_high_beta_pullback_partial_profit_take_reduces_size(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                partial_profit_take_high_beta_pullback_trigger_rr=0.35,
+                partial_profit_take_high_beta_pullback_fraction=0.45,
+                partial_profit_take_high_beta_pullback_stop_lock_rr=0.12,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        position = Position(
+            symbol="AVAX/USDT",
+            side="long",
+            entry_price=100.0,
+            size=2.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+        )
+        position.metadata = {
+            "initial_size": 2.0,
+            "signal_snapshot": {"metadata": {"high_beta_quality_escape": True}},
+        }
+        bar = pd.Series({"open": 100.0, "high": 100.9, "low": 99.9, "close": 100.7, "volume": 1000.0})
+
+        engine._maybe_partial_profit_take(position, bar)
+        expected_exit_price, _ = engine._apply_exit_costs(position, float(bar["close"]), bar)
+        expected_partial_gross = engine._gross_pl("long", 100.0, expected_exit_price, 0.9)
+
+        self.assertAlmostEqual(position.size, 1.1)
+        self.assertAlmostEqual(position.stop_loss, 100.24)
+        self.assertTrue(position.metadata["partial_profit_taken"])
+        self.assertAlmostEqual(position.metadata["partial_profit_taken_fraction"], 0.45)
+        self.assertEqual(position.metadata["partial_profit_take_reason"], "high_beta_pullback_partial_profit_take")
+        self.assertAlmostEqual(position.metadata["partial_profit_stop_lock_rr"], 0.12)
+        self.assertAlmostEqual(float(position.metadata["partial_realized_gross_pl"]), expected_partial_gross)
+        self.assertEqual(engine._partial_profit_takes_by_strategy["trend_pullback"], 1)
+
+    def test_simulation_engine_spot_core_pullback_partial_profit_take_reduces_size(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                partial_profit_take_spot_core_pullback_trigger_rr=0.40,
+                partial_profit_take_spot_core_pullback_fraction=0.35,
+                partial_profit_take_spot_core_pullback_stop_lock_rr=0.12,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=2.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+        )
+        position.metadata = {
+            "initial_size": 2.0,
+            "signal_snapshot": {"metadata": {"symbol_bucket": "majors"}},
+        }
+        bar = pd.Series({"open": 100.0, "high": 100.9, "low": 99.9, "close": 100.7, "volume": 1000.0})
+
+        engine._maybe_partial_profit_take(position, bar)
+
+        self.assertAlmostEqual(position.size, 1.3)
+        self.assertAlmostEqual(position.stop_loss, 100.24)
+        self.assertTrue(position.metadata["partial_profit_taken"])
+        self.assertAlmostEqual(position.metadata["partial_profit_taken_fraction"], 0.35)
+        self.assertEqual(position.metadata["partial_profit_take_reason"], "spot_core_pullback_partial_profit_take")
+        self.assertAlmostEqual(position.metadata["partial_profit_stop_lock_rr"], 0.12)
+        self.assertEqual(engine._partial_profit_takes_by_strategy["trend_pullback"], 1)
+
+    def test_simulation_engine_fee_aware_partial_profit_stop_lock_covers_costs(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                backtest_fee_bps=25.0,
+                partial_profit_take_spot_core_pullback_trigger_rr=0.40,
+                partial_profit_take_spot_core_pullback_fraction=0.10,
+                partial_profit_take_spot_core_pullback_stop_lock_rr=0.02,
+                partial_profit_fee_aware_stop_lock_buffer_bps=2.0,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=2.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+            fee_paid=0.50,
+        )
+        position.metadata = {
+            "initial_size": 2.0,
+            "signal_snapshot": {"metadata": {"symbol_bucket": "majors"}},
+        }
+        bar = pd.Series({"open": 100.0, "high": 100.9, "low": 99.9, "close": 100.7, "volume": 1000.0})
+
+        engine._maybe_partial_profit_take(position, bar)
+
+        self.assertGreater(position.metadata["partial_profit_stop_lock_rr"], 0.02)
+        self.assertAlmostEqual(position.stop_loss, 100.36)
+        self.assertAlmostEqual(position.metadata["partial_profit_fee_aware_stop_lock_rr"], 0.18)
+
+    def test_simulation_engine_can_disable_fee_aware_partial_profit_stop_lock(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                backtest_fee_bps=25.0,
+                partial_profit_take_spot_core_pullback_trigger_rr=0.40,
+                partial_profit_take_spot_core_pullback_fraction=0.10,
+                partial_profit_take_spot_core_pullback_stop_lock_rr=0.02,
+                partial_profit_fee_aware_stop_lock_enabled=False,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=2.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+            fee_paid=0.50,
+        )
+        position.metadata = {
+            "initial_size": 2.0,
+            "signal_snapshot": {"metadata": {"symbol_bucket": "majors"}},
+        }
+        bar = pd.Series({"open": 100.0, "high": 100.9, "low": 99.9, "close": 100.7, "volume": 1000.0})
+
+        engine._maybe_partial_profit_take(position, bar)
+
+        self.assertAlmostEqual(position.stop_loss, 100.04)
+        self.assertAlmostEqual(position.metadata["partial_profit_stop_lock_rr"], 0.02)
+        self.assertAlmostEqual(position.metadata["partial_profit_fee_aware_stop_lock_rr"], 0.0)
+
+    def test_simulation_engine_profit_protected_exit_caps_slippage_after_partial(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                backtest_spread_bps=20.0,
+                backtest_slippage_bps=50.0,
+                simulation_slippage_volatility_weight=1.0,
+                partial_profit_protected_exit_min_lock_rr=0.04,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=100.24,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+        )
+        position.metadata = {"partial_profit_stop_lock_rr": 0.12}
+        bar = pd.Series({"open": 100.1, "high": 101.0, "low": 99.5, "close": 100.0, "volume": 1000.0})
+
+        exit_price, _ = engine._apply_exit_costs(position, 100.24, bar)
+
+        self.assertAlmostEqual(exit_price, 100.24)
+
+    def test_simulation_engine_partial_profit_stop_uses_distinct_exit_reason(self):
+        engine = HistoricalSimulationEngine(BotConfig(), signal_engine_cls=QuietSignalEngine)
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=100.24,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+        )
+        position.metadata = {
+            "partial_profit_taken": True,
+            "partial_profit_stop_lock_rr": 0.12,
+        }
+        bar = pd.Series({"open": 100.10, "high": 100.60, "low": 99.90, "close": 100.20})
+
+        reason, price, details = engine._trigger_exit(position, bar)
+
+        self.assertEqual(reason, "PROFIT_PROTECT_STOP")
+        self.assertAlmostEqual(price, 100.10)
+        self.assertTrue(details["profit_protected_stop"])
+        self.assertAlmostEqual(details["partial_profit_stop_lock_rr"], 0.12)
+
+    def test_simulation_engine_winner_follow_through_exits_partial_winner_before_stop(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                winner_follow_through_confirm_bars=2,
+                winner_follow_through_min_mfe_r=0.35,
+                winner_follow_through_min_progress_after_partial_rr=0.10,
+                winner_follow_through_max_giveback_rr=0.22,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=100.24,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+        )
+        position.metadata = {
+            "partial_profit_taken": True,
+            "partial_profit_stop_lock_rr": 0.12,
+            "partial_profit_rr_move": 0.49,
+            "partial_profit_bar_index": 10,
+            "mfe_r": 0.50,
+        }
+        bar = pd.Series({"open": 100.6, "high": 100.7, "low": 100.3, "close": 100.5})
+
+        reason, price, details = engine._trigger_exit(position, bar, current_index=12)
+
+        self.assertEqual(reason, "WINNER_FOLLOW_THROUGH_FAIL")
+        self.assertAlmostEqual(price, 100.5)
+        self.assertTrue(details["winner_follow_through_fail"])
+        self.assertEqual(details["path_assumption"], "close_follow_through_failure")
+
+    def test_simulation_engine_winner_follow_through_keeps_confirmed_partial_winner_open(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                winner_follow_through_confirm_bars=2,
+                winner_follow_through_min_mfe_r=0.35,
+                winner_follow_through_min_progress_after_partial_rr=0.10,
+                winner_follow_through_max_giveback_rr=0.22,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=100.24,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+        )
+        position.metadata = {
+            "partial_profit_taken": True,
+            "partial_profit_stop_lock_rr": 0.12,
+            "partial_profit_rr_move": 0.49,
+            "partial_profit_bar_index": 10,
+            "mfe_r": 0.75,
+        }
+        bar = pd.Series({"open": 101.2, "high": 101.4, "low": 100.9, "close": 101.25})
+
+        reason, price, details = engine._trigger_exit(position, bar, current_index=12)
+
+        self.assertEqual(reason, "OPEN")
+        self.assertIsNone(price)
+        self.assertFalse(details.get("winner_follow_through_fail", False))
 
     def test_simulation_engine_attaches_entry_atr_to_position_metadata(self):
         class StubSignals:
@@ -2707,6 +3865,47 @@ class TradeBotCoreTests(unittest.TestCase):
         self.assertEqual(summary["giveback_by_strategy"]["trend_breakout"]["mfe_above_1r_count"], 1.0)
         self.assertEqual(summary["giveback_by_strategy"]["trend_pullback"]["gave_back_below_0_25r_count"], 1.0)
 
+    def test_campaign_acceptance_blocks_when_validation_harness_is_weak(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                target_trades_per_day_min=0.1,
+                target_trades_per_day_max=2.0,
+                promotion_min_win_rate_pct=0.0,
+                promotion_min_profit_factor=0.0,
+                promotion_max_drawdown_pct=20.0,
+                promotion_max_stop_loss_negative_pl_share_pct=55.0,
+                promotion_min_signal_to_submission_pct=18.0,
+                promotion_min_submission_to_fill_pct=45.0,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        metrics = {
+            "win_rate_pct": 50.0,
+            "total_return_pct": 1.0,
+            "profit_factor": 1.2,
+            "max_drawdown_pct": -2.0,
+        }
+        trade_frequency = {
+            "global": {"trades_per_day": 1.0},
+            "target_band": {"preferred_min": 0.1, "preferred_max": 2.0},
+        }
+        validation_harness = {
+            "stop_loss_negative_pl_share_pct": 80.0,
+            "signal_to_submission_pct": 10.0,
+            "submission_to_fill_pct": 30.0,
+        }
+
+        summary = engine._build_campaign_acceptance_summary(
+            metrics=metrics,
+            trade_frequency=trade_frequency,
+            validation_harness=validation_harness,
+        )
+
+        self.assertFalse(summary["passes_all"])
+        self.assertFalse(summary["checks"]["stop_loss_damage_within_limit"])
+        self.assertFalse(summary["checks"]["signal_to_submission_meets_floor"])
+        self.assertFalse(summary["checks"]["submission_to_fill_meets_floor"])
+
     def test_simulation_engine_mean_reversion_reclaim_failure_exits_after_snapback_stalls(self):
         engine = HistoricalSimulationEngine(
             BotConfig(
@@ -2733,6 +3932,264 @@ class TradeBotCoreTests(unittest.TestCase):
         self.assertEqual(reason, "MEAN_REVERSION_RECLAIM_FAIL")
         self.assertAlmostEqual(price, 100.0)
         self.assertEqual(details["path_assumption"], "close_reclaim_failure")
+
+    def test_simulation_engine_breakout_thesis_failure_exits_before_full_stop(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                breakout_thesis_fail_activation_rr=0.10,
+                breakout_thesis_fail_close_rr=-0.15,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_breakout",
+            initial_stop_loss=98.0,
+        )
+        position.metadata = {"mfe_r": 0.05, "signal_snapshot": {"trend_persistence": 0.65}}
+        bar = pd.Series({"open": 100.0, "high": 100.2, "low": 99.4, "close": 99.6})
+
+        reason, price, details = engine._trigger_exit(position, bar)
+
+        self.assertEqual(reason, "BREAKOUT_THESIS_FAIL")
+        self.assertAlmostEqual(price, 99.6)
+        self.assertEqual(details["path_assumption"], "close_thesis_failure")
+
+    def test_simulation_engine_breakout_structure_failure_exits_before_stop(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                breakout_thesis_fail_close_rr=-0.30,
+                breakout_thesis_fail_structure_buffer_rr=0.05,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_breakout",
+            initial_stop_loss=98.0,
+        )
+        position.metadata = {"mfe_r": 0.30, "signal_snapshot": {"metadata": {"breakout_level": 100.0}}}
+        bar = pd.Series({"open": 100.0, "high": 100.4, "low": 99.2, "close": 99.7})
+
+        reason, price, details = engine._trigger_exit(position, bar)
+
+        self.assertEqual(reason, "BREAKOUT_STRUCTURE_FAIL")
+        self.assertAlmostEqual(price, 99.7)
+        self.assertEqual(details["path_assumption"], "close_thesis_failure")
+
+    def test_simulation_engine_pullback_reclaim_failure_exits_before_stop(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                pullback_thesis_fail_close_rr=-0.30,
+                pullback_thesis_fail_reclaim_buffer_rr=0.05,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+        )
+        position.metadata = {
+            "mfe_r": 0.30,
+            "signal_snapshot": {"metadata": {"reclaim_level": 100.0, "trend_persistence": 0.62}},
+        }
+        bar = pd.Series({"open": 100.0, "high": 100.3, "low": 99.2, "close": 99.8})
+
+        reason, price, details = engine._trigger_exit(position, bar)
+
+        self.assertEqual(reason, "PULLBACK_RECLAIM_FAIL")
+        self.assertAlmostEqual(price, 99.8)
+        self.assertEqual(details["path_assumption"], "close_thesis_failure")
+
+    def test_simulation_engine_pullback_structure_failure_exits_before_stop(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                pullback_thesis_fail_close_rr=-0.30,
+                pullback_thesis_fail_structure_buffer_rr=0.05,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+        )
+        position.metadata = {
+            "mfe_r": 0.30,
+            "signal_snapshot": {"metadata": {"structure_support": 100.0, "trend_persistence": 0.62}},
+        }
+        bar = pd.Series({"open": 100.0, "high": 100.3, "low": 99.2, "close": 99.8})
+
+        reason, price, details = engine._trigger_exit(position, bar)
+
+        self.assertEqual(reason, "PULLBACK_STRUCTURE_FAIL")
+        self.assertAlmostEqual(price, 99.8)
+        self.assertEqual(details["path_assumption"], "close_thesis_failure")
+
+    def test_simulation_engine_high_beta_pullback_thesis_failure_exits_before_stop(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(high_beta_pullback_thesis_fail_close_rr=-0.08),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        position = Position(
+            symbol="AVAX/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=98.0,
+            take_profit=104.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+        )
+        position.metadata = {
+            "mfe_r": 0.40,
+            "signal_snapshot": {
+                "metadata": {
+                    "high_beta_quality_escape": True,
+                    "trend_persistence": 0.42,
+                }
+            },
+        }
+        bar = pd.Series({"open": 100.0, "high": 100.4, "low": 97.8, "close": 99.75})
+
+        reason, price, details = engine._trigger_exit(position, bar)
+
+        self.assertEqual(reason, "HIGH_BETA_PULLBACK_THESIS_FAIL")
+        self.assertAlmostEqual(price, 99.75)
+        self.assertEqual(details["path_assumption"], "pre_stop_high_beta_thesis_failure")
+
+    def test_simulation_engine_repeated_setup_reason_blocks_near_duplicate_signal(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                simulation_repeat_setup_suppression_bars=12,
+                simulation_repeat_setup_entry_tolerance_bps=25.0,
+                simulation_repeat_setup_quality_floor=0.70,
+                simulation_repeat_setup_density_penalty_score=7.0,
+                simulation_repeat_setup_no_trade_penalty_bps=4.0,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        prior_signal = {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "strategy": "trend_breakout",
+            "entry_price": 100.0,
+            "signal_quality": 0.82,
+            "regime": "trending",
+            "metadata": {},
+        }
+        engine._register_setup_signature(prior_signal, current_index=10)
+        new_signal = {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "strategy": "trend_breakout",
+            "entry_price": 100.12,
+            "signal_quality": 0.81,
+            "regime": "trending",
+            "metadata": {},
+        }
+
+        reason = engine._repeated_setup_reason(new_signal, current_index=15)
+
+        self.assertEqual(reason, "repeated_setup_density")
+        realized_penalty = dict((new_signal.get("metadata", {}) or {}).get("realized_performance_penalty", {}) or {})
+        self.assertEqual(realized_penalty["repeat_setup_penalty_score"], 7.0)
+        self.assertIn("repeated_setup_density", list(realized_penalty.get("reasons", []) or []))
+
+    def test_simulation_engine_fresh_setup_reason_blocks_low_quality_duplicate_before_cooldown(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                simulation_repeat_setup_suppression_bars=12,
+                simulation_fresh_setup_min_entry_shift_bps=35.0,
+                simulation_fresh_setup_min_score_improvement=0.20,
+                simulation_fresh_setup_block_quality_floor=0.55,
+                simulation_repeat_setup_quality_floor=0.80,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        prior_signal = {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "strategy": "trend_pullback",
+            "entry_price": 100.0,
+            "signal_quality": 0.70,
+            "regime": "trending",
+            "metadata": {"pullback_score": 1.10, "structure_key": "same-zone"},
+        }
+        engine._register_setup_signature(prior_signal, current_index=10)
+        new_signal = {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "strategy": "trend_pullback",
+            "entry_price": 100.12,
+            "signal_quality": 0.72,
+            "regime": "trending",
+            "metadata": {"pullback_score": 1.14, "structure_key": "same-zone"},
+        }
+
+        reason = engine._fresh_setup_reason(new_signal, current_index=14)
+
+        self.assertEqual(reason, "fresh_setup_required")
+        realized_penalty = dict((new_signal.get("metadata", {}) or {}).get("realized_performance_penalty", {}) or {})
+        self.assertIn("fresh_setup_required", list(realized_penalty.get("reasons", []) or []))
+
+    def test_simulation_engine_fresh_setup_reason_allows_material_score_improvement(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                simulation_repeat_setup_suppression_bars=12,
+                simulation_fresh_setup_min_entry_shift_bps=35.0,
+                simulation_fresh_setup_min_score_improvement=0.20,
+                simulation_fresh_setup_block_quality_floor=0.55,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        prior_signal = {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "strategy": "trend_breakout",
+            "entry_price": 100.0,
+            "signal_quality": 0.70,
+            "regime": "trending",
+            "metadata": {"breakout_score": 1.05, "structure_key": "old-break"},
+        }
+        engine._register_setup_signature(prior_signal, current_index=10)
+        improved_signal = {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "strategy": "trend_breakout",
+            "entry_price": 100.10,
+            "signal_quality": 0.76,
+            "regime": "trending",
+            "metadata": {"breakout_score": 1.35, "structure_key": "old-break"},
+        }
+
+        reason = engine._fresh_setup_reason(improved_signal, current_index=14)
+
+        self.assertIsNone(reason)
 
     def test_simulation_engine_reentry_cooldown_blocks_mean_reversion_after_reclaim_fail(self):
         engine = HistoricalSimulationEngine(
@@ -2910,6 +4367,66 @@ class TradeBotCoreTests(unittest.TestCase):
 
         self.assertAlmostEqual(breakout_position.stop_loss, 101.6)
         self.assertAlmostEqual(pullback_position.stop_loss, 101.2)
+
+    def test_simulation_engine_regime_profiles_adjust_trailing_params(self):
+        engine = BacktestEngine(BotConfig(trailing_pullback_rr=1.0, trailing_pullback_atr_mult=1.0))
+        trend_position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+            metadata={"partial_profit_taken": True, "signal_snapshot": {"metadata": {"regime_state": "trend_supportive"}}},
+        )
+        risk_position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+            metadata={"signal_snapshot": {"metadata": {"regime_state": "risk_off"}}},
+        )
+
+        trend_rr, trend_atr = engine._family_trailing_params(trend_position)
+        risk_rr, risk_atr = engine._family_trailing_params(risk_position)
+
+        self.assertAlmostEqual(trend_rr, 1.10)
+        self.assertAlmostEqual(trend_atr, 1.15)
+        self.assertAlmostEqual(risk_rr, 0.70)
+        self.assertAlmostEqual(risk_atr, 0.65)
+
+    def test_simulation_engine_risk_off_thesis_failure_uses_faster_floor(self):
+        engine = BacktestEngine(BotConfig(pullback_thesis_fail_close_rr=-0.30))
+        position = Position(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            stop_loss=98.0,
+            take_profit=110.0,
+            strategy="trend_pullback",
+            initial_stop_loss=98.0,
+            metadata={
+                "mfe_r": 0.01,
+                "signal_snapshot": {
+                    "metadata": {
+                        "regime_state": "risk_off",
+                        "trend_persistence": 0.10,
+                    }
+                },
+            },
+        )
+
+        reason, price = engine._thesis_failure_exit(position, 99.86)
+
+        self.assertEqual(reason, "PULLBACK_THESIS_FAIL")
+        self.assertAlmostEqual(price, 99.86)
 
     def test_simulation_engine_writes_checkpoint_and_resumes(self):
         index = pd.date_range("2025-01-01", periods=140, freq="15min")
@@ -3334,6 +4851,81 @@ class TradeBotCoreTests(unittest.TestCase):
             "ensemble": {},
         }
         self.assertTrue(engine._passes_reliability_checks("BTC/USDT", signal, regime, proposal_count=1))
+
+    def test_signal_engine_state_gate_blocks_breakout_in_non_trending_regime(self):
+        engine = SignalEngine(BotConfig(), DummyExchange())
+        rejection = engine._strategy_state_gate_reason(
+            "trend_breakout",
+            "choppy",
+            {
+                "trend_persistence": 0.80,
+                "liquidity_score": 0.90,
+                "directional_efficiency": 0.50,
+                "momentum_crash_risk": 0.10,
+                "breakout_score": 1.40,
+            },
+        )
+        self.assertEqual(rejection, "state_gate_breakout_regime")
+
+    def test_signal_engine_state_gate_allows_strong_breakout_in_trending_regime(self):
+        engine = SignalEngine(BotConfig(), DummyExchange())
+        rejection = engine._strategy_state_gate_reason(
+            "trend_breakout",
+            "trending",
+            {
+                "trend_persistence": 0.80,
+                "liquidity_score": 0.90,
+                "directional_efficiency": 0.50,
+                "momentum_crash_risk": 0.10,
+                "breakout_score": 1.50,
+            },
+        )
+        self.assertIsNone(rejection)
+
+    def test_signal_engine_state_gate_allows_constructive_spot_core_pullback_regime(self):
+        engine = SignalEngine(BotConfig(trading_mode="spot"), DummyExchange())
+        rejection = engine._strategy_state_gate_reason(
+            "trend_pullback",
+            "choppy",
+            {
+                "side": "long",
+                "constructive_spot_core_regime": True,
+                "trend_persistence": 0.56,
+                "liquidity_score": 0.90,
+                "pullback_score": 1.52,
+                "realized_vol_percentile": 0.50,
+            },
+        )
+        self.assertIsNone(rejection)
+
+    def test_signal_engine_state_gate_still_blocks_weak_non_constructive_pullback_regime(self):
+        engine = SignalEngine(BotConfig(trading_mode="spot"), DummyExchange())
+        rejection = engine._strategy_state_gate_reason(
+            "trend_pullback",
+            "choppy",
+            {
+                "side": "long",
+                "constructive_spot_core_regime": False,
+                "trend_persistence": 0.30,
+                "liquidity_score": 0.90,
+                "pullback_score": 1.10,
+                "realized_vol_percentile": 0.50,
+            },
+        )
+        self.assertEqual(rejection, "state_gate_pullback_regime")
+
+    def test_signal_engine_state_gate_blocks_mean_reversion_when_efficiency_is_too_high(self):
+        engine = SignalEngine(BotConfig(), DummyExchange())
+        rejection = engine._strategy_state_gate_reason(
+            "mean_reversion",
+            "mean_reverting",
+            {
+                "liquidity_score": 0.90,
+                "directional_efficiency": 0.45,
+                "mean_reversion_score": 1.40,
+            },
+        )
+        self.assertEqual(rejection, "state_gate_mean_reversion_efficiency")
 
     def test_candidate_rank_score_penalizes_directional_family_cluster_crowding(self):
         timestamps = pd.date_range("2025-01-01", periods=130, freq="15min")
@@ -4038,6 +5630,62 @@ class TradeBotCoreTests(unittest.TestCase):
         self.assertTrue(snapshot["SOL/USDT"]["probation_veto_active"])
         self.assertEqual(snapshot["SOL/USDT"]["realized_expectancy"], -25.0)
 
+    def test_frequency_expansion_gate_waits_for_exit_repair_evidence(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(frequency_expansion_min_closed_trades=3),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        engine._campaign_timeline_start = dt.datetime(2026, 1, 1)
+        engine._now = dt.datetime(2026, 1, 3)
+        engine.trades = [
+            {"symbol": "BTC/USDT", "strategy": "trend_pullback", "pl": 1.0, "exit_reason": "TP"},
+            {"symbol": "BTC/USDT", "strategy": "trend_pullback", "pl": -0.5, "exit_reason": "PROFIT_PROTECT_STOP"},
+        ]
+
+        gate = engine._frequency_expansion_gate()
+
+        self.assertFalse(gate["allowed"])
+        self.assertEqual(gate["reason"], "not_enough_closed_trades")
+
+    def test_frequency_expansion_gate_allows_after_positive_exit_repair(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(frequency_expansion_min_closed_trades=3),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        engine._campaign_timeline_start = dt.datetime(2026, 1, 1)
+        engine._now = dt.datetime(2026, 1, 3)
+        engine.trades = [
+            {"symbol": "BTC/USDT", "strategy": "trend_pullback", "pl": 1.0, "exit_reason": "TP"},
+            {"symbol": "BTC/USDT", "strategy": "trend_pullback", "pl": 1.0, "exit_reason": "TP"},
+            {"symbol": "BTC/USDT", "strategy": "trend_pullback", "pl": -0.5, "exit_reason": "PROFIT_PROTECT_STOP"},
+        ]
+        engine._closed_by_symbol["BTC/USDT"] = 3
+        engine._closed_by_strategy["trend_pullback"] = 3
+        engine._wins_by_strategy["trend_pullback"] = 2
+        engine._losses_by_strategy["trend_pullback"] = 1
+
+        gate = engine._frequency_expansion_gate()
+
+        self.assertTrue(gate["allowed"])
+        self.assertEqual(gate["reason"], "exit_repair_confirmed")
+        self.assertGreater(gate["best_strategy_expectancy"], 0.0)
+
+    def test_ensemble_frequency_relax_waits_when_expansion_gate_is_blocked(self):
+        adjustment = EnsembleAllocator._frequency_adjustment(
+            "trend_pullback",
+            {
+                "status": "far_below_target",
+                "expansion_allowed": False,
+                "dominant_strategy": None,
+                "strategy_trade_share": {},
+            },
+        )
+
+        self.assertEqual(adjustment["reason"], "frequency_expansion_waiting_for_exit_repair")
+        self.assertGreaterEqual(adjustment["min_net_expectancy_delta"], 0.0)
+
     def test_simulation_can_disable_trend_pullback_explicitly(self):
         engine = HistoricalSimulationEngine(
             BotConfig(
@@ -4082,6 +5730,195 @@ class TradeBotCoreTests(unittest.TestCase):
             }
         )
         self.assertEqual(reason, "pullback_strategy_probation_veto")
+
+    def test_strategy_symbol_probation_veto_blocks_pullback_only_for_losing_symbol_family_pair(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                starting_balance=1000.0,
+                trading_mode="futures",
+                simulation_strategy_symbol_veto_min_trades=2,
+                simulation_pullback_symbol_veto_expectancy_floor=-15.0,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        engine.trades = [
+            {"symbol": "DOT/USDT", "strategy": "trend_pullback", "pl": -18.0},
+            {"symbol": "DOT/USDT", "strategy": "trend_pullback", "pl": -22.0},
+            {"symbol": "DOT/USDT", "strategy": "trend_breakout", "pl": 8.0},
+        ]
+
+        pullback_reason = engine._strategy_symbol_eligibility_reason(
+            {
+                "symbol": "DOT/USDT",
+                "strategy": "trend_pullback",
+                "side": "long",
+                "metadata": {"liquidity_score": 0.90},
+            }
+        )
+        breakout_reason = engine._strategy_symbol_eligibility_reason(
+            {
+                "symbol": "DOT/USDT",
+                "strategy": "trend_breakout",
+                "side": "long",
+                "metadata": {"liquidity_score": 0.90},
+            }
+        )
+
+        self.assertEqual(pullback_reason, "pullback_symbol_probation_veto")
+        self.assertIsNone(breakout_reason)
+
+    def test_spot_high_beta_long_requires_trend_supportive_universe_state(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                starting_balance=1000.0,
+                trading_mode="spot",
+                simulation_spot_high_beta_requires_trend_supportive=True,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        engine._current_universe_regime_state = mock.Mock(return_value={"state": "neutral"})
+
+        reason = engine._strategy_symbol_eligibility_reason(
+            {
+                "symbol": "AVAX/USDT",
+                "strategy": "trend_pullback",
+                "side": "long",
+                "metadata": {"liquidity_score": 0.95},
+            }
+        )
+
+        self.assertEqual(reason, "spot_high_beta_requires_trend_supportive")
+
+    def test_spot_high_beta_pullback_requires_stronger_persistence(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                starting_balance=1000.0,
+                trading_mode="spot",
+                simulation_spot_high_beta_pullback_min_trend_persistence=0.50,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        engine._current_universe_regime_state = mock.Mock(return_value={"state": "trend_supportive"})
+
+        reason = engine._strategy_symbol_eligibility_reason(
+            {
+                "symbol": "AVAX/USDT",
+                "strategy": "trend_pullback",
+                "side": "long",
+                "signal_quality": 0.78,
+                "expected_edge_bps": 42.0,
+                "metadata": {
+                    "liquidity_score": 0.95,
+                    "pullback_score": 2.10,
+                    "trend_persistence": 0.42,
+                },
+            }
+        )
+
+        self.assertEqual(reason, "spot_high_beta_pullback_persistence_gate")
+
+    def test_spot_high_beta_pullback_quality_escape_allows_strong_local_structure(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                starting_balance=1000.0,
+                trading_mode="spot",
+                simulation_spot_high_beta_pullback_min_score=1.55,
+                simulation_spot_high_beta_pullback_min_trend_persistence=0.50,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        engine._current_universe_regime_state = mock.Mock(return_value={"state": "trend_supportive"})
+
+        reason = engine._strategy_symbol_eligibility_reason(
+            {
+                "symbol": "AVAX/USDT",
+                "strategy": "trend_pullback",
+                "side": "long",
+                "signal_quality": 0.78,
+                "expected_edge_bps": 42.0,
+                "metadata": {
+                    "liquidity_score": 0.95,
+                    "pullback_score": 1.40,
+                    "trend_persistence": 0.42,
+                    "realized_vol_percentile": 0.58,
+                    "stretch_from_mean": 0.012,
+                    "partial_htf_used": True,
+                    "strategy_variant": "spot_core_local_structure_pullback",
+                },
+            }
+        )
+
+        self.assertIsNone(reason)
+
+    def test_spot_high_beta_pullback_quality_escape_allows_full_htf_alignment(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                starting_balance=1000.0,
+                trading_mode="spot",
+                simulation_spot_high_beta_pullback_min_score=1.55,
+                simulation_spot_high_beta_pullback_min_trend_persistence=0.50,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        engine._current_universe_regime_state = mock.Mock(return_value={"state": "trend_supportive"})
+
+        reason = engine._strategy_symbol_eligibility_reason(
+            {
+                "symbol": "AVAX/USDT",
+                "strategy": "trend_pullback",
+                "side": "long",
+                "signal_quality": 0.79,
+                "expected_edge_bps": 59.0,
+                "metadata": {
+                    "liquidity_score": 1.40,
+                    "pullback_score": 2.14,
+                    "trend_persistence": 0.416,
+                    "realized_vol_percentile": 0.45,
+                    "stretch_from_mean": 0.010,
+                    "htf_4h_bullish": True,
+                    "htf_1h_uptrend": True,
+                    "strategy_variant": "shallow_pullback",
+                },
+            }
+        )
+
+        self.assertIsNone(reason)
+
+    def test_realized_performance_penalty_adds_strategy_symbol_negative_expectancy_reason(self):
+        engine = HistoricalSimulationEngine(
+            BotConfig(
+                starting_balance=1000.0,
+                trading_mode="futures",
+                simulation_strategy_symbol_veto_min_trades=2,
+                simulation_pullback_symbol_veto_expectancy_floor=-15.0,
+                simulation_strategy_symbol_penalty_score=4.5,
+            ),
+            signal_engine_cls=QuietSignalEngine,
+        )
+        engine._reset_run_state()
+        engine.trades = [
+            {"symbol": "DOT/USDT", "strategy": "trend_pullback", "pl": -18.0},
+            {"symbol": "DOT/USDT", "strategy": "trend_pullback", "pl": -22.0},
+        ]
+        engine._closed_by_symbol["DOT/USDT"] = 2
+        engine._closed_by_strategy["trend_pullback"] = 2
+
+        details = engine._realized_performance_penalty_details(
+            {
+                "symbol": "DOT/USDT",
+                "strategy": "trend_pullback",
+                "side": "long",
+                "metadata": {},
+            }
+        )
+
+        self.assertIn("strategy_symbol_negative_expectancy", list(details.get("reasons", []) or []))
+        self.assertGreaterEqual(float(details.get("score_penalty", 0.0) or 0.0), 4.5)
 
     def test_portfolio_no_trade_region_can_relax_for_positive_missed_opportunity_learning(self):
         timestamps = pd.date_range("2025-01-01", periods=130, freq="15min")
@@ -4262,6 +6099,17 @@ class TradeBotCoreTests(unittest.TestCase):
                     self.last_generation_diagnostics[symbol] = {
                         "outcome": "no_proposal",
                         "reason": "strategy_produced_no_proposal",
+                        "strategy_rejection_reasons": {
+                            "trend_pullback": "bullish_pullback_shape_not_qualified",
+                        },
+                        "near_miss_candidates": [
+                            {
+                                "symbol": symbol,
+                                "strategy": "trend_pullback",
+                                "rejection_reason": "bullish_pullback_shape_not_qualified",
+                                "regime": "trending",
+                            }
+                        ],
                     }
                     return None
                 if symbol == "SOL/USDT":
@@ -4274,6 +6122,18 @@ class TradeBotCoreTests(unittest.TestCase):
                     self.last_generation_diagnostics[symbol] = {
                         "outcome": "reliability_rejected",
                         "reason": "signal_quality_below_threshold",
+                        "replacement_candidates": [
+                            {
+                                "symbol": symbol,
+                                "strategy": "trend_pullback",
+                                "rejection_reason": "signal_quality_below_threshold",
+                                "raw_confidence": 0.51,
+                                "calibrated_confidence": 0.49,
+                                "expected_edge_bps": 12.0,
+                                "rr_ratio": 1.4,
+                                "regime": "trending",
+                            }
+                        ],
                     }
                     return None
                 self.last_generation_diagnostics[symbol] = {
@@ -4312,10 +6172,29 @@ class TradeBotCoreTests(unittest.TestCase):
         self.assertEqual(diagnostics["generation_outcomes_by_symbol"]["XRP/USDT"]["reliability_rejected"], 1)
         self.assertEqual(diagnostics["generation_outcomes_by_symbol"]["BTC/USDT"]["selected"], 1)
         self.assertEqual(diagnostics["generation_outcomes_by_symbol"]["ADA/USDT"]["selected"], 1)
+        self.assertEqual(diagnostics["replacement_candidates_seen"], 1)
+        self.assertEqual(diagnostics["replacement_candidates_by_strategy"]["trend_pullback"], 1)
+        self.assertEqual(diagnostics["replacement_candidates_by_symbol"]["XRP/USDT"], 1)
+        self.assertEqual(diagnostics["replacement_rejections_by_reason"]["signal_quality_below_threshold"], 1)
+        self.assertEqual(diagnostics["replacement_near_misses_seen"], 1)
+        self.assertEqual(diagnostics["replacement_near_misses_by_strategy"]["trend_pullback"], 1)
+        self.assertEqual(diagnostics["replacement_near_misses_by_symbol"]["ETH/USDT"], 1)
+        self.assertEqual(diagnostics["replacement_near_misses_by_reason"]["bullish_pullback_shape_not_qualified"], 1)
+        self.assertEqual(diagnostics["replacement_near_miss_examples"][0]["symbol"], "ETH/USDT")
+        self.assertEqual(diagnostics["replacement_near_miss_examples"][0]["strategy"], "trend_pullback")
 
         self.assertEqual(
             diagnostics["generation_reasons_by_symbol"]["ETH/USDT"]["strategy_produced_no_proposal"],
             1,
+        )
+        eth_primary = result["campaign_diagnostics"]["primary_summary"]["by_symbol"]["ETH/USDT"]
+        self.assertEqual(
+            eth_primary["strategy_rejection_reasons"]["trend_pullback"]["bullish_pullback_shape_not_qualified"],
+            1,
+        )
+        top_rejections = result["campaign_diagnostics"]["primary_summary"]["top_rejection_reasons"]
+        self.assertTrue(
+            any(item["key"] == "strategy:trend_pullback:bullish_pullback_shape_not_qualified" for item in top_rejections)
         )
         self.assertEqual(
             diagnostics["generation_reasons_by_symbol"]["SOL/USDT"]["no_ensemble_selection"],
@@ -4326,6 +6205,944 @@ class TradeBotCoreTests(unittest.TestCase):
             1,
         )
         self.assertEqual(diagnostics["skip_reasons_by_symbol"]["ADA/USDT"]["max_open_positions"], 1)
+
+    def test_signal_engine_finds_stronger_replacement_after_reliability_rejection(self):
+        engine = SignalEngine.__new__(SignalEngine)
+        engine.config = BotConfig(
+            replacement_min_confidence_delta=0.03,
+            replacement_min_edge_delta_bps=3.0,
+            replacement_min_rr_delta=0.05,
+            learning_calibration_gate_min_samples=999.0,
+        )
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.85,
+            volatility_ratio=0.01,
+            trend_strength=0.02,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={},
+        )
+
+        rejected_signal = Signal(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            stop_loss=99.0,
+            take_profit=101.6,
+            strategy="trend_pullback",
+            confidence=0.62,
+            timeframe="15m",
+            expected_holding_minutes=60,
+            expected_edge_bps=15.0,
+            metadata={"preferred_order_type": "limit"},
+        )
+        replacement_signal = Signal(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            stop_loss=99.0,
+            take_profit=102.1,
+            strategy="trend_breakout",
+            confidence=0.68,
+            timeframe="15m",
+            expected_holding_minutes=60,
+            expected_edge_bps=21.0,
+            metadata={"preferred_order_type": "limit"},
+        )
+
+        class Decision:
+            signal = rejected_signal
+            selected_strategy = "trend_pullback"
+            proposals = []
+            rejected_reasons = []
+            regime = {"regime": "trending", "confidence": 0.85}
+
+        rejected_payload = engine._signal_payload_from_model(
+            symbol="BTC/USDT",
+            signal=rejected_signal,
+            hurst=0.5,
+            research_context={},
+            decision=Decision,
+            regime=regime,
+        )
+
+        replacement = engine._find_replacement_signal_payload(
+            symbol="BTC/USDT",
+            rejected_payload=rejected_payload,
+            proposals=[
+                StrategyProposal(rejected_signal, rejected_signal.expected_edge_bps, "weak"),
+                StrategyProposal(replacement_signal, replacement_signal.expected_edge_bps, "strong"),
+            ],
+            regime=regime,
+            hurst=0.5,
+            research_context={},
+            decision=Decision,
+            rejection_reason="calibrated_confidence_too_low",
+        )
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement["strategy"], "trend_breakout")
+        replacement_meta = replacement["metadata"]["replacement_opportunity"]
+        self.assertTrue(replacement_meta["active"])
+        self.assertEqual(replacement_meta["replaced_strategy"], "trend_pullback")
+
+    def test_signal_engine_rejects_weak_replacement_after_reliability_rejection(self):
+        engine = SignalEngine.__new__(SignalEngine)
+        engine.config = BotConfig(
+            replacement_min_confidence_delta=0.03,
+            replacement_min_edge_delta_bps=3.0,
+            replacement_min_rr_delta=0.05,
+            learning_calibration_gate_min_samples=999.0,
+        )
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.85,
+            volatility_ratio=0.01,
+            trend_strength=0.02,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={},
+        )
+        rejected_signal = Signal(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            stop_loss=99.0,
+            take_profit=101.6,
+            strategy="trend_pullback",
+            confidence=0.62,
+            timeframe="15m",
+            expected_holding_minutes=60,
+            expected_edge_bps=15.0,
+            metadata={"preferred_order_type": "limit"},
+        )
+        weak_signal = Signal(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            stop_loss=99.0,
+            take_profit=101.7,
+            strategy="trend_breakout",
+            confidence=0.63,
+            timeframe="15m",
+            expected_holding_minutes=60,
+            expected_edge_bps=16.0,
+            metadata={"preferred_order_type": "limit"},
+        )
+
+        class Decision:
+            signal = rejected_signal
+            selected_strategy = "trend_pullback"
+            proposals = []
+            rejected_reasons = []
+            regime = {"regime": "trending", "confidence": 0.85}
+
+        rejected_payload = engine._signal_payload_from_model(
+            symbol="BTC/USDT",
+            signal=rejected_signal,
+            hurst=0.5,
+            research_context={},
+            decision=Decision,
+            regime=regime,
+        )
+
+        replacement = engine._find_replacement_signal_payload(
+            symbol="BTC/USDT",
+            rejected_payload=rejected_payload,
+            proposals=[
+                StrategyProposal(rejected_signal, rejected_signal.expected_edge_bps, "weak"),
+                StrategyProposal(weak_signal, weak_signal.expected_edge_bps, "not enough better"),
+            ],
+            regime=regime,
+            hurst=0.5,
+            research_context={},
+            decision=Decision,
+            rejection_reason="calibrated_confidence_too_low",
+        )
+
+        self.assertIsNone(replacement)
+
+    def test_signal_engine_selects_liquid_bullish_near_miss_replacement(self):
+        engine = SignalEngine.__new__(SignalEngine)
+        engine.config = BotConfig(
+            replacement_near_miss_enabled=True,
+            replacement_near_miss_min_regime_confidence=0.85,
+            replacement_near_miss_min_trend_persistence=0.39,
+            replacement_near_miss_min_volume_impulse=1.02,
+            replacement_near_miss_max_entry_zscore=0.30,
+            replacement_near_miss_max_volatility_percentile=0.72,
+            replacement_near_miss_min_liquidity_score=0.85,
+            replacement_near_miss_min_score=1.58,
+            replacement_near_miss_min_rank_score=2.55,
+        )
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.93,
+            volatility_ratio=0.012,
+            trend_strength=0.03,
+            liquidity_score=0.95,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "pullback_score": 2.22,
+                "trend_persistence": 0.41,
+                "volume_impulse": 1.07,
+                "entry_zscore": 0.27,
+                "realized_vol_percentile": 0.62,
+            },
+        )
+
+        class StubPullback:
+            name = "trend_pullback"
+
+            def __init__(self, config, exch, helpers):
+                self.config = config
+                self.exch = exch
+                self.helpers = helpers
+                self.last_rejection_reason = "bullish_confirmation_missing"
+
+            def evaluate(self, symbol, regime):
+                if self.config.pullback_confirmation_near_miss_min_trend_persistence > 0.39:
+                    self.last_rejection_reason = "bullish_confirmation_missing"
+                    return None
+                signal = Signal(
+                    symbol=symbol,
+                    side="long",
+                    entry_price=100.0,
+                    stop_loss=99.0,
+                    take_profit=101.8,
+                    strategy="trend_pullback",
+                    confidence=0.68,
+                    timeframe="15m",
+                    expected_holding_minutes=60,
+                    expected_edge_bps=18.0,
+                    metadata={"symbol_bucket": "majors", "preferred_order_type": "limit"},
+                )
+                return StrategyProposal(signal, signal.expected_edge_bps, "near miss recovered")
+
+        engine.strategy_modules = [StubPullback(engine.config, object(), object())]
+        engine._reliability_rejection_reason = lambda symbol, signal, regime, proposal_count: None
+
+        payload = engine._find_near_miss_replacement_signal_payload(
+            symbol="BTC/USDT",
+            strategy_rejection_reasons={"trend_pullback": "bullish_confirmation_missing"},
+            regime=regime,
+            hurst=0.5,
+            research_context={},
+        )
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["strategy"], "trend_pullback")
+        self.assertTrue(payload["metadata"]["replacement_opportunity"]["active"])
+        self.assertEqual(payload["metadata"]["replacement_opportunity"]["type"], "near_miss_pullback")
+        self.assertGreaterEqual(float(payload["metadata"]["replacement_opportunity"]["rank_score"]), 2.55)
+
+    def test_signal_engine_blocks_slower_large_cap_near_miss_replacement(self):
+        engine = SignalEngine.__new__(SignalEngine)
+        engine.config = BotConfig(replacement_near_miss_enabled=True)
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.93,
+            volatility_ratio=0.012,
+            trend_strength=0.03,
+            liquidity_score=0.95,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "pullback_score": 2.22,
+                "trend_persistence": 0.41,
+                "volume_impulse": 1.07,
+                "entry_zscore": 0.27,
+                "realized_vol_percentile": 0.62,
+            },
+        )
+        engine.strategy_modules = []
+
+        payload = engine._find_near_miss_replacement_signal_payload(
+            symbol="ADA/USDT",
+            strategy_rejection_reasons={"trend_pullback": "bullish_confirmation_missing"},
+            regime=regime,
+            hurst=0.5,
+            research_context={},
+        )
+
+        self.assertIsNone(payload)
+
+    def test_replacement_near_miss_rank_prefers_majors_over_high_beta(self):
+        engine = SignalEngine.__new__(SignalEngine)
+        engine.config = BotConfig()
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.91,
+            volatility_ratio=0.012,
+            trend_strength=0.03,
+            liquidity_score=0.93,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "pullback_score": 2.18,
+                "trend_persistence": 0.41,
+                "volume_impulse": 1.06,
+                "entry_zscore": 0.24,
+                "realized_vol_percentile": 0.60,
+            },
+        )
+
+        btc_score = engine._replacement_near_miss_rank_score(symbol="BTC/USDT", regime=regime)
+        sol_score = engine._replacement_near_miss_rank_score(symbol="SOL/USDT", regime=regime)
+
+        self.assertGreater(btc_score, sol_score)
+
+    def test_signal_engine_blocks_low_rank_near_miss_replacement(self):
+        engine = SignalEngine.__new__(SignalEngine)
+        engine.config = BotConfig(
+            replacement_near_miss_enabled=True,
+            replacement_near_miss_min_rank_score=2.55,
+        )
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.86,
+            volatility_ratio=0.012,
+            trend_strength=0.03,
+            liquidity_score=0.86,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "pullback_score": 1.58,
+                "trend_persistence": 0.39,
+                "volume_impulse": 1.02,
+                "entry_zscore": 0.30,
+                "realized_vol_percentile": 0.72,
+            },
+        )
+        engine.strategy_modules = []
+
+        payload = engine._find_near_miss_replacement_signal_payload(
+            symbol="XRP/USDT",
+            strategy_rejection_reasons={"trend_pullback": "bullish_confirmation_missing"},
+            regime=regime,
+            hurst=0.5,
+            research_context={},
+        )
+
+        self.assertIsNone(payload)
+
+    def test_signal_engine_blocks_near_miss_replacement_on_negative_opportunity_history(self):
+        engine = SignalEngine.__new__(SignalEngine)
+        engine.config = BotConfig(
+            replacement_near_miss_enabled=True,
+            replacement_profitability_filter_enabled=True,
+            replacement_profitability_min_opportunity_samples=6.0,
+            replacement_profitability_min_avg_forward_r=-0.05,
+            replacement_profitability_min_positive_ratio=0.48,
+            replacement_near_miss_min_rank_score=2.55,
+        )
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.93,
+            volatility_ratio=0.012,
+            trend_strength=0.03,
+            liquidity_score=0.95,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "pullback_score": 2.22,
+                "trend_persistence": 0.41,
+                "volume_impulse": 1.07,
+                "entry_zscore": 0.27,
+                "realized_vol_percentile": 0.62,
+            },
+        )
+
+        class StubPullback:
+            name = "trend_pullback"
+
+            def __init__(self, config, exch, helpers):
+                self.config = config
+                self.exch = exch
+                self.helpers = helpers
+                self.last_rejection_reason = "bullish_confirmation_missing"
+
+            def evaluate(self, symbol, regime):
+                signal = Signal(
+                    symbol=symbol,
+                    side="long",
+                    entry_price=100.0,
+                    stop_loss=99.0,
+                    take_profit=101.8,
+                    strategy="trend_pullback",
+                    confidence=0.68,
+                    timeframe="15m",
+                    expected_holding_minutes=60,
+                    expected_edge_bps=18.0,
+                    metadata={
+                        "symbol_bucket": "majors",
+                        "preferred_order_type": "limit",
+                        "learning_context": {
+                            "opportunity": {
+                                "samples": 8.0,
+                                "avg_forward_r": -0.12,
+                                "positive_ratio": 0.40,
+                            }
+                        },
+                    },
+                )
+                return StrategyProposal(signal, signal.expected_edge_bps, "near miss recovered")
+
+        engine.strategy_modules = [StubPullback(engine.config, object(), object())]
+        engine._reliability_rejection_reason = lambda symbol, signal, regime, proposal_count: None
+
+        payload = engine._find_near_miss_replacement_signal_payload(
+            symbol="BTC/USDT",
+            strategy_rejection_reasons={"trend_pullback": "bullish_confirmation_missing"},
+            regime=regime,
+            hurst=0.5,
+            research_context={},
+        )
+
+        self.assertIsNone(payload)
+
+    def test_signal_engine_allows_near_miss_replacement_with_acceptable_opportunity_history(self):
+        engine = SignalEngine.__new__(SignalEngine)
+        engine.config = BotConfig(
+            replacement_near_miss_enabled=True,
+            replacement_profitability_filter_enabled=True,
+            replacement_profitability_min_opportunity_samples=6.0,
+            replacement_profitability_min_avg_forward_r=-0.05,
+            replacement_profitability_min_positive_ratio=0.48,
+            replacement_near_miss_min_rank_score=2.55,
+        )
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.93,
+            volatility_ratio=0.012,
+            trend_strength=0.03,
+            liquidity_score=0.95,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "pullback_score": 2.22,
+                "trend_persistence": 0.41,
+                "volume_impulse": 1.07,
+                "entry_zscore": 0.27,
+                "realized_vol_percentile": 0.62,
+            },
+        )
+
+        class StubPullback:
+            name = "trend_pullback"
+
+            def __init__(self, config, exch, helpers):
+                self.config = config
+                self.exch = exch
+                self.helpers = helpers
+                self.last_rejection_reason = "bullish_confirmation_missing"
+
+            def evaluate(self, symbol, regime):
+                signal = Signal(
+                    symbol=symbol,
+                    side="long",
+                    entry_price=100.0,
+                    stop_loss=99.0,
+                    take_profit=101.8,
+                    strategy="trend_pullback",
+                    confidence=0.68,
+                    timeframe="15m",
+                    expected_holding_minutes=60,
+                    expected_edge_bps=18.0,
+                    metadata={
+                        "symbol_bucket": "majors",
+                        "preferred_order_type": "limit",
+                        "learning_context": {
+                            "opportunity": {
+                                "samples": 8.0,
+                                "avg_forward_r": 0.02,
+                                "positive_ratio": 0.56,
+                            }
+                        },
+                    },
+                )
+                return StrategyProposal(signal, signal.expected_edge_bps, "near miss recovered")
+
+        engine.strategy_modules = [StubPullback(engine.config, object(), object())]
+        engine._reliability_rejection_reason = lambda symbol, signal, regime, proposal_count: None
+
+        payload = engine._find_near_miss_replacement_signal_payload(
+            symbol="BTC/USDT",
+            strategy_rejection_reasons={"trend_pullback": "bullish_confirmation_missing"},
+            regime=regime,
+            hurst=0.5,
+            research_context={},
+        )
+
+        self.assertIsNotNone(payload)
+
+    def test_signal_engine_selects_second_best_candidate_when_close_and_safer(self):
+        engine = SignalEngine.__new__(SignalEngine)
+        engine.config = BotConfig(
+            second_best_candidate_enabled=True,
+            second_best_candidate_max_score_gap=6.0,
+            second_best_candidate_min_rr_improvement=0.10,
+            second_best_candidate_min_confidence=0.60,
+            second_best_candidate_min_edge_bps=12.0,
+        )
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.88,
+            volatility_ratio=0.01,
+            trend_strength=0.02,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={},
+        )
+        top_signal = Signal(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            stop_loss=99.1,
+            take_profit=101.35,
+            strategy="trend_breakout",
+            confidence=0.63,
+            timeframe="15m",
+            expected_holding_minutes=60,
+            expected_edge_bps=15.0,
+            metadata={"preferred_order_type": "limit"},
+        )
+        second_signal = Signal(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            stop_loss=99.0,
+            take_profit=101.8,
+            strategy="trend_pullback",
+            confidence=0.64,
+            timeframe="15m",
+            expected_holding_minutes=60,
+            expected_edge_bps=16.0,
+            metadata={"preferred_order_type": "limit"},
+        )
+
+        class Decision:
+            signal = None
+            selected_strategy = None
+            rejected_reasons = ["trend_breakout:negative_net_expectancy", "trend_pullback:negative_net_expectancy"]
+            proposals = [
+                {"strategy": "trend_breakout", "ensemble_score": 43.0, "rr_ratio": 1.5, "confidence": 0.63, "expected_edge_bps": 15.0},
+                {"strategy": "trend_pullback", "ensemble_score": 39.5, "rr_ratio": 1.8, "confidence": 0.64, "expected_edge_bps": 16.0},
+            ]
+            regime = {"regime": "trending", "confidence": 0.88}
+
+        engine._reliability_rejection_reason = lambda symbol, signal, regime, proposal_count: None
+        payload = engine._find_second_best_candidate_payload(
+            symbol="BTC/USDT",
+            proposals=[
+                StrategyProposal(top_signal, top_signal.expected_edge_bps, "top"),
+                StrategyProposal(second_signal, second_signal.expected_edge_bps, "second"),
+            ],
+            regime=regime,
+            hurst=0.5,
+            research_context={},
+            decision=Decision,
+        )
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["strategy"], "trend_pullback")
+        self.assertEqual(payload["metadata"]["replacement_opportunity"]["type"], "second_best_candidate")
+
+    def test_signal_engine_blocks_second_best_candidate_when_gap_too_large(self):
+        engine = SignalEngine.__new__(SignalEngine)
+        engine.config = BotConfig(second_best_candidate_enabled=True, second_best_candidate_max_score_gap=3.0)
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.88,
+            volatility_ratio=0.01,
+            trend_strength=0.02,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={},
+        )
+        top_signal = Signal(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            stop_loss=99.1,
+            take_profit=101.35,
+            strategy="trend_breakout",
+            confidence=0.63,
+            timeframe="15m",
+            expected_holding_minutes=60,
+            expected_edge_bps=15.0,
+            metadata={"preferred_order_type": "limit"},
+        )
+        second_signal = Signal(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            stop_loss=99.0,
+            take_profit=101.8,
+            strategy="trend_pullback",
+            confidence=0.64,
+            timeframe="15m",
+            expected_holding_minutes=60,
+            expected_edge_bps=16.0,
+            metadata={"preferred_order_type": "limit"},
+        )
+
+        class Decision:
+            signal = None
+            selected_strategy = None
+            rejected_reasons = []
+            proposals = [
+                {"strategy": "trend_breakout", "ensemble_score": 43.0, "rr_ratio": 1.5, "confidence": 0.63, "expected_edge_bps": 15.0},
+                {"strategy": "trend_pullback", "ensemble_score": 38.0, "rr_ratio": 1.8, "confidence": 0.64, "expected_edge_bps": 16.0},
+            ]
+            regime = {"regime": "trending", "confidence": 0.88}
+
+        engine._reliability_rejection_reason = lambda symbol, signal, regime, proposal_count: None
+        payload = engine._find_second_best_candidate_payload(
+            symbol="BTC/USDT",
+            proposals=[
+                StrategyProposal(top_signal, top_signal.expected_edge_bps, "top"),
+                StrategyProposal(second_signal, second_signal.expected_edge_bps, "second"),
+            ],
+            regime=regime,
+            hurst=0.5,
+            research_context={},
+            decision=Decision,
+        )
+
+        self.assertIsNone(payload)
+
+    def test_signal_engine_selects_strong_single_candidate_escape(self):
+        engine = SignalEngine.__new__(SignalEngine)
+        engine.config = BotConfig(
+            single_candidate_escape_enabled=True,
+            single_candidate_escape_min_confidence=0.63,
+            single_candidate_escape_min_edge_bps=15.0,
+            single_candidate_escape_min_rr=1.45,
+            single_candidate_escape_min_net_expectancy_bps=2.0,
+        )
+        regime = RegimeAssessment(
+            regime="choppy",
+            confidence=0.74,
+            volatility_ratio=0.01,
+            trend_strength=0.02,
+            liquidity_score=0.92,
+            event_risk=False,
+            unstable=False,
+            metadata={"momentum_crash_risk": 0.30},
+        )
+        signal = Signal(
+            symbol="BTC/USDT",
+            side="long",
+            entry_price=100.0,
+            stop_loss=99.0,
+            take_profit=101.7,
+            strategy="trend_pullback",
+            confidence=0.66,
+            timeframe="15m",
+            expected_holding_minutes=60,
+            expected_edge_bps=18.0,
+            metadata={
+                "candidate_flow_rescue": {"active": True},
+                "profile_preference": "candidate_flow_rescue",
+                "preferred_order_type": "limit",
+            },
+        )
+
+        class Decision:
+            signal = None
+            selected_strategy = None
+            rejected_reasons = ["trend_pullback:negative_net_expectancy"]
+            proposals = [
+                {
+                    "strategy": "trend_pullback",
+                    "ensemble_score": 38.0,
+                    "net_expectancy_bps": 2.4,
+                    "rr_ratio": 1.7,
+                    "confidence": 0.66,
+                    "expected_edge_bps": 18.0,
+                    "momentum_crash_risk": 0.30,
+                }
+            ]
+            regime = {"regime": "choppy", "confidence": 0.74}
+
+        engine._reliability_rejection_reason = lambda symbol, signal, regime, proposal_count: None
+        payload = engine._find_single_candidate_escape_payload(
+            symbol="BTC/USDT",
+            proposals=[StrategyProposal(signal, signal.expected_edge_bps, "only candidate")],
+            regime=regime,
+            hurst=0.5,
+            research_context={},
+            decision=Decision,
+        )
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["metadata"]["replacement_opportunity"]["type"], "single_candidate_escape")
+        self.assertTrue(payload["metadata"]["single_candidate_escape"]["active"])
+
+    def test_signal_engine_blocks_single_candidate_escape_outside_liquid_core(self):
+        engine = SignalEngine.__new__(SignalEngine)
+        engine.config = BotConfig(single_candidate_escape_enabled=True)
+        regime = RegimeAssessment(
+            regime="choppy",
+            confidence=0.74,
+            volatility_ratio=0.01,
+            trend_strength=0.02,
+            liquidity_score=0.92,
+            event_risk=False,
+            unstable=False,
+            metadata={"momentum_crash_risk": 0.30},
+        )
+        signal = Signal(
+            symbol="ADA/USDT",
+            side="long",
+            entry_price=100.0,
+            stop_loss=99.0,
+            take_profit=101.7,
+            strategy="trend_pullback",
+            confidence=0.66,
+            timeframe="15m",
+            expected_holding_minutes=60,
+            expected_edge_bps=18.0,
+            metadata={"preferred_order_type": "limit"},
+        )
+
+        class Decision:
+            signal = None
+            selected_strategy = None
+            rejected_reasons = ["trend_pullback:negative_net_expectancy"]
+            proposals = [
+                {
+                    "strategy": "trend_pullback",
+                    "ensemble_score": 38.0,
+                    "net_expectancy_bps": 2.4,
+                    "rr_ratio": 1.7,
+                    "confidence": 0.66,
+                    "expected_edge_bps": 18.0,
+                    "momentum_crash_risk": 0.30,
+                }
+            ]
+            regime = {"regime": "choppy", "confidence": 0.74}
+
+        engine._reliability_rejection_reason = lambda symbol, signal, regime, proposal_count: None
+        payload = engine._find_single_candidate_escape_payload(
+            symbol="ADA/USDT",
+            proposals=[StrategyProposal(signal, signal.expected_edge_bps, "only candidate")],
+            regime=regime,
+            hurst=0.5,
+            research_context={},
+            decision=Decision,
+        )
+
+        self.assertIsNone(payload)
+
+    def test_signal_engine_compacts_top_ensemble_proposals(self):
+        compact = SignalEngine._compact_ensemble_proposals(
+            [
+                {"strategy": "trend_pullback", "ensemble_score": 39.5, "net_expectancy_bps": 8.0, "rr_ratio": 1.8, "confidence": 0.64, "expected_edge_bps": 16.0, "frequency_reason": "neutral"},
+                {"strategy": "trend_breakout", "ensemble_score": 43.0, "net_expectancy_bps": 9.0, "rr_ratio": 1.5, "confidence": 0.63, "expected_edge_bps": 15.0, "frequency_reason": "inactive"},
+                {"strategy": "mean_reversion", "ensemble_score": 31.0, "net_expectancy_bps": 6.0, "rr_ratio": 1.2, "confidence": 0.61, "expected_edge_bps": 13.0, "frequency_reason": "soft_below_target_mean_reversion_relax"},
+                {"strategy": "extra", "ensemble_score": 12.0, "net_expectancy_bps": 1.0, "rr_ratio": 1.0, "confidence": 0.50, "expected_edge_bps": 8.0, "frequency_reason": "inactive"},
+            ],
+            limit=3,
+        )
+
+        self.assertEqual(len(compact), 3)
+        self.assertEqual(compact[0]["strategy"], "trend_breakout")
+        self.assertEqual(compact[1]["strategy"], "trend_pullback")
+        self.assertEqual(compact[2]["strategy"], "mean_reversion")
+        self.assertEqual(compact[2]["frequency_reason"], "soft_below_target_mean_reversion_relax")
+
+    def test_simulation_campaign_marks_cross_symbol_replacement_candidate(self):
+        timestamps = pd.date_range("2025-01-01", periods=21, freq="15min")
+        df = pd.DataFrame(
+            [
+                {
+                    "timestamp": ts,
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.0,
+                    "volume": 1000.0,
+                }
+                for ts in timestamps
+            ]
+        ).set_index("timestamp")
+
+        class LocalSimulationEngine(HistoricalSimulationEngine):
+            def load_historical_data(self, symbol, timeframe, days=180):
+                return df.copy()
+
+        class ReplacementSignals:
+            def __init__(self, config, exch):
+                self.exch = exch
+                self.learning_context_provider = None
+                self.last_generation_diagnostics = {}
+                self._fired = set()
+
+            def generate_signal(self, symbol):
+                candles = self.exch.fetch_ohlcv(symbol, "15m", limit=200)
+                if len(candles) != 21 or symbol in self._fired:
+                    return None
+                self._fired.add(symbol)
+                if symbol == "BTC/USDT":
+                    self.last_generation_diagnostics[symbol] = {
+                        "outcome": "reliability_rejected",
+                        "reason": "calibrated_confidence_too_low",
+                        "replacement_candidates": [
+                            {
+                                "symbol": symbol,
+                                "strategy": "trend_pullback",
+                                "rejection_reason": "calibrated_confidence_too_low",
+                                "raw_confidence": 0.60,
+                                "calibrated_confidence": 0.45,
+                                "expected_edge_bps": 14.0,
+                                "rr_ratio": 1.5,
+                                "regime": "trending",
+                            }
+                        ],
+                    }
+                    return None
+                self.last_generation_diagnostics[symbol] = {
+                    "outcome": "selected",
+                    "reason": "selected_for_submission",
+                    "proposal_strategies": ["trend_breakout"],
+                }
+                return {
+                    "side": "long",
+                    "entry_price": 100.0,
+                    "stop_loss": 99.0,
+                    "take_profit": 103.0,
+                    "strategy": "trend_breakout",
+                    "expected_holding_minutes": 60,
+                    "signal_quality": 0.82,
+                    "expected_edge_bps": 24.0,
+                    "rr_ratio": 3.0,
+                    "metadata": {
+                        "ensemble_score": 100.0,
+                        "preferred_order_type": "limit",
+                    },
+                }
+
+        engine = LocalSimulationEngine(
+            BotConfig(
+                starting_balance=1000.0,
+                trading_mode="futures",
+                max_open_positions=2,
+                backtest_warmup_candles=20,
+                replacement_cross_symbol_enabled=True,
+                replacement_cross_symbol_max_per_scan=1,
+            ),
+            signal_engine_cls=ReplacementSignals,
+        )
+        result = engine.run_campaign(["BTC/USDT", "ETH/USDT"], timeframe="15m", days=10)
+        diagnostics = result["decision_diagnostics"]
+
+        self.assertEqual(diagnostics["replacement_candidates_seen"], 1)
+        self.assertEqual(diagnostics["replacement_candidates_selected"], 1)
+        self.assertEqual(diagnostics["replacement_cross_symbol_selected"], 1)
+        self.assertEqual(diagnostics["replacement_cross_symbol_selected_by_strategy"]["trend_breakout"], 1)
+        self.assertEqual(diagnostics["raw_signals_by_symbol"]["ETH/USDT"], 1)
+
+    def test_replacement_guard_reason_enforces_daily_and_symbol_caps(self):
+        engine = HistoricalSimulationEngine.__new__(HistoricalSimulationEngine)
+        engine.config = BotConfig(replacement_max_per_day=1, replacement_max_per_symbol_per_day=1)
+        engine._now = dt.datetime(2025, 1, 1, 12, 0, 0)
+        engine._replacement_submitted_by_day = {"2025-01-01": 1}
+        engine._replacement_submitted_by_symbol_day = {"2025-01-01": {"BTC/USDT": 1}}
+
+        signal = {
+            "symbol": "ETH/USDT",
+            "strategy": "trend_pullback",
+            "metadata": {"replacement_opportunity": {"active": True, "type": "near_miss_pullback"}},
+        }
+        self.assertEqual(engine._replacement_guard_reason(signal), "replacement_daily_cap")
+
+        engine.config = BotConfig(replacement_max_per_day=2, replacement_max_per_symbol_per_day=1)
+        self.assertEqual(
+            engine._replacement_guard_reason(
+                {
+                    "symbol": "BTC/USDT",
+                    "strategy": "trend_pullback",
+                    "metadata": {"replacement_opportunity": {"active": True, "type": "near_miss_pullback"}},
+                }
+            ),
+            "replacement_symbol_daily_cap",
+        )
+
+    def test_build_batch_summary_aggregates_replacement_guard_blocks(self):
+        summary = build_batch_summary(
+            [
+                {
+                    "decision_diagnostics": {
+                        "replacement_guard_blocks": 2,
+                        "replacement_guard_blocks_by_reason": {"replacement_symbol_daily_cap": 2},
+                    }
+                },
+                {
+                    "decision_diagnostics": {
+                        "replacement_guard_blocks": 1,
+                        "replacement_guard_blocks_by_reason": {"replacement_daily_cap": 1},
+                    }
+                },
+            ]
+        )
+
+        self.assertEqual(summary["execution_totals"]["replacement_guard_blocks"], 3)
+        self.assertEqual(summary["decision_totals"]["replacement_guard_blocks_by_reason"]["replacement_symbol_daily_cap"], 2)
+        self.assertEqual(summary["decision_totals"]["replacement_guard_blocks_by_reason"]["replacement_daily_cap"], 1)
+
+    def test_build_batch_summary_aggregates_replacement_lifecycle_metrics(self):
+        summary = build_batch_summary(
+            [
+                {
+                    "decision_diagnostics": {
+                        "replacement_submitted": 2,
+                        "replacement_filled": 1,
+                        "replacement_closed": 1,
+                        "replacement_wins": 1,
+                        "replacement_losses": 0,
+                        "replacement_submitted_by_strategy": {"trend_pullback": 2},
+                        "replacement_filled_by_strategy": {"trend_pullback": 1},
+                        "replacement_closed_by_strategy": {"trend_pullback": 1},
+                        "replacement_wins_by_strategy": {"trend_pullback": 1},
+                    }
+                },
+                {
+                    "decision_diagnostics": {
+                        "replacement_submitted": 1,
+                        "replacement_filled": 1,
+                        "replacement_closed": 1,
+                        "replacement_wins": 0,
+                        "replacement_losses": 1,
+                        "replacement_submitted_by_strategy": {"trend_breakout": 1},
+                        "replacement_filled_by_strategy": {"trend_breakout": 1},
+                        "replacement_closed_by_strategy": {"trend_breakout": 1},
+                        "replacement_losses_by_strategy": {"trend_breakout": 1},
+                    }
+                },
+            ]
+        )
+
+        self.assertEqual(summary["execution_totals"]["replacement_submitted"], 3)
+        self.assertEqual(summary["execution_totals"]["replacement_filled"], 2)
+        self.assertEqual(summary["execution_totals"]["replacement_closed"], 2)
+        self.assertEqual(summary["execution_totals"]["replacement_wins"], 1)
+        self.assertEqual(summary["execution_totals"]["replacement_losses"], 1)
+        self.assertEqual(summary["decision_totals"]["replacement_submitted_by_strategy"]["trend_pullback"], 2)
+        self.assertEqual(summary["decision_totals"]["replacement_filled_by_strategy"]["trend_breakout"], 1)
 
     def test_simulation_campaign_includes_nested_diagnostic_schema(self):
         timestamps = pd.date_range("2025-01-01", periods=130, freq="15min")
@@ -4603,6 +7420,275 @@ class TradeBotCoreTests(unittest.TestCase):
 
         self.assertIsNotNone(signal)
         self.assertEqual(signal["strategy"], "trend_breakout")
+
+    def test_signal_engine_state_gate_allows_constructive_core_pullback(self):
+        config = BotConfig(
+            state_gate_pullback_constructive_min_trend_persistence=0.34,
+            state_gate_pullback_constructive_min_pullback_score=0.96,
+        )
+        engine = SignalEngine(config, DummyExchange())
+        regime = RegimeAssessment(
+            regime="choppy",
+            confidence=0.72,
+            volatility_ratio=0.01,
+            trend_strength=0.01,
+            liquidity_score=0.82,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "preferred_family": "trend_pullback",
+                "trend_persistence": 0.38,
+                "pullback_score": 1.05,
+                "directional_efficiency": 0.12,
+                "realized_vol_percentile": 0.70,
+                "momentum_crash_risk": 0.25,
+            },
+        )
+        metadata = {
+            "side": "long",
+            "symbol_bucket": "majors",
+            "trend_direction": "bullish",
+            "preferred_family": "trend_pullback",
+            "trend_persistence": 0.38,
+            "liquidity_score": 0.82,
+            "pullback_score": 1.05,
+            "directional_efficiency": 0.12,
+            "realized_vol_percentile": 0.70,
+            "momentum_crash_risk": 0.25,
+        }
+
+        self.assertIsNone(engine._strategy_state_gate_reason("trend_pullback", regime, metadata))
+
+    def test_signal_engine_state_gate_blocks_weak_constructive_pullback(self):
+        engine = SignalEngine(BotConfig(), DummyExchange())
+        regime = RegimeAssessment(
+            regime="choppy",
+            confidence=0.72,
+            volatility_ratio=0.01,
+            trend_strength=0.01,
+            liquidity_score=0.82,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "preferred_family": "trend_pullback",
+            },
+        )
+        metadata = {
+            "side": "long",
+            "symbol_bucket": "majors",
+            "trend_direction": "bullish",
+            "preferred_family": "trend_pullback",
+            "trend_persistence": 0.20,
+            "liquidity_score": 0.82,
+            "pullback_score": 1.05,
+            "directional_efficiency": 0.12,
+            "realized_vol_percentile": 0.70,
+        }
+
+        self.assertEqual(
+            engine._strategy_state_gate_reason("trend_pullback", regime, metadata),
+            "state_gate_pullback_persistence",
+        )
+
+    def test_signal_engine_state_gate_keeps_breakout_strict_to_trending(self):
+        engine = SignalEngine(BotConfig(), DummyExchange())
+        regime = RegimeAssessment(
+            regime="choppy",
+            confidence=0.8,
+            volatility_ratio=0.01,
+            trend_strength=0.01,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={"trend_direction": "bullish", "trend_persistence": 0.60},
+        )
+
+        self.assertEqual(
+            engine._strategy_state_gate_reason("trend_breakout", regime, {"side": "long", "trend_persistence": 0.60}),
+            "state_gate_breakout_regime",
+        )
+
+    def test_signal_engine_candidate_flow_rescue_uses_relaxed_calibration_floor(self):
+        config = BotConfig(
+            learning_calibration_gate_min_samples=1,
+            learning_min_calibrated_confidence=0.50,
+            candidate_flow_rescue_calibration_floor=0.34,
+            min_reliable_regime_confidence=0.50,
+            min_signal_quality_score_pullback=0.55,
+            min_expected_edge_bps_pullback=8.0,
+            min_reliable_rr_ratio_pullback=1.20,
+        )
+        engine = SignalEngine(config, DummyExchange())
+        regime = RegimeAssessment(
+            regime="choppy",
+            confidence=0.72,
+            volatility_ratio=0.01,
+            trend_strength=0.01,
+            liquidity_score=0.82,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "preferred_family": "trend_pullback",
+            },
+        )
+        signal = {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "entry_price": 100.0,
+            "stop_loss": 98.0,
+            "take_profit": 103.0,
+            "strategy": "trend_pullback",
+            "signal_quality": 0.62,
+            "expected_edge_bps": 10.0,
+            "rr_ratio": 1.50,
+            "hurst_exponent": 0.50,
+            "research_context": {},
+            "metadata": {
+                "candidate_flow_rescue": {"active": True},
+                "side": "long",
+                "symbol_bucket": "majors",
+                "trend_direction": "bullish",
+                "preferred_family": "trend_pullback",
+                "trend_persistence": 0.35,
+                "liquidity_score": 0.82,
+                "pullback_score": 1.0,
+                "directional_efficiency": 0.10,
+                "realized_vol_percentile": 0.70,
+                "learning_context": {
+                    "calibration": {
+                        "effective_samples": 4,
+                        "calibrated_confidence": 0.35,
+                    }
+                },
+            },
+        }
+
+        self.assertIsNone(engine._reliability_rejection_reason("BTC/USDT", signal, regime, 1))
+
+    def test_signal_engine_filters_short_proposals_before_spot_ensemble_selection(self):
+        config = BotConfig(
+            trading_mode="spot",
+            min_hurst_for_trend_breakout=0.12,
+            min_reliable_regime_confidence=0.50,
+            min_expected_edge_bps=8.0,
+            min_reliable_rr_ratio_trend=1.20,
+        )
+        engine = SignalEngine(config, DummyExchange())
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.8,
+            volatility_ratio=0.01,
+            trend_strength=0.02,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "trend_persistence": 0.50,
+                "directional_efficiency": 0.40,
+                "breakout_score": 1.60,
+            },
+        )
+
+        class ShortStrategy:
+            name = "trend_breakout"
+
+            def evaluate(self, symbol, regime):
+                return StrategyProposal(
+                    signal=Signal(
+                        symbol=symbol,
+                        side="short",
+                        entry_price=100.0,
+                        stop_loss=102.0,
+                        take_profit=96.0,
+                        strategy="trend_breakout",
+                        confidence=0.9,
+                        timeframe="15m",
+                        expected_edge_bps=40.0,
+                        regime=regime.regime,
+                    ),
+                    expected_edge_bps=40.0,
+                    rationale="short should be hidden from spot ensemble",
+                )
+
+        class LongStrategy:
+            name = "trend_breakout"
+
+            def evaluate(self, symbol, regime):
+                return StrategyProposal(
+                    signal=Signal(
+                        symbol=symbol,
+                        side="long",
+                        entry_price=100.0,
+                        stop_loss=98.0,
+                        take_profit=103.0,
+                        strategy="trend_breakout",
+                        confidence=0.68,
+                        timeframe="15m",
+                        expected_edge_bps=12.0,
+                        regime=regime.regime,
+                    ),
+                    expected_edge_bps=12.0,
+                    rationale="valid spot long",
+                )
+
+        engine.strategy_modules = [ShortStrategy(), LongStrategy()]
+        engine.regime_engine.classify = mock.Mock(return_value=regime)
+        engine.compute_hurst_exponent = mock.Mock(return_value=0.20)
+
+        signal = engine.generate_signal("BTC/USDT")
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal["side"], "long")
+        self.assertEqual(engine.last_generation_diagnostics["BTC/USDT"]["spot_short_proposals_filtered"], 1)
+
+    def test_signal_engine_reports_spot_short_only_proposals_as_generation_rejection(self):
+        config = BotConfig(trading_mode="spot")
+        engine = SignalEngine(config, DummyExchange())
+        regime = RegimeAssessment(
+            regime="mean_reverting",
+            confidence=0.8,
+            volatility_ratio=0.01,
+            trend_strength=0.0,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={},
+        )
+
+        class ShortOnlyStrategy:
+            name = "mean_reversion"
+
+            def evaluate(self, symbol, regime):
+                return StrategyProposal(
+                    signal=Signal(
+                        symbol=symbol,
+                        side="short",
+                        entry_price=100.0,
+                        stop_loss=102.0,
+                        take_profit=98.0,
+                        strategy="mean_reversion",
+                        confidence=0.8,
+                        timeframe="15m",
+                        expected_edge_bps=18.0,
+                        regime=regime.regime,
+                    ),
+                    expected_edge_bps=18.0,
+                    rationale="spot-incompatible short",
+                )
+
+        engine.strategy_modules = [ShortOnlyStrategy()]
+        engine.regime_engine.classify = mock.Mock(return_value=regime)
+        engine.compute_hurst_exponent = mock.Mock(return_value=0.30)
+
+        signal = engine.generate_signal("BNB/USDT")
+
+        self.assertIsNone(signal)
+        self.assertEqual(engine.last_generation_diagnostics["BNB/USDT"]["reason"], "spot_short_only_proposals")
+        self.assertEqual(engine.last_generation_diagnostics["BNB/USDT"]["spot_short_proposals_filtered"], 1)
 
     def test_signal_engine_vetoes_long_when_research_is_strongly_bearish(self):
         config = BotConfig(min_hurst_for_trend_breakout=0.12, research_conflict_veto_confidence=0.72)
@@ -5100,6 +8186,7 @@ class TradeBotCoreTests(unittest.TestCase):
         venue, _, _ = self._build_simulated_venue_for_fill_test(
             {"open": 100.0, "high": 100.8, "low": 99.6, "close": 100.2, "volume": 1000.0}
         )
+        venue.config.simulation_pullback_aggressive_market_enabled = True
         signal = {
             "symbol": "BTC/USDT",
             "side": "long",
@@ -5114,9 +8201,62 @@ class TradeBotCoreTests(unittest.TestCase):
                 "preferred_order_type": "limit",
                 "mid_price": 100.0,
                 "liquidity_score": 0.72,
+                "entry_close_location": 0.62,
+                "entry_body_fraction": 0.24,
             },
         }
         self.assertEqual(venue._order_type_for_signal(signal), "market")
+
+    def test_simulated_pullback_limit_stays_passive_by_default(self):
+        venue, _, _ = self._build_simulated_venue_for_fill_test(
+            {"open": 100.0, "high": 100.8, "low": 99.6, "close": 100.2, "volume": 1000.0}
+        )
+        signal = {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "strategy": "trend_pullback",
+            "entry_price": 100.08,
+            "stop_loss": 98.5,
+            "take_profit": 103.2,
+            "signal_quality": 0.90,
+            "expected_edge_bps": 60.0,
+            "rr_ratio": 2.2,
+            "metadata": {
+                "preferred_order_type": "limit",
+                "mid_price": 100.0,
+                "liquidity_score": 0.90,
+                "entry_close_location": 0.75,
+                "entry_body_fraction": 0.40,
+                "spread_bps": 2.0,
+            },
+        }
+
+        self.assertEqual(venue._order_type_for_signal(signal), "limit")
+
+    def test_simulated_weak_close_pullback_limit_stays_passive(self):
+        venue, _, _ = self._build_simulated_venue_for_fill_test(
+            {"open": 100.0, "high": 100.8, "low": 99.6, "close": 100.2, "volume": 1000.0}
+        )
+        signal = {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "strategy": "trend_pullback",
+            "entry_price": 100.08,
+            "stop_loss": 98.5,
+            "take_profit": 103.2,
+            "signal_quality": 0.76,
+            "expected_edge_bps": 21.0,
+            "rr_ratio": 1.9,
+            "metadata": {
+                "preferred_order_type": "limit",
+                "mid_price": 100.0,
+                "liquidity_score": 0.72,
+                "entry_close_location": 0.40,
+                "entry_body_fraction": 0.24,
+            },
+        }
+
+        self.assertEqual(venue._order_type_for_signal(signal), "limit")
 
     def test_simulated_far_pullback_limit_stays_passive(self):
         venue, _, _ = self._build_simulated_venue_for_fill_test(
@@ -5238,6 +8378,102 @@ class TradeBotCoreTests(unittest.TestCase):
             },
         }
         self.assertEqual(venue._order_type_for_signal(signal), "market")
+        self.assertGreaterEqual(float(dict(signal.get("metadata", {}) or {}).get("execution_urgency_score", 0.0) or 0.0), 0.0)
+
+    def test_simulated_high_urgency_breakout_uses_marketable_limit_before_market(self):
+        venue, _, _ = self._build_simulated_venue_for_fill_test(
+            {"open": 100.0, "high": 100.8, "low": 99.6, "close": 100.2, "volume": 1000.0}
+        )
+        signal = {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "strategy": "trend_breakout",
+            "entry_price": 100.0,
+            "stop_loss": 98.5,
+            "take_profit": 103.5,
+            "signal_quality": 0.76,
+            "expected_edge_bps": 22.0,
+            "rr_ratio": 1.7,
+            "metadata": {
+                "preferred_order_type": "limit",
+                "mid_price": 100.0,
+                "liquidity_score": 0.88,
+                "spread_bps": 6.0,
+            },
+        }
+        order_type = venue._order_type_for_signal(signal)
+        requested_price = venue._requested_price_for_signal(signal, order_type="limit")
+
+        self.assertEqual(order_type, "limit")
+        self.assertGreater(float(dict(signal.get("metadata", {}) or {}).get("execution_urgency_score", 0.0) or 0.0), 0.68)
+        self.assertGreater(requested_price, 99.99)
+
+    def test_simulated_high_urgency_pullback_uses_urgent_limit_profile(self):
+        venue, now, _ = self._build_simulated_venue_for_fill_test(
+            {"open": 100.0, "high": 100.8, "low": 99.6, "close": 100.2, "volume": 1000.0}
+        )
+        venue.config.backtest_latency_bars = 3
+        venue.rng.seed(7)
+        signal = {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "strategy": "trend_pullback",
+            "entry_price": 100.0,
+            "stop_loss": 98.0,
+            "take_profit": 103.5,
+            "signal_quality": 0.92,
+            "expected_edge_bps": 60.0,
+            "rr_ratio": 1.75,
+            "metadata": {
+                "preferred_order_type": "limit",
+                "mid_price": 100.0,
+                "liquidity_score": 0.95,
+                "spread_bps": 4.0,
+                "entry_close_location": 0.80,
+                "entry_body_fraction": 0.35,
+            },
+        }
+
+        order = venue.submit_order(signal=signal, size=1.0, now=now, current_index=0, trace_id="urgent-pullback")
+
+        self.assertEqual(order.order_type, "limit")
+        self.assertTrue(order.metadata["urgent_limit_execution"])
+        self.assertTrue(signal["metadata"]["urgent_limit_execution"])
+        self.assertLessEqual(order.queue_ahead_fraction, 0.18)
+        self.assertEqual(order.latency_bars, 1)
+        self.assertGreater(order.requested_price, 99.99)
+
+    def test_simulated_weak_pullback_does_not_use_urgent_limit_profile(self):
+        venue, now, _ = self._build_simulated_venue_for_fill_test(
+            {"open": 100.0, "high": 100.8, "low": 99.6, "close": 100.2, "volume": 1000.0}
+        )
+        venue.config.backtest_latency_bars = 3
+        signal = {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "strategy": "trend_pullback",
+            "entry_price": 100.0,
+            "stop_loss": 98.0,
+            "take_profit": 103.0,
+            "signal_quality": 0.72,
+            "expected_edge_bps": 16.0,
+            "rr_ratio": 1.5,
+            "metadata": {
+                "preferred_order_type": "limit",
+                "mid_price": 100.0,
+                "liquidity_score": 0.70,
+                "spread_bps": 4.0,
+                "entry_close_location": 0.40,
+                "entry_body_fraction": 0.16,
+            },
+        }
+
+        order = venue.submit_order(signal=signal, size=1.0, now=now, current_index=0, trace_id="passive-pullback")
+
+        self.assertEqual(order.order_type, "limit")
+        self.assertFalse(order.metadata["urgent_limit_execution"])
+        self.assertNotIn("urgent_limit_execution", signal["metadata"])
+        self.assertEqual(order.latency_bars, 3)
 
     def test_simulated_high_quality_pullback_limit_gets_better_queue_priority(self):
         venue, now, _ = self._build_simulated_venue_for_fill_test(
@@ -5428,6 +8664,28 @@ class TradeBotCoreTests(unittest.TestCase):
         risk = RiskManager(config, state)
         size = risk.calc_position_size(entry_price=100.0, stop_loss=99.0)
         self.assertAlmostEqual(size, 1.0, places=6)
+
+    def test_risk_manager_sizes_down_high_beta_quality_escape_pullback(self):
+        config = BotConfig(
+            trading_mode="futures",
+            default_leverage=10,
+            risk_per_trade_max=0.03,
+            high_beta_quality_escape_risk_multiplier=0.55,
+        )
+        state = BotState(balance=1000.0)
+        risk = RiskManager(config, state)
+        baseline = risk.calc_position_size(
+            entry_price=100.0,
+            stop_loss=98.0,
+            signal={"strategy": "trend_pullback", "metadata": {}},
+        )
+        protected = risk.calc_position_size(
+            entry_price=100.0,
+            stop_loss=98.0,
+            signal={"strategy": "trend_pullback", "metadata": {"high_beta_quality_escape": True}},
+        )
+
+        self.assertAlmostEqual(protected, baseline * 0.55)
 
     def test_portfolio_risk_caps_symbol_exposure(self):
         config = BotConfig(trading_mode="spot", max_symbol_exposure_fraction=0.20)
@@ -6084,6 +9342,1150 @@ class TradeBotCoreTests(unittest.TestCase):
         self.assertEqual(proposal.signal.side, "long")
         self.assertEqual(proposal.signal.metadata.get("confirmation_variant"), "reclaim_hold")
 
+    def test_trend_pullback_strategy_can_emit_strict_confirmation_near_miss_long(self):
+        closes = [
+            100.0, 100.4, 100.9, 101.4, 101.9, 102.5, 103.1, 103.8, 104.5, 105.2,
+            105.9, 106.6, 107.3, 108.1, 108.8, 109.6, 110.3, 111.1, 111.8, 112.5,
+            113.2, 113.9, 114.5, 115.1, 115.7, 116.2, 116.7, 117.0, 117.2, 117.25,
+            117.05, 116.85, 116.62, 116.38, 116.18, 116.05, 115.96, 115.93, 115.91, 115.90,
+        ]
+        candles_15m = []
+        for idx, close in enumerate(closes):
+            if idx == len(closes) - 1:
+                candles_15m.append([float(idx), close - 0.045, close + 0.16, close - 0.12, close, 2100.0])
+            else:
+                candles_15m.append([float(idx), close - 0.18, close + 0.42, close - 0.40, close, 1700.0])
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return True
+
+            def is_1h_uptrend(self, symbol):
+                return True
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.0
+
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.83,
+            volatility_ratio=0.010,
+            trend_strength=0.02,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 1.06,
+                "stretch_from_mean": 0.010,
+                "directional_efficiency": 0.27,
+                "pullback_score": 1.64,
+                "trend_persistence": 0.56,
+                "entry_zscore": 0.10,
+                "realized_vol_percentile": 0.56,
+            },
+        )
+        strategy = TrendPullbackStrategy(BotConfig(), StrategyExchangeStub({"15m": candles_15m}), Helpers())
+        proposal = strategy.evaluate("BTC/USDT", regime)
+
+        self.assertIsNotNone(proposal)
+        self.assertEqual(proposal.signal.side, "long")
+        self.assertEqual(proposal.signal.metadata.get("confirmation_variant"), "confirmation_near_miss")
+        self.assertTrue(proposal.signal.metadata.get("bullish_confirmation_near_miss"))
+
+    def test_trend_pullback_strategy_confirmation_near_miss_matches_real_case_band(self):
+        closes = [
+            100.0, 100.4, 100.9, 101.4, 101.9, 102.5, 103.1, 103.8, 104.5, 105.2,
+            105.9, 106.6, 107.3, 108.1, 108.8, 109.6, 110.3, 111.1, 111.8, 112.5,
+            113.2, 113.9, 114.5, 115.1, 115.7, 116.2, 116.7, 117.0, 117.2, 117.25,
+            117.05, 116.85, 116.62, 116.38, 116.18, 116.05, 115.96, 115.93, 115.91, 115.90,
+        ]
+        candles_15m = []
+        for idx, close in enumerate(closes):
+            if idx == len(closes) - 1:
+                candles_15m.append([float(idx), close - 0.045, close + 0.16, close - 0.12, close, 2100.0])
+            else:
+                candles_15m.append([float(idx), close - 0.18, close + 0.42, close - 0.40, close, 1700.0])
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return True
+
+            def is_1h_uptrend(self, symbol):
+                return True
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.0
+
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.93,
+            volatility_ratio=0.012,
+            trend_strength=0.03,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 1.07,
+                "stretch_from_mean": 0.021,
+                "directional_efficiency": 0.16,
+                "pullback_score": 2.22,
+                "trend_persistence": 0.41,
+                "entry_zscore": 0.27,
+                "realized_vol_percentile": 0.62,
+            },
+        )
+        strategy = TrendPullbackStrategy(BotConfig(), StrategyExchangeStub({"15m": candles_15m}), Helpers())
+        proposal = strategy.evaluate("BTC/USDT", regime)
+
+        self.assertIsNotNone(proposal)
+        self.assertEqual(proposal.signal.metadata.get("confirmation_variant"), "confirmation_near_miss")
+
+    def test_trend_pullback_strategy_confirmation_near_miss_stays_blocked_below_real_case_band(self):
+        closes = [
+            100.0, 100.4, 100.9, 101.4, 101.9, 102.5, 103.1, 103.8, 104.5, 105.2,
+            105.9, 106.6, 107.3, 108.1, 108.8, 109.6, 110.3, 111.1, 111.8, 112.5,
+            113.2, 113.9, 114.5, 115.1, 115.7, 116.2, 116.7, 117.0, 117.2, 117.25,
+            117.05, 116.85, 116.62, 116.38, 116.18, 116.05, 115.96, 115.93, 115.91, 115.90,
+        ]
+        candles_15m = []
+        for idx, close in enumerate(closes):
+            if idx == len(closes) - 1:
+                candles_15m.append([float(idx), close - 0.045, close + 0.16, close - 0.12, close, 2100.0])
+            else:
+                candles_15m.append([float(idx), close - 0.18, close + 0.42, close - 0.40, close, 1700.0])
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return True
+
+            def is_1h_uptrend(self, symbol):
+                return True
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.0
+
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.93,
+            volatility_ratio=0.012,
+            trend_strength=0.03,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 1.07,
+                "stretch_from_mean": 0.021,
+                "directional_efficiency": 0.16,
+                "pullback_score": 2.22,
+                "trend_persistence": 0.39,
+                "entry_zscore": 0.27,
+                "realized_vol_percentile": 0.62,
+            },
+        )
+        strategy = TrendPullbackStrategy(BotConfig(), StrategyExchangeStub({"15m": candles_15m}), Helpers())
+        proposal = strategy.evaluate("BTC/USDT", regime)
+
+        self.assertIsNone(proposal)
+        self.assertEqual(strategy.last_rejection_reason, "bullish_confirmation_missing")
+
+    def test_trend_pullback_strategy_expands_spot_major_long_opportunities(self):
+        closes = [
+            100.0, 100.5, 101.1, 101.8, 102.4, 103.0, 103.7, 104.3, 105.0, 105.7,
+            106.3, 107.0, 107.8, 108.5, 109.2, 110.0, 110.7, 111.5, 112.2, 113.0,
+            113.7, 114.5, 115.2, 116.0, 116.7, 117.5, 118.1, 118.8, 119.4, 120.0,
+            119.8, 119.5, 119.3, 119.1, 118.95, 118.78, 118.62, 118.58, 118.60, 118.65,
+        ]
+        candles_15m = []
+        for idx, close in enumerate(closes):
+            if idx == len(closes) - 1:
+                candles_15m.append([float(idx), close - 0.28, close + 0.07, close - 0.40, close, 2400.0])
+            else:
+                candles_15m.append([float(idx), close - 0.22, close + 0.42, close - 0.42, close, 2100.0])
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return True
+
+            def is_1h_uptrend(self, symbol):
+                return True
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.20
+
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.84,
+            volatility_ratio=0.010,
+            trend_strength=0.018,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 1.16,
+                "stretch_from_mean": 0.012,
+                "directional_efficiency": 0.24,
+                "pullback_score": 1.50,
+                "trend_persistence": 0.54,
+                "entry_zscore": 0.10,
+                "realized_vol_percentile": 0.54,
+            },
+        )
+        strategy = TrendPullbackStrategy(
+            BotConfig(trading_mode="spot"),
+            StrategyExchangeStub({"15m": candles_15m}),
+            Helpers(),
+        )
+
+        proposal = strategy.evaluate("BTC/USDT", regime)
+
+        self.assertIsNotNone(proposal)
+        self.assertEqual(proposal.signal.side, "long")
+        self.assertEqual(proposal.signal.metadata.get("strategy_variant"), "spot_major_continuation_pullback")
+        self.assertEqual(proposal.signal.metadata.get("symbol_bucket"), "majors")
+
+    def test_spot_core_pullback_can_use_resilient_higher_timeframe_fallback(self):
+        closes = [
+            100.0, 100.5, 101.1, 101.8, 102.4, 103.0, 103.7, 104.3, 105.0, 105.7,
+            106.3, 107.0, 107.8, 108.5, 109.2, 110.0, 110.7, 111.5, 112.2, 113.0,
+            113.7, 114.5, 115.2, 116.0, 116.7, 117.5, 118.1, 118.8, 119.4, 120.0,
+            119.8, 119.5, 119.3, 119.1, 118.95, 118.78, 118.62, 118.58, 118.60, 118.65,
+        ]
+        candles_15m = []
+        for idx, close in enumerate(closes):
+            if idx == len(closes) - 1:
+                candles_15m.append([float(idx), close - 0.28, close + 0.07, close - 0.40, close, 2400.0])
+            else:
+                candles_15m.append([float(idx), close - 0.22, close + 0.42, close - 0.42, close, 2100.0])
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return False
+
+            def is_1h_uptrend(self, symbol):
+                return False
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.20
+
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.84,
+            volatility_ratio=0.010,
+            trend_strength=0.018,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 1.16,
+                "stretch_from_mean": 0.012,
+                "directional_efficiency": 0.24,
+                "pullback_score": 1.50,
+                "trend_persistence": 0.54,
+                "entry_zscore": 0.10,
+                "realized_vol_percentile": 0.54,
+            },
+        )
+        strategy = TrendPullbackStrategy(
+            BotConfig(trading_mode="spot"),
+            StrategyExchangeStub({"15m": candles_15m}),
+            Helpers(),
+        )
+
+        proposal = strategy.evaluate("ETH/USDT", regime)
+
+        self.assertIsNotNone(proposal)
+        self.assertEqual(proposal.signal.side, "long")
+        self.assertTrue(proposal.signal.metadata.get("htf_fallback_used"))
+
+    def test_spot_core_pullback_can_use_micro_reclaim_shape(self):
+        closes = [
+            100.0, 100.6, 101.2, 101.9, 102.6, 103.2, 103.9, 104.5, 105.2, 105.9,
+            106.6, 107.2, 107.9, 108.7, 109.4, 110.1, 110.8, 111.5, 112.2, 112.9,
+            113.6, 114.3, 115.0, 115.7, 116.4, 117.1, 117.8, 118.5, 119.2, 119.9,
+            120.2, 120.0, 119.9, 119.82, 119.76, 119.72, 119.70, 119.69, 119.71, 119.74,
+        ]
+        candles_15m = []
+        for idx, close in enumerate(closes):
+            if idx == len(closes) - 1:
+                candles_15m.append([float(idx), close - 0.10, close + 0.05, close - 0.18, close, 2600.0])
+            elif idx == len(closes) - 2:
+                candles_15m.append([float(idx), close - 0.18, close + 0.03, close - 0.24, close, 2300.0])
+            else:
+                candles_15m.append([float(idx), close - 0.22, close + 0.42, close - 0.42, close, 2100.0])
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return False
+
+            def is_1h_uptrend(self, symbol):
+                return False
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.15
+
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.86,
+            volatility_ratio=0.009,
+            trend_strength=0.019,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 1.16,
+                "stretch_from_mean": 0.010,
+                "directional_efficiency": 0.24,
+                "pullback_score": 1.52,
+                "trend_persistence": 0.56,
+                "entry_zscore": 0.10,
+                "realized_vol_percentile": 0.50,
+            },
+        )
+        strategy = TrendPullbackStrategy(
+            BotConfig(trading_mode="spot"),
+            StrategyExchangeStub({"15m": candles_15m}),
+            Helpers(),
+        )
+
+        proposal = strategy.evaluate("XRP/USDT", regime)
+
+        self.assertIsNotNone(proposal)
+        self.assertEqual(proposal.signal.side, "long")
+        self.assertEqual(proposal.signal.metadata.get("strategy_variant"), "spot_core_micro_reclaim")
+        self.assertEqual(proposal.signal.metadata.get("confirmation_variant"), "spot_core_micro_reclaim")
+        self.assertTrue(proposal.signal.metadata.get("htf_fallback_used"))
+
+    def test_spot_core_pullback_can_use_constructive_non_trending_regime(self):
+        closes = [
+            100.0, 100.6, 101.2, 101.9, 102.6, 103.2, 103.9, 104.5, 105.2, 105.9,
+            106.6, 107.2, 107.9, 108.7, 109.4, 110.1, 110.8, 111.5, 112.2, 112.9,
+            113.6, 114.3, 115.0, 115.7, 116.4, 117.1, 117.8, 118.5, 119.2, 119.9,
+            120.2, 120.0, 119.9, 119.82, 119.76, 119.72, 119.70, 119.69, 119.71, 119.74,
+        ]
+        candles_15m = []
+        for idx, close in enumerate(closes):
+            if idx == len(closes) - 1:
+                candles_15m.append([float(idx), close - 0.10, close + 0.05, close - 0.18, close, 2600.0])
+            elif idx == len(closes) - 2:
+                candles_15m.append([float(idx), close - 0.18, close + 0.03, close - 0.24, close, 2300.0])
+            else:
+                candles_15m.append([float(idx), close - 0.22, close + 0.42, close - 0.42, close, 2100.0])
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return False
+
+            def is_1h_uptrend(self, symbol):
+                return False
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.15
+
+        regime = RegimeAssessment(
+            regime="choppy",
+            confidence=0.66,
+            volatility_ratio=0.009,
+            trend_strength=0.010,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 1.16,
+                "stretch_from_mean": 0.010,
+                "directional_efficiency": 0.24,
+                "pullback_score": 1.52,
+                "trend_persistence": 0.56,
+                "entry_zscore": 0.10,
+                "realized_vol_percentile": 0.50,
+            },
+        )
+        strategy = TrendPullbackStrategy(
+            BotConfig(
+                trading_mode="spot",
+                spot_core_partial_htf_enabled=False,
+                spot_core_htf_fallback_enabled=False,
+            ),
+            StrategyExchangeStub({"15m": candles_15m}),
+            Helpers(),
+        )
+
+        proposal = strategy.evaluate("XRP/USDT", regime)
+
+        self.assertIsNotNone(proposal)
+        self.assertEqual(proposal.signal.side, "long")
+        self.assertTrue(proposal.signal.metadata.get("constructive_spot_core_regime"))
+        self.assertEqual(proposal.signal.metadata.get("strategy_variant"), "spot_core_micro_reclaim")
+
+    def test_spot_core_pullback_can_infer_bullish_direction_from_local_structure(self):
+        closes = [
+            100.0, 100.6, 101.2, 101.9, 102.6, 103.2, 103.9, 104.5, 105.2, 105.9,
+            106.6, 107.2, 107.9, 108.7, 109.4, 110.1, 110.8, 111.5, 112.2, 112.9,
+            113.6, 114.3, 115.0, 115.7, 116.4, 117.1, 117.8, 118.5, 119.2, 119.9,
+            120.2, 120.0, 119.9, 119.82, 119.76, 119.72, 119.70, 119.69, 119.71, 119.74,
+        ]
+        candles_15m = []
+        for idx, close in enumerate(closes):
+            if idx == len(closes) - 1:
+                candles_15m.append([float(idx), close - 0.10, close + 0.05, close - 0.18, close, 2600.0])
+            elif idx == len(closes) - 2:
+                candles_15m.append([float(idx), close - 0.18, close + 0.03, close - 0.24, close, 2300.0])
+            else:
+                candles_15m.append([float(idx), close - 0.22, close + 0.42, close - 0.42, close, 2100.0])
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return False
+
+            def is_1h_uptrend(self, symbol):
+                return False
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.15
+
+        regime = RegimeAssessment(
+            regime="choppy",
+            confidence=0.66,
+            volatility_ratio=0.009,
+            trend_strength=0.010,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "flat",
+                "volume_impulse": 1.12,
+                "stretch_from_mean": 0.010,
+                "directional_efficiency": 0.18,
+                "pullback_score": 1.42,
+                "trend_persistence": 0.48,
+                "entry_zscore": 0.10,
+                "realized_vol_percentile": 0.55,
+            },
+        )
+        strategy = TrendPullbackStrategy(
+            BotConfig(
+                trading_mode="spot",
+                spot_core_partial_htf_enabled=False,
+                spot_core_htf_fallback_enabled=False,
+            ),
+            StrategyExchangeStub({"15m": candles_15m}),
+            Helpers(),
+        )
+
+        proposal = strategy.evaluate("BNB/USDT", regime)
+
+        self.assertIsNotNone(proposal)
+        self.assertEqual(proposal.signal.side, "long")
+        self.assertTrue(proposal.signal.metadata.get("inferred_bullish_direction"))
+        self.assertTrue(proposal.signal.metadata.get("constructive_spot_core_regime"))
+
+    def test_spot_core_pullback_can_use_partial_higher_timeframe_alignment(self):
+        closes = [
+            100.0, 100.6, 101.2, 101.9, 102.6, 103.2, 103.9, 104.5, 105.2, 105.9,
+            106.6, 107.2, 107.9, 108.7, 109.4, 110.1, 110.8, 111.5, 112.2, 112.9,
+            113.6, 114.3, 115.0, 115.7, 116.4, 117.1, 117.8, 118.5, 119.2, 119.9,
+            120.2, 120.0, 119.9, 119.82, 119.76, 119.72, 119.70, 119.69, 119.71, 119.74,
+        ]
+        candles_15m = []
+        for idx, close in enumerate(closes):
+            if idx == len(closes) - 1:
+                candles_15m.append([float(idx), close - 0.10, close + 0.05, close - 0.18, close, 2600.0])
+            elif idx == len(closes) - 2:
+                candles_15m.append([float(idx), close - 0.18, close + 0.03, close - 0.24, close, 2300.0])
+            else:
+                candles_15m.append([float(idx), close - 0.22, close + 0.42, close - 0.42, close, 2100.0])
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return True
+
+            def is_1h_uptrend(self, symbol):
+                return False
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.15
+
+        regime = RegimeAssessment(
+            regime="choppy",
+            confidence=0.66,
+            volatility_ratio=0.009,
+            trend_strength=0.010,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 1.04,
+                "stretch_from_mean": 0.010,
+                "directional_efficiency": 0.18,
+                "pullback_score": 1.36,
+                "trend_persistence": 0.45,
+                "entry_zscore": 0.10,
+                "realized_vol_percentile": 0.55,
+            },
+        )
+        strategy = TrendPullbackStrategy(BotConfig(trading_mode="spot"), StrategyExchangeStub({"15m": candles_15m}), Helpers())
+
+        proposal = strategy.evaluate("ETH/USDT", regime)
+
+        self.assertIsNotNone(proposal)
+        self.assertTrue(proposal.signal.metadata.get("partial_htf_used"))
+        self.assertTrue(proposal.signal.metadata.get("htf_4h_bullish"))
+        self.assertFalse(proposal.signal.metadata.get("htf_1h_uptrend"))
+
+    def test_spot_core_pullback_can_use_local_structure_continuation_shape(self):
+        closes = [
+            100.0, 100.5, 101.0, 101.6, 102.1, 102.7, 103.2, 103.8, 104.3, 104.9,
+            105.4, 106.0, 106.6, 107.1, 107.7, 108.2, 108.8, 109.3, 109.9, 110.4,
+            111.0, 111.5, 112.1, 112.6, 113.2, 113.7, 114.3, 114.8, 115.4, 115.9,
+            116.2, 116.4, 116.6, 116.7, 116.78, 116.86, 116.92, 116.98, 117.04, 117.08,
+        ]
+        candles_15m = []
+        for idx, close in enumerate(closes):
+            if idx == len(closes) - 1:
+                candles_15m.append([float(idx), close - 0.08, close + 0.08, close - 0.14, close, 2500.0])
+            else:
+                candles_15m.append([float(idx), close - 0.18, close + 0.30, close - 0.30, close, 2100.0])
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return False
+
+            def is_1h_uptrend(self, symbol):
+                return True
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.05
+
+        regime = RegimeAssessment(
+            regime="choppy",
+            confidence=0.64,
+            volatility_ratio=0.009,
+            trend_strength=0.009,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 1.02,
+                "stretch_from_mean": 0.012,
+                "directional_efficiency": 0.16,
+                "pullback_score": 1.28,
+                "trend_persistence": 0.40,
+                "entry_zscore": 0.18,
+                "realized_vol_percentile": 0.58,
+            },
+        )
+        strategy = TrendPullbackStrategy(BotConfig(trading_mode="spot"), StrategyExchangeStub({"15m": candles_15m}), Helpers())
+
+        proposal = strategy.evaluate("BTC/USDT", regime)
+
+        self.assertIsNotNone(proposal)
+        self.assertEqual(proposal.signal.metadata.get("strategy_variant"), "spot_core_local_structure_pullback")
+        self.assertEqual(proposal.signal.metadata.get("confirmation_variant"), "spot_core_local_structure")
+        self.assertTrue(proposal.signal.metadata.get("partial_htf_used"))
+
+    def test_spot_core_pullback_can_use_alignment_bridge_for_liquid_major(self):
+        closes = [
+            100.0, 100.5, 101.0, 101.6, 102.1, 102.7, 103.2, 103.8, 104.3, 104.9,
+            105.4, 106.0, 106.6, 107.1, 107.7, 108.2, 108.8, 109.3, 109.9, 110.4,
+            111.0, 111.5, 112.1, 112.6, 113.2, 113.7, 114.3, 114.8, 115.4, 115.9,
+            116.2, 116.4, 116.6, 116.7, 116.76, 116.68, 116.60, 116.54, 116.58, 116.70,
+        ]
+        candles_15m = []
+        for idx, close in enumerate(closes):
+            if idx == len(closes) - 1:
+                candles_15m.append([float(idx), close - 0.07, close + 0.10, close - 0.12, close, 2500.0])
+            else:
+                candles_15m.append([float(idx), close - 0.18, close + 0.30, close - 0.30, close, 2100.0])
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return False
+
+            def is_1h_uptrend(self, symbol):
+                return False
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.05
+
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.72,
+            volatility_ratio=0.009,
+            trend_strength=0.009,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 1.00,
+                "stretch_from_mean": 0.012,
+                "directional_efficiency": 0.14,
+                "pullback_score": 1.31,
+                "trend_persistence": 0.43,
+                "entry_zscore": 0.16,
+                "realized_vol_percentile": 0.60,
+            },
+        )
+        strategy = TrendPullbackStrategy(
+            BotConfig(
+                trading_mode="spot",
+                spot_core_partial_htf_enabled=False,
+                spot_core_htf_fallback_enabled=False,
+            ),
+            StrategyExchangeStub({"15m": candles_15m}),
+            Helpers(),
+        )
+
+        proposal = strategy.evaluate("BTC/USDT", regime)
+
+        self.assertIsNotNone(proposal)
+        self.assertEqual(proposal.signal.metadata.get("strategy_variant"), "spot_core_local_structure_pullback")
+        self.assertTrue(proposal.signal.metadata.get("alignment_bridge_used"))
+        self.assertFalse(proposal.signal.metadata.get("partial_htf_used"))
+
+    def test_spot_core_pullback_alignment_bridge_stays_blocked_when_quality_is_weak(self):
+        closes = [
+            100.0, 100.5, 101.0, 101.6, 102.1, 102.7, 103.2, 103.8, 104.3, 104.9,
+            105.4, 106.0, 106.6, 107.1, 107.7, 108.2, 108.8, 109.3, 109.9, 110.4,
+            111.0, 111.5, 112.1, 112.6, 113.2, 113.7, 114.3, 114.8, 115.4, 115.9,
+            116.2, 116.4, 116.6, 116.7, 116.76, 116.68, 116.60, 116.54, 116.55, 116.56,
+        ]
+        candles_15m = []
+        for idx, close in enumerate(closes):
+            if idx == len(closes) - 1:
+                candles_15m.append([float(idx), close - 0.10, close + 0.08, close - 0.14, close, 2100.0])
+            else:
+                candles_15m.append([float(idx), close - 0.18, close + 0.30, close - 0.30, close, 1900.0])
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return False
+
+            def is_1h_uptrend(self, symbol):
+                return False
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.05
+
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.72,
+            volatility_ratio=0.009,
+            trend_strength=0.009,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 0.92,
+                "stretch_from_mean": 0.028,
+                "directional_efficiency": 0.09,
+                "pullback_score": 1.20,
+                "trend_persistence": 0.34,
+                "entry_zscore": 0.31,
+                "realized_vol_percentile": 0.80,
+            },
+        )
+        strategy = TrendPullbackStrategy(
+            BotConfig(
+                trading_mode="spot",
+                spot_core_partial_htf_enabled=False,
+                spot_core_htf_fallback_enabled=False,
+            ),
+            StrategyExchangeStub({"15m": candles_15m}),
+            Helpers(),
+        )
+
+        proposal = strategy.evaluate("BTC/USDT", regime)
+
+        self.assertIsNone(proposal)
+        self.assertEqual(strategy.last_rejection_reason, "bullish_higher_timeframe_not_aligned")
+
+    def test_spot_core_pullback_can_use_liquid_value_bridge_for_deep_core_pullback(self):
+        closes = [
+            100.0, 100.5, 101.1, 101.8, 102.5, 103.2, 103.8, 104.4, 105.1, 105.8,
+            106.5, 107.2, 107.8, 108.5, 109.1, 109.8, 110.5, 111.1, 111.8, 112.4,
+            113.1, 113.7, 114.3, 115.0, 115.6, 116.2, 116.8, 117.4, 118.0, 118.6,
+            119.0, 118.6, 118.2, 117.8, 117.4, 117.1, 116.9, 116.8, 116.75, 116.72,
+        ]
+        candles_15m = [[float(idx), close - 0.22, close + 0.24, close - 0.32, close, 2100.0] for idx, close in enumerate(closes)]
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return False
+
+            def is_1h_uptrend(self, symbol):
+                return False
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.35
+
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.95,
+            volatility_ratio=0.009,
+            trend_strength=0.012,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 0.72,
+                "stretch_from_mean": -0.004,
+                "directional_efficiency": 0.36,
+                "pullback_score": 2.45,
+                "trend_persistence": 0.34,
+                "entry_zscore": -1.20,
+                "realized_vol_percentile": 0.40,
+            },
+        )
+        strategy = TrendPullbackStrategy(
+            BotConfig(
+                trading_mode="spot",
+                spot_core_partial_htf_enabled=False,
+                spot_core_htf_fallback_enabled=False,
+            ),
+            StrategyExchangeStub({"15m": candles_15m}),
+            Helpers(),
+        )
+
+        proposal = strategy.evaluate("BNB/USDT", regime)
+
+        self.assertIsNotNone(proposal)
+        self.assertEqual(proposal.signal.metadata.get("strategy_variant"), "spot_core_local_structure_pullback")
+        self.assertTrue(proposal.signal.metadata.get("liquid_value_bridge_used"))
+
+    def test_spot_core_pullback_liquid_value_bridge_requires_real_quality(self):
+        closes = [
+            100.0, 100.5, 101.1, 101.8, 102.5, 103.2, 103.8, 104.4, 105.1, 105.8,
+            106.5, 107.2, 107.8, 108.5, 109.1, 109.8, 110.5, 111.1, 111.8, 112.4,
+            113.1, 113.7, 114.3, 115.0, 115.6, 116.2, 116.8, 117.4, 118.0, 118.6,
+            119.0, 118.6, 118.2, 117.8, 117.4, 117.1, 116.9, 116.8, 116.75, 116.72,
+        ]
+        candles_15m = [[float(idx), close - 0.22, close + 0.24, close - 0.32, close, 2100.0] for idx, close in enumerate(closes)]
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return False
+
+            def is_1h_uptrend(self, symbol):
+                return False
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.35
+
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.95,
+            volatility_ratio=0.009,
+            trend_strength=0.012,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 0.60,
+                "stretch_from_mean": -0.004,
+                "directional_efficiency": 0.22,
+                "pullback_score": 2.10,
+                "trend_persistence": 0.22,
+                "entry_zscore": -0.20,
+                "realized_vol_percentile": 0.40,
+            },
+        )
+        strategy = TrendPullbackStrategy(
+            BotConfig(
+                trading_mode="spot",
+                spot_core_partial_htf_enabled=False,
+                spot_core_htf_fallback_enabled=False,
+            ),
+            StrategyExchangeStub({"15m": candles_15m}),
+            Helpers(),
+        )
+
+        proposal = strategy.evaluate("BNB/USDT", regime)
+
+        self.assertIsNone(proposal)
+        self.assertEqual(strategy.last_rejection_reason, "bullish_higher_timeframe_not_aligned")
+
+    def test_spot_core_pullback_records_shape_rejection_details(self):
+        closes = [
+            100.0, 100.5, 101.1, 101.8, 102.5, 103.2, 103.8, 104.4, 105.1, 105.8,
+            106.5, 107.2, 107.8, 108.5, 109.1, 109.8, 110.5, 111.1, 111.8, 112.4,
+            113.1, 113.7, 114.3, 115.0, 115.6, 116.2, 116.8, 117.4, 118.0, 118.6,
+            119.0, 118.6, 118.2, 117.8, 117.4, 117.1, 116.9, 116.8, 116.75, 115.6,
+        ]
+        candles_15m = [[float(idx), close - 0.22, close + 0.24, close - 0.32, close, 2100.0] for idx, close in enumerate(closes)]
+        candles_15m[-1] = [float(len(closes) - 1), 115.80, 116.05, 115.55, 115.60, 2100.0]
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return False
+
+            def is_1h_uptrend(self, symbol):
+                return False
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.35
+
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.95,
+            volatility_ratio=0.009,
+            trend_strength=0.012,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 0.72,
+                "stretch_from_mean": -0.004,
+                "directional_efficiency": 0.36,
+                "pullback_score": 2.45,
+                "trend_persistence": 0.34,
+                "entry_zscore": -1.20,
+                "realized_vol_percentile": 0.40,
+            },
+        )
+        strategy = TrendPullbackStrategy(
+            BotConfig(
+                trading_mode="spot",
+                spot_core_partial_htf_enabled=False,
+                spot_core_htf_fallback_enabled=False,
+            ),
+            StrategyExchangeStub({"15m": candles_15m}),
+            Helpers(),
+        )
+
+        proposal = strategy.evaluate("BNB/USDT", regime)
+
+        self.assertIsNone(proposal)
+        self.assertEqual(strategy.last_rejection_reason, "bullish_pullback_shape_not_qualified")
+        self.assertEqual(strategy.last_rejection_details["primary_detail"], "close_location_low")
+        self.assertTrue(strategy.last_rejection_details["liquid_value_bridge_used"])
+
+    def test_spot_core_pullback_records_htf_rejection_details(self):
+        closes = [
+            100.0, 100.5, 101.1, 101.8, 102.5, 103.2, 103.8, 104.4, 105.1, 105.8,
+            106.5, 107.2, 107.8, 108.5, 109.1, 109.8, 110.5, 111.1, 111.8, 112.4,
+            113.1, 113.7, 114.3, 115.0, 115.6, 116.2, 116.8, 117.4, 118.0, 118.6,
+            119.0, 118.6, 118.2, 117.8, 117.4, 117.1, 116.9, 116.8, 116.75, 116.72,
+        ]
+        candles_15m = [[float(idx), close - 0.22, close + 0.24, close - 0.32, close, 2100.0] for idx, close in enumerate(closes)]
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return False
+
+            def is_1h_uptrend(self, symbol):
+                return False
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.35
+
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.95,
+            volatility_ratio=0.009,
+            trend_strength=0.012,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 0.55,
+                "stretch_from_mean": -0.004,
+                "directional_efficiency": 0.36,
+                "pullback_score": 2.45,
+                "trend_persistence": 0.34,
+                "entry_zscore": -1.20,
+                "realized_vol_percentile": 0.40,
+            },
+        )
+        strategy = TrendPullbackStrategy(
+            BotConfig(
+                trading_mode="spot",
+                spot_core_partial_htf_enabled=False,
+                spot_core_htf_fallback_enabled=False,
+            ),
+            StrategyExchangeStub({"15m": candles_15m}),
+            Helpers(),
+        )
+
+        proposal = strategy.evaluate("BNB/USDT", regime)
+
+        self.assertIsNone(proposal)
+        self.assertEqual(strategy.last_rejection_reason, "bullish_higher_timeframe_not_aligned")
+        self.assertEqual(strategy.last_rejection_details["primary_detail"], "volume_impulse_below_value_bridge")
+
+    def test_spot_core_pullback_records_regime_rejection_details(self):
+        closes = [
+            100.0, 100.5, 101.1, 101.8, 102.5, 103.2, 103.8, 104.4, 105.1, 105.8,
+            106.5, 107.2, 107.8, 108.5, 109.1, 109.8, 110.5, 111.1, 111.8, 112.4,
+            113.1, 113.7, 114.3, 115.0, 115.6, 116.2, 116.8, 117.4, 118.0, 118.6,
+            119.0, 118.6, 118.2, 117.8, 117.4, 117.1, 116.9, 116.8, 116.75, 116.72,
+        ]
+        candles_15m = [[float(idx), close - 0.22, close + 0.24, close - 0.32, close, 2100.0] for idx, close in enumerate(closes)]
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return False
+
+            def is_1h_uptrend(self, symbol):
+                return False
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.35
+
+        regime = RegimeAssessment(
+            regime="low_liquidity",
+            confidence=0.82,
+            volatility_ratio=0.009,
+            trend_strength=0.012,
+            liquidity_score=0.52,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 0.52,
+                "stretch_from_mean": -0.004,
+                "directional_efficiency": 0.36,
+                "pullback_score": 2.45,
+                "trend_persistence": 0.34,
+                "entry_zscore": -1.20,
+                "realized_vol_percentile": 0.40,
+            },
+        )
+        strategy = TrendPullbackStrategy(BotConfig(trading_mode="spot"), StrategyExchangeStub({"15m": candles_15m}), Helpers())
+
+        proposal = strategy.evaluate("BNB/USDT", regime)
+
+        self.assertIsNone(proposal)
+        self.assertEqual(strategy.last_rejection_reason, "regime_not_trend")
+        self.assertEqual(strategy.last_rejection_details["primary_detail"], "low_liquidity_regime")
+
+    def test_spot_core_pullback_liquid_value_bridge_records_near_stack_support(self):
+        closes = [
+            100.0, 100.5, 101.1, 101.8, 102.5, 103.2, 103.8, 104.4, 105.1, 105.8,
+            106.5, 107.2, 107.8, 108.5, 109.1, 109.8, 110.5, 111.1, 111.8, 112.4,
+            113.1, 113.7, 114.3, 115.0, 115.6, 116.2, 116.8, 117.4, 118.0, 118.6,
+            119.0, 118.6, 118.2, 117.8, 117.4, 117.1, 116.9, 116.8, 116.75, 116.72,
+        ]
+        candles_15m = [[float(idx), close - 0.22, close + 0.24, close - 0.32, close, 2100.0] for idx, close in enumerate(closes)]
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return False
+
+            def is_1h_uptrend(self, symbol):
+                return False
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.35
+
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.95,
+            volatility_ratio=0.009,
+            trend_strength=0.012,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 0.72,
+                "stretch_from_mean": -0.004,
+                "directional_efficiency": 0.36,
+                "pullback_score": 2.45,
+                "trend_persistence": 0.34,
+                "entry_zscore": -1.20,
+                "realized_vol_percentile": 0.40,
+            },
+        )
+        strategy = TrendPullbackStrategy(
+            BotConfig(
+                trading_mode="spot",
+                spot_core_partial_htf_enabled=False,
+                spot_core_htf_fallback_enabled=False,
+                spot_core_liquid_value_pullback_max_fast_slow_gap_atr=99.0,
+            ),
+            StrategyExchangeStub({"15m": candles_15m}),
+            Helpers(),
+        )
+
+        proposal = strategy.evaluate("BNB/USDT", regime)
+
+        self.assertIsNotNone(proposal)
+        self.assertTrue(proposal.signal.metadata.get("liquid_value_bridge_used"))
+        self.assertTrue(proposal.signal.metadata.get("liquid_value_near_stack"))
+
+    def test_spot_core_pullback_does_not_hard_reject_choppy_core_regime(self):
+        closes = [
+            100.0, 100.6, 101.2, 101.9, 102.6, 103.2, 103.9, 104.5, 105.2, 105.9,
+            106.6, 107.2, 107.9, 108.7, 109.4, 110.1, 110.8, 111.5, 112.2, 112.9,
+            113.6, 114.3, 115.0, 115.7, 116.4, 117.1, 117.8, 118.5, 119.2, 119.9,
+            120.2, 120.0, 119.9, 119.82, 119.76, 119.72, 119.70, 119.69, 119.71, 119.74,
+        ]
+        candles_15m = [[float(idx), close - 0.22, close + 0.42, close - 0.42, close, 2100.0] for idx, close in enumerate(closes)]
+
+        class Helpers:
+            def is_4h_bullish(self, symbol):
+                return False
+
+            def is_1h_uptrend(self, symbol):
+                return False
+
+            def is_4h_bearish(self, symbol):
+                return False
+
+            def is_1h_downtrend(self, symbol):
+                return False
+
+            def compute_atr(self, symbol, timeframe="15m", period=14):
+                return 1.15
+
+        regime = RegimeAssessment(
+            regime="choppy",
+            confidence=0.60,
+            volatility_ratio=0.009,
+            trend_strength=0.004,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={
+                "trend_direction": "bullish",
+                "volume_impulse": 0.80,
+                "stretch_from_mean": 0.010,
+                "directional_efficiency": 0.05,
+                "pullback_score": 1.10,
+                "trend_persistence": 0.30,
+                "entry_zscore": 0.10,
+                "realized_vol_percentile": 0.55,
+            },
+        )
+        strategy = TrendPullbackStrategy(BotConfig(trading_mode="spot"), StrategyExchangeStub({"15m": candles_15m}), Helpers())
+
+        proposal = strategy.evaluate("BTC/USDT", regime)
+
+        self.assertIsNone(proposal)
+        self.assertNotEqual(strategy.last_rejection_reason, "regime_not_trend")
+
     def test_trend_pullback_strategy_prefers_shallow_profile_in_contained_volatility(self):
         class ShallowHelpers:
             def is_4h_bullish(self, symbol):
@@ -6588,6 +10990,44 @@ class TradeBotCoreTests(unittest.TestCase):
         self.assertIn("suppressed_family", assessment.metadata)
         self.assertIn("rotation_confidence", assessment.metadata)
 
+    def test_market_regime_engine_classifies_constructive_spot_core_pullback_as_trending(self):
+        candles_1h = []
+        candles_15m = []
+        base = 100.0
+        for idx in range(60):
+            close = base + (idx * 0.05)
+            candles_1h.append([float(idx), close - 0.18, close + 0.24, close - 0.22, close, 1500.0])
+        for idx in range(60):
+            close = base + (idx * 0.09)
+            if idx >= 52:
+                close -= 0.10
+            candles_15m.append([float(idx), close - 0.08, close + 0.16, close - 0.12, close, 1800.0 if idx >= 54 else 1400.0])
+
+        class ExchangeStub:
+            def fetch_ohlcv(self, symbol, timeframe, limit=60):
+                if timeframe == "1h":
+                    return candles_1h[-limit:]
+                return candles_15m[-limit:]
+
+            def get_order_book(self, symbol):
+                last_close = float(candles_15m[-1][4])
+                return {"bid": last_close * 0.9995, "ask": last_close * 1.0005}
+
+        config = BotConfig(
+            trading_mode="spot",
+            regime_trend_score_threshold=99.0,
+            spot_core_constructive_regime_min_pullback_score=1.20,
+            spot_core_constructive_regime_min_trend_persistence=0.40,
+            spot_core_constructive_regime_min_volume_impulse=1.00,
+            spot_core_constructive_regime_min_directional_efficiency=0.10,
+            spot_core_constructive_regime_max_volatility_percentile=0.90,
+        )
+        assessment = MarketRegimeEngine(config, ExchangeStub()).classify("XRP/USDT")
+
+        self.assertEqual(assessment.regime, "trending")
+        self.assertTrue(assessment.metadata.get("constructive_spot_core_regime"))
+        self.assertEqual(assessment.metadata.get("symbol_bucket"), "exchange_beta")
+
     def test_market_regime_engine_emits_pullback_biased_rotation_under_crash_risk(self):
         candles_1h = []
         candles_15m = []
@@ -6965,6 +11405,103 @@ class TradeBotCoreTests(unittest.TestCase):
         }
 
         self.assertTrue(SignalEngine._passes_reliability_checks(bot, "BTC/USDT", signal, regime, 2))
+
+    def test_reliability_checks_relax_calibration_for_high_quality_pullback(self):
+        engine = SignalEngine(BotConfig(), DummyExchange())
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.85,
+            volatility_ratio=0.01,
+            trend_strength=0.02,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={"trend_direction": "bullish"},
+        )
+        signal = {
+            "side": "long",
+            "entry_price": 100.0,
+            "stop_loss": 98.0,
+            "take_profit": 103.4,
+            "strategy": "trend_pullback",
+            "signal_quality": 0.76,
+            "expected_edge_bps": 22.0,
+            "rr_ratio": 1.7,
+            "hurst_exponent": 0.55,
+            "research_context": {},
+            "metadata": {
+                "pullback_score": 2.5,
+                "trend_persistence": 0.52,
+                "volume_impulse": 1.05,
+                "directional_efficiency": 0.42,
+                "realized_vol_percentile": 0.35,
+                "liquidity_score": 1.0,
+                "entry_zscore": -0.20,
+                "learning_context": {
+                    "veto": False,
+                    "calibration": {
+                        "effective_samples": 8.0,
+                        "calibrated_confidence": 0.45,
+                    },
+                    "opportunity": {
+                        "samples": 0.0,
+                        "avg_forward_r": 0.0,
+                    },
+                },
+            },
+        }
+
+        self.assertTrue(engine._passes_reliability_checks("BTC/USDT", signal, regime, proposal_count=1))
+
+    def test_reliability_checks_keep_calibration_gate_for_low_quality_pullback(self):
+        engine = SignalEngine(BotConfig(), DummyExchange())
+        regime = RegimeAssessment(
+            regime="trending",
+            confidence=0.85,
+            volatility_ratio=0.01,
+            trend_strength=0.02,
+            liquidity_score=1.0,
+            event_risk=False,
+            unstable=False,
+            metadata={"trend_direction": "bullish"},
+        )
+        signal = {
+            "side": "long",
+            "entry_price": 100.0,
+            "stop_loss": 98.0,
+            "take_profit": 103.4,
+            "strategy": "trend_pullback",
+            "signal_quality": 0.76,
+            "expected_edge_bps": 22.0,
+            "rr_ratio": 1.7,
+            "hurst_exponent": 0.55,
+            "research_context": {},
+            "metadata": {
+                "pullback_score": 1.4,
+                "trend_persistence": 0.28,
+                "volume_impulse": 0.70,
+                "directional_efficiency": 0.18,
+                "realized_vol_percentile": 0.70,
+                "liquidity_score": 0.82,
+                "entry_zscore": 0.40,
+                "learning_context": {
+                    "veto": False,
+                    "calibration": {
+                        "effective_samples": 8.0,
+                        "calibrated_confidence": 0.47,
+                    },
+                    "opportunity": {
+                        "samples": 0.0,
+                        "avg_forward_r": 0.0,
+                    },
+                },
+            },
+        }
+
+        self.assertEqual(
+            engine._reliability_rejection_reason("BTC/USDT", signal, regime, proposal_count=1),
+            "calibrated_confidence_too_low",
+        )
 
     def test_signal_engine_rejects_low_regime_confidence_signal(self):
         engine = SignalEngine(BotConfig(), DummyExchange())

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import re
 import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -75,6 +76,13 @@ def _normalize_timestamp(value: Any) -> "pd.Timestamp":
     if ts.tzinfo is not None:
         ts = ts.tz_convert("UTC").tz_localize(None)
     return ts
+
+
+def _empty_ohlcv_frame() -> "pd.DataFrame":
+    _require_pandas()
+    frame = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    frame.index = pd.DatetimeIndex([], name="timestamp")
+    return frame
 
 
 def _as_utc(now: dt.datetime) -> dt.datetime:
@@ -456,10 +464,18 @@ class SimulatedExecutionVenue:
         order_type = self._order_type_for_signal(signal)
         requested_price = self._requested_price_for_signal(signal, order_type=order_type)
         queue_ahead_fraction = self.rng.uniform(0.12, 0.92) if order_type == "limit" else 0.0
+        signal_metadata = dict(signal.get("metadata", {}) or {})
+        urgent_limit = order_type == "limit" and bool(signal_metadata.get("urgent_limit_execution", False))
         if order_type == "limit":
             strategy = str(signal.get("strategy", "unknown") or "unknown")
             signal_quality = float(signal.get("signal_quality", 0.0) or 0.0)
             expected_edge_bps = float(signal.get("expected_edge_bps", 0.0) or 0.0)
+            if urgent_limit:
+                queue_ahead_fraction = min(
+                    queue_ahead_fraction,
+                    max(float(getattr(self.config, "simulation_execution_urgent_limit_queue_cap", 0.18) or 0.18), 0.0),
+                )
+                signal_metadata["limit_queue_priority_assist"] = True
             if strategy in {"trend_pullback", "trend_breakout"}:
                 quality_floor = float(
                     getattr(
@@ -477,9 +493,9 @@ class SimulatedExecutionVenue:
                 )
                 if signal_quality >= quality_floor and expected_edge_bps >= edge_floor:
                     queue_ahead_fraction = min(queue_ahead_fraction, 0.28)
-                    signal_metadata = dict(signal.get("metadata", {}) or {})
                     signal_metadata["limit_queue_priority_assist"] = True
                     signal["metadata"] = signal_metadata
+            signal["metadata"] = signal_metadata
         latency_floor = max(int(getattr(self.config, "backtest_latency_bars", 1)), 1)
         latency_jitter = max(int(getattr(self.config, "simulation_latency_jitter_bars", 0)), 0)
         latency_bars = max(latency_floor + (self.rng.randint(0, latency_jitter) if latency_jitter else 0), 1)
@@ -487,6 +503,13 @@ class SimulatedExecutionVenue:
             strategy = str(signal.get("strategy", "unknown") or "unknown")
             signal_quality = float(signal.get("signal_quality", 0.0) or 0.0)
             expected_edge_bps = float(signal.get("expected_edge_bps", 0.0) or 0.0)
+            if urgent_limit:
+                latency_bars = min(
+                    latency_bars,
+                    max(int(getattr(self.config, "simulation_execution_urgent_limit_latency_bars", 1) or 1), 1),
+                )
+                signal_metadata["limit_latency_reduced"] = True
+                signal["metadata"] = signal_metadata
             if strategy in {"trend_pullback", "trend_breakout"} and latency_bars > 1:
                 quality_floor = float(
                     getattr(
@@ -532,6 +555,8 @@ class SimulatedExecutionVenue:
             signal=dict(signal),
             metadata={
                 "original_preferred_order_type": str(dict(signal.get("metadata", {}) or {}).get("preferred_order_type", "")),
+                "urgent_limit_execution": urgent_limit,
+                "execution_urgency_score": float(dict(signal.get("metadata", {}) or {}).get("execution_urgency_score", 0.0) or 0.0),
                 "limit_to_market_upgrade": bool(
                     order_type == "market"
                     and str(dict(signal.get("metadata", {}) or {}).get("preferred_order_type", "")).lower() == "limit"
@@ -554,23 +579,62 @@ class SimulatedExecutionVenue:
     def _order_type_for_signal(self, signal: Dict[str, Any]) -> str:
         metadata = dict(signal.get("metadata", {}) or {})
         preferred = str(metadata.get("preferred_order_type", "")).lower()
+        urgency = self._execution_urgency_score(signal)
+        metadata["execution_urgency_score"] = urgency
+        signal["metadata"] = metadata
+        strategy = str(signal.get("strategy", metadata.get("strategy", "unknown")) or "unknown")
+        pullback_market_enabled = strategy != "trend_pullback" or bool(getattr(self.config, "simulation_pullback_aggressive_market_enabled", False))
+        spread_bps = float(metadata.get("spread_bps", 0.0) or 0.0)
+        spread_guard = float(getattr(self.config, "simulation_execution_urgency_spread_guard_bps", 18.0) or 18.0)
+        pullback_shape_ok = strategy != "trend_pullback" or self._pullback_aggressive_execution_shape_ok(metadata)
+        if pullback_market_enabled and pullback_shape_ok and urgency >= float(getattr(self.config, "simulation_execution_urgency_market_threshold", 0.84) or 0.84) and spread_bps <= spread_guard:
+            return "market"
         if preferred == "market":
             return preferred
         if preferred == "limit" and self._should_upgrade_limit_to_market(signal):
             return "market"
         if preferred == "limit":
+            if self._should_use_urgent_limit(signal):
+                metadata = dict(signal.get("metadata", {}) or {})
+                metadata["urgent_limit_execution"] = True
+                signal["metadata"] = metadata
             return preferred
         if bool(metadata.get("force_limit_entry", False)):
             return "limit"
         return "market" if bool(signal.get("fast_move", False)) else "limit"
+
+    def _should_use_urgent_limit(self, signal: Dict[str, Any]) -> bool:
+        metadata = dict(signal.get("metadata", {}) or {})
+        if bool(metadata.get("force_limit_entry", False)):
+            return False
+        strategy = str(signal.get("strategy", metadata.get("strategy", "unknown")) or "unknown")
+        if strategy not in {"trend_pullback", "trend_breakout", "mean_reversion"}:
+            return False
+        urgency = float(metadata.get("execution_urgency_score", self._execution_urgency_score(signal)) or 0.0)
+        if urgency < float(getattr(self.config, "simulation_execution_urgent_limit_threshold", 0.72) or 0.72):
+            return False
+        spread_bps = float(metadata.get("spread_bps", 0.0) or 0.0)
+        if spread_bps > float(getattr(self.config, "simulation_execution_urgency_spread_guard_bps", 18.0) or 18.0):
+            return False
+        if strategy == "trend_pullback" and not self._pullback_aggressive_execution_shape_ok(metadata):
+            return False
+        return True
 
     def _should_upgrade_limit_to_market(self, signal: Dict[str, Any]) -> bool:
         metadata = dict(signal.get("metadata", {}) or {})
         strategy = str(signal.get("strategy", metadata.get("strategy", "unknown")) or "unknown")
         if strategy not in {"trend_pullback", "mean_reversion", "trend_breakout"}:
             return False
+        if strategy == "trend_pullback" and not bool(getattr(self.config, "simulation_pullback_aggressive_market_enabled", False)):
+            return False
         if bool(metadata.get("force_limit_entry", False)):
             return False
+        if float(metadata.get("execution_urgency_score", self._execution_urgency_score(signal)) or 0.0) >= float(
+            getattr(self.config, "simulation_execution_urgency_market_threshold", 0.84) or 0.84
+        ):
+            spread_bps = float(metadata.get("spread_bps", 0.0) or 0.0)
+            if spread_bps <= float(getattr(self.config, "simulation_execution_urgency_spread_guard_bps", 18.0) or 18.0):
+                return True
         signal_quality = float(signal.get("signal_quality", 0.0) or 0.0)
         expected_edge_bps = float(signal.get("expected_edge_bps", 0.0) or 0.0)
         rr_ratio = float(signal.get("rr_ratio", 0.0) or 0.0)
@@ -615,6 +679,9 @@ class SimulatedExecutionVenue:
         distance_bps = abs(entry_price - mid_price) / mid_price * 10000.0
         if distance_bps > max_distance_bps:
             return False
+        if strategy == "trend_pullback":
+            if not self._pullback_aggressive_execution_shape_ok(metadata):
+                return False
         liquidity_score = float(metadata.get("liquidity_score", 0.0) or 0.0)
         if strategy == "mean_reversion" and liquidity_score < 0.55:
             return False
@@ -625,6 +692,13 @@ class SimulatedExecutionVenue:
         if strategy == suppressed_family:
             return False
         return True
+
+    def _pullback_aggressive_execution_shape_ok(self, metadata: Dict[str, Any]) -> bool:
+        close_location = float(metadata.get("entry_close_location", 0.0) or 0.0)
+        body_fraction = float(metadata.get("entry_body_fraction", 0.0) or 0.0)
+        min_close_location = float(getattr(self.config, "simulation_pullback_aggressive_min_close_location", 0.52) or 0.52)
+        min_body_fraction = float(getattr(self.config, "simulation_pullback_aggressive_min_body_fraction", 0.18) or 0.18)
+        return close_location >= min_close_location and body_fraction >= min_body_fraction
 
     def _requested_price_for_signal(self, signal: Dict[str, Any], *, order_type: str) -> float:
         entry_price = float(signal.get("entry_price", 0.0) or 0.0)
@@ -650,6 +724,11 @@ class SimulatedExecutionVenue:
                 offset_bps - float(getattr(self.config, "simulation_high_quality_limit_offset_tightening_bps", 2.0) or 2.0),
                 0.5,
             )
+        urgency = float(metadata.get("execution_urgency_score", self._execution_urgency_score(signal)) or 0.0)
+        if urgency >= float(getattr(self.config, "simulation_execution_urgency_marketable_limit_threshold", 0.68) or 0.68):
+            offset_bps *= max(0.20, 1.0 - urgency)
+        if bool(metadata.get("urgent_limit_execution", False)):
+            offset_bps *= max(float(getattr(self.config, "simulation_execution_urgent_limit_offset_multiplier", 0.25) or 0.25), 0.0)
         if offset_bps <= 0.0:
             return entry_price
         raw_offset = entry_price * (offset_bps / 10000.0)
@@ -664,6 +743,29 @@ class SimulatedExecutionVenue:
         if side in {"short", "sell"}:
             return max(entry_price + raw_offset, 1e-9)
         return entry_price
+
+    def _execution_urgency_score(self, signal: Dict[str, Any]) -> float:
+        metadata = dict(signal.get("metadata", {}) or {})
+        strategy = str(signal.get("strategy", "unknown") or "unknown")
+        quality = float(signal.get("signal_quality", 0.0) or 0.0)
+        edge = float(signal.get("expected_edge_bps", 0.0) or 0.0)
+        liquidity_score = float(metadata.get("liquidity_score", 0.0) or 0.0)
+        spread_bps = float(metadata.get("spread_bps", 0.0) or 0.0)
+        fast_move = bool(signal.get("fast_move", False))
+        rotation_policy = dict(metadata.get("rotation_policy", {}) or {})
+        preferred_family = str(metadata.get("preferred_family", rotation_policy.get("preferred_family", "")) or "")
+        score = (quality * 0.48) + min(edge / 40.0, 1.0) * 0.22 + min(liquidity_score, 1.0) * 0.18
+        if fast_move:
+            score += 0.08
+        if strategy == "trend_breakout":
+            score += float(getattr(self.config, "simulation_execution_urgency_breakout_bonus", 0.08) or 0.08)
+        if strategy == "trend_pullback":
+            score -= float(getattr(self.config, "simulation_execution_urgency_pullback_penalty", 0.04) or 0.04)
+        if strategy == preferred_family:
+            score += 0.05
+        if spread_bps > float(getattr(self.config, "simulation_execution_urgency_spread_guard_bps", 18.0) or 18.0):
+            score -= 0.12
+        return max(0.0, min(score, 1.0))
 
     def _limit_expiry_bars_for_signal(self, signal: Dict[str, Any]) -> int:
         metadata = dict(signal.get("metadata", {}) or {})
@@ -1117,6 +1219,8 @@ class SimulatedExecutionVenue:
         bar_range = max(high - low, price * 1e-6)
         touch_depth = 1.0 - min(abs(close - price) / bar_range, 1.0)
         base = 0.9 if order.order_type == "market" else 0.55
+        if order.order_type == "limit" and bool(order.metadata.get("urgent_limit_execution", False)):
+            base += max(float(getattr(self.config, "simulation_execution_urgent_limit_liquidity_bonus", 0.12) or 0.12), 0.0)
         if passive_fill:
             base += 0.15 * touch_depth
         if (order.side in {"long", "buy"} and open_price <= price) or (order.side not in {"long", "buy"} and open_price >= price):
@@ -1197,6 +1301,7 @@ class HistoricalSimulationEngine:
         self._simulation_symbol_universe: list[str] = []
         self._base_timeframe = str(getattr(config, "timeframes", {}).get("entry", "15m"))
         self._campaign_days = 0
+        self._historical_data_rows: Dict[str, int] = {}
         self._progress_callback = progress_callback
         self._stop_requested = stop_requested
         self._stopped_early = False
@@ -1205,34 +1310,86 @@ class HistoricalSimulationEngine:
         self._checkpoint_path = os.path.join(self.artifact_dir, "simulation_checkpoint.json")
         self._artifact_manifest_path = os.path.join(self.artifact_dir, "simulation_artifacts.json")
 
+    def _historical_cache_path(self, symbol: str, timeframe: str, days: int) -> str:
+        raw_cache_dir = str(getattr(self.config, "historical_data_cache_dir", "data/historical_cache") or "data/historical_cache")
+        cache_dir = raw_cache_dir if os.path.isabs(raw_cache_dir) else os.path.abspath(raw_cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+        safe_symbol = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(symbol or "unknown")).strip("_") or "unknown"
+        safe_timeframe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(timeframe or "unknown")).strip("_") or "unknown"
+        return os.path.join(cache_dir, f"{safe_symbol}_{safe_timeframe}_{int(days)}d.csv")
+
+    def _read_historical_cache(self, symbol: str, timeframe: str, days: int, *, require_fresh: bool) -> "pd.DataFrame":
+        _require_pandas()
+        if not bool(getattr(self.config, "historical_data_cache_enabled", True)):
+            return pd.DataFrame()
+        cache_path = self._historical_cache_path(symbol, timeframe, days)
+        if not os.path.exists(cache_path):
+            return pd.DataFrame()
+        if require_fresh:
+            max_age_hours = float(getattr(self.config, "historical_data_cache_max_staleness_hours", 168.0) or 168.0)
+            age_hours = (dt.datetime.now(dt.timezone.utc).timestamp() - os.path.getmtime(cache_path)) / 3600.0
+            if max_age_hours >= 0.0 and age_hours > max_age_hours:
+                return pd.DataFrame()
+        try:
+            frame = pd.read_csv(cache_path, parse_dates=["timestamp"])
+        except Exception:
+            return pd.DataFrame()
+        if frame.empty:
+            return frame
+        frame.set_index("timestamp", inplace=True)
+        return _normalize_ohlcv_frame(frame)
+
+    def _write_historical_cache(self, symbol: str, timeframe: str, days: int, frame: "pd.DataFrame") -> None:
+        _require_pandas()
+        if not bool(getattr(self.config, "historical_data_cache_enabled", True)) or frame.empty:
+            return
+        cache_path = self._historical_cache_path(symbol, timeframe, days)
+        try:
+            output = _normalize_ohlcv_frame(frame).reset_index()
+            output.rename(columns={output.columns[0]: "timestamp"}, inplace=True)
+            output.to_csv(cache_path, index=False)
+        except Exception:
+            return
+
     def load_historical_data(self, symbol: str, timeframe: str, days: int = 180) -> "pd.DataFrame":
         _require_pandas()
         import ccxt
 
+        cached = self._read_historical_cache(symbol, timeframe, days, require_fresh=True)
+        if not cached.empty:
+            return cached
         exchange = ccxt.binance({"enableRateLimit": True})
-        end_ts = pd.Timestamp.utcnow().tz_localize(None)
+        end_ts = pd.Timestamp.now(tz="UTC").tz_localize(None)
         start_ts = end_ts - pd.Timedelta(days=days)
         since = int(start_ts.timestamp() * 1000)
         end_ms = int(end_ts.timestamp() * 1000)
         ohlcv: list[list[Any]] = []
         seen: set[int] = set()
-        while since < end_ms:
-            batch = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
-            if not batch:
-                break
-            rows = [row for row in batch if int(row[0]) not in seen]
-            if not rows:
-                break
-            seen.update(int(row[0]) for row in rows)
-            ohlcv.extend(rows)
-            since = int(rows[-1][0]) + 1
-            if len(batch) < 1000:
-                break
+        try:
+            while since < end_ms:
+                batch = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+                if not batch:
+                    break
+                rows = [row for row in batch if int(row[0]) not in seen]
+                if not rows:
+                    break
+                seen.update(int(row[0]) for row in rows)
+                ohlcv.extend(rows)
+                since = int(rows[-1][0]) + 1
+                if len(batch) < 1000:
+                    break
+        except Exception:
+            fallback = self._read_historical_cache(symbol, timeframe, days, require_fresh=False)
+            if not fallback.empty:
+                return fallback
+            return _empty_ohlcv_frame()
         frame = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
         if frame.empty:
             return frame
         frame["timestamp"] = pd.to_datetime(frame["timestamp"], unit="ms")
         frame.set_index("timestamp", inplace=True)
+        frame = _normalize_ohlcv_frame(frame)
+        self._write_historical_cache(symbol, timeframe, days, frame)
         return frame
 
     def build_historical_universe(self, symbols: Sequence[str], timeframe: str, days: int) -> HistoricalDataUniverse:
@@ -1240,10 +1397,12 @@ class HistoricalSimulationEngine:
         required_timeframes = {timeframe}
         required_timeframes.update(str(tf) for tf in getattr(self.config, "timeframes", {}).values())
         datasets: Dict[tuple[str, str], pd.DataFrame] = {}
+        self._historical_data_rows = {}
         for symbol in symbols:
             base = self.load_historical_data(symbol, timeframe, days)
             base = _normalize_ohlcv_frame(base)
             datasets[(symbol, timeframe)] = base
+            self._historical_data_rows[f"{symbol}:{timeframe}"] = int(len(base))
             for target_tf in required_timeframes:
                 if target_tf == timeframe:
                     continue
@@ -1254,6 +1413,7 @@ class HistoricalSimulationEngine:
                 else:
                     loaded = self.load_historical_data(symbol, target_tf, days)
                     datasets[(symbol, target_tf)] = _normalize_ohlcv_frame(loaded)
+                self._historical_data_rows[f"{symbol}:{target_tf}"] = int(len(datasets[(symbol, target_tf)]))
         return HistoricalDataUniverse(datasets, base_timeframe=timeframe)
 
     def _reset_run_state(self) -> None:
@@ -1280,10 +1440,42 @@ class HistoricalSimulationEngine:
         self._generation_outcomes: Dict[str, int] = {}
         self._generation_outcomes_by_symbol: Dict[str, Dict[str, int]] = {}
         self._generation_reasons_by_symbol: Dict[str, Dict[str, int]] = {}
+        self._replacement_candidates_seen: int = 0
+        self._replacement_candidates_selected: int = 0
+        self._replacement_candidates_by_strategy: Dict[str, int] = {}
+        self._replacement_selected_by_strategy: Dict[str, int] = {}
+        self._replacement_rejections_by_reason: Dict[str, int] = {}
+        self._replacement_candidates_by_symbol: Dict[str, int] = {}
+        self._replacement_cross_symbol_selected: int = 0
+        self._replacement_cross_symbol_selected_by_strategy: Dict[str, int] = {}
+        self._replacement_near_misses_seen: int = 0
+        self._replacement_near_misses_by_strategy: Dict[str, int] = {}
+        self._replacement_near_misses_by_symbol: Dict[str, int] = {}
+        self._replacement_near_misses_by_reason: Dict[str, int] = {}
+        self._replacement_near_misses_by_detail: Dict[str, int] = {}
+        self._replacement_near_miss_examples: list[Dict[str, Any]] = []
+        self._replacement_submitted: int = 0
+        self._replacement_filled: int = 0
+        self._replacement_closed: int = 0
+        self._replacement_wins: int = 0
+        self._replacement_losses: int = 0
+        self._replacement_submitted_by_strategy: Dict[str, int] = {}
+        self._replacement_filled_by_strategy: Dict[str, int] = {}
+        self._replacement_closed_by_strategy: Dict[str, int] = {}
+        self._replacement_wins_by_strategy: Dict[str, int] = {}
+        self._replacement_losses_by_strategy: Dict[str, int] = {}
+        self._replacement_guard_blocks: int = 0
+        self._replacement_guard_blocks_by_reason: Dict[str, int] = {}
+        self._replacement_submitted_by_day: Dict[str, int] = {}
+        self._replacement_submitted_by_symbol_day: Dict[str, Dict[str, int]] = {}
+        self._strategy_rejection_reasons_by_symbol: Dict[str, Dict[str, Dict[str, int]]] = {}
         self._proposal_count: int = 0
         self._proposals_by_strategy: Dict[str, int] = {}
         self._frequency_adjustment_counts: Dict[str, int] = {}
         self._frequency_adjustment_counts_by_strategy: Dict[str, Dict[str, int]] = {}
+        self._frequency_expansion_allowed_count: int = 0
+        self._frequency_expansion_blocked_count: int = 0
+        self._frequency_expansion_block_reasons: Dict[str, int] = {}
         self._family_rotation_counts: Dict[str, int] = {}
         self._family_rotation_counts_by_strategy: Dict[str, Dict[str, int]] = {}
         self._family_rotation_recovery_counts: Dict[str, int] = {}
@@ -1325,6 +1517,19 @@ class HistoricalSimulationEngine:
         self._reentry_cooldowns: Dict[str, Dict[str, Any]] = {}
         self._reentry_cooldown_registrations: Dict[str, int] = {}
         self._reentry_cooldown_registrations_by_strategy: Dict[str, Dict[str, int]] = {}
+        self._recent_setup_signatures: Dict[str, Dict[str, Any]] = {}
+        self._repeated_setup_blocks: int = 0
+        self._repeated_setup_blocks_by_strategy: Dict[str, int] = {}
+        self._fresh_setup_blocks: int = 0
+        self._fresh_setup_blocks_by_strategy: Dict[str, int] = {}
+        self._triple_barrier_labels: list[Dict[str, Any]] = []
+        self._triple_barrier_label_counts: Dict[str, int] = {}
+        self._triple_barrier_label_counts_by_strategy: Dict[str, Dict[str, int]] = {}
+        self._triple_barrier_label_counts_by_symbol: Dict[str, Dict[str, int]] = {}
+        self._triple_barrier_bucket_stats: Dict[str, Dict[str, Any]] = {}
+        self._pullback_meta_filter_blocks: int = 0
+        self._pullback_meta_filter_blocks_by_bucket: Dict[str, int] = {}
+        self._pullback_meta_filter_blocks_by_symbol: Dict[str, int] = {}
         self._latest_universe_selection: Dict[str, Any] = {"eligible_symbols": [], "rejected_symbols": {}, "scored_symbols": {}}
         self._raw_signals_by_symbol: Dict[str, int] = {}
         self._submitted_by_symbol: Dict[str, int] = {}
@@ -1572,7 +1777,38 @@ class HistoricalSimulationEngine:
         self._campaign_timeline_start = timeline[0] if timeline else None
         warmup = max(int(getattr(self.config, "backtest_warmup_candles", 100)), 20)
         if len(timeline) <= warmup:
-            return {"error": "Not enough data", "num_bars": len(timeline)}
+            market_data = {
+                "datasets": dict(sorted(self._historical_data_rows.items())),
+                "datasets_loaded": int(sum(1 for rows in self._historical_data_rows.values() if int(rows or 0) > 0)),
+                "datasets_missing": int(sum(1 for rows in self._historical_data_rows.values() if int(rows or 0) <= 0)),
+                "total_rows": int(sum(int(rows or 0) for rows in self._historical_data_rows.values())),
+                "data_available": bool(any(int(rows or 0) > 0 for rows in self._historical_data_rows.values())),
+            }
+            return {
+                "error": "Not enough data",
+                "num_bars": len(timeline),
+                "num_trades": 0,
+                "raw_signals": 0,
+                "total_return_pct": 0.0,
+                "win_rate_pct": 0.0,
+                "campaign_summary": {
+                    "market_data": market_data,
+                    "validation_harness": {
+                        "signal_to_submission_pct": 0.0,
+                        "submission_to_fill_pct": 0.0,
+                        "fill_to_close_pct": 0.0,
+                        "stop_loss_negative_pl_share_pct": 0.0,
+                        "repeated_setup_density_pct": 0.0,
+                        "fresh_setup_block_density_pct": 0.0,
+                        "repeated_setup_blocks": 0,
+                        "fresh_setup_blocks": 0,
+                    },
+                    "acceptance": {
+                        "checks": {"market_data_available": bool(market_data["data_available"])},
+                        "passes_all": False,
+                    },
+                },
+            }
         resume_possible = bool(getattr(self.config, "simulation_resume_from_checkpoint", True)) and os.path.exists(self._checkpoint_path)
         if not resume_possible and os.path.exists(self.state_store.path):
             os.remove(self.state_store.path)
@@ -1619,7 +1855,7 @@ class HistoricalSimulationEngine:
             self._apply_fills(processed["fills"])
             self._expire_orders(processed["expired"])
             self._cancel_orders(processed.get("cancelled", []))
-            self._manage_open_positions(bar_by_symbol, now)
+            self._manage_open_positions(bar_by_symbol, now, current_index=current_index)
             self._scan_signals(symbols, current_index)
             self._persist_progress_snapshot(current_index, len(timeline), timeline)
             self._emit_progress(current_index, len(timeline), now)
@@ -1653,6 +1889,7 @@ class HistoricalSimulationEngine:
         assert self.venue is not None
         symbols = self._eligible_universe_symbols(symbols)
         candidates: list[Dict[str, Any]] = []
+        blocked_replacement_candidates: list[Dict[str, Any]] = []
         for symbol in symbols:
             if self.state.emergency_mode:
                 break
@@ -1668,21 +1905,57 @@ class HistoricalSimulationEngine:
             proposal_strategies = [str(item or "unknown") for item in list(generation.get("proposal_strategies", []) or [])]
             if signal and not proposal_strategies:
                 proposal_strategies = [str(dict(signal).get("strategy", "unknown") or "unknown")]
+            if bool(generation.get("replacement_selected", False)):
+                replacement_strategy = str(generation.get("replacement_selected_strategy", dict(signal or {}).get("strategy", "unknown")) or "unknown")
+                self._replacement_candidates_selected += 1
+                self._increment_counter(self._replacement_selected_by_strategy, replacement_strategy)
             self._proposal_count += len(proposal_strategies)
             for strategy_name in proposal_strategies:
                 self._increment_counter(self._proposals_by_strategy, strategy_name)
             if not signal:
                 outcome = str(generation.get("outcome", "no_signal") or "no_signal")
                 reason = str(generation.get("reason", "no_reason_recorded") or "no_reason_recorded")
+                replacement_candidates = list(generation.get("replacement_candidates", []) or [])
+                if not replacement_candidates and generation.get("replacement_candidate"):
+                    replacement_candidates = [generation.get("replacement_candidate")]
+                for candidate in replacement_candidates:
+                    candidate_payload = dict(candidate or {})
+                    candidate_strategy = str(candidate_payload.get("strategy", "unknown") or "unknown")
+                    candidate_reason = str(candidate_payload.get("rejection_reason", reason) or reason)
+                    self._replacement_candidates_seen += 1
+                    self._increment_counter(self._replacement_candidates_by_strategy, candidate_strategy)
+                    self._increment_counter(self._replacement_candidates_by_symbol, symbol)
+                    self._increment_counter(self._replacement_rejections_by_reason, candidate_reason)
+                    blocked_replacement_candidates.append(candidate_payload)
                 self._increment_counter(self._generation_outcomes, outcome)
                 by_symbol = self._generation_outcomes_by_symbol.setdefault(symbol, {})
                 by_symbol[outcome] = int(by_symbol.get(outcome, 0)) + 1
                 reason_counts = self._generation_reasons_by_symbol.setdefault(symbol, {})
                 reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+                for strategy_name, strategy_reason in dict(generation.get("strategy_rejection_reasons", {}) or {}).items():
+                    self._replacement_near_misses_seen += 1
+                    self._increment_counter(self._replacement_near_misses_by_strategy, str(strategy_name))
+                    self._increment_counter(self._replacement_near_misses_by_symbol, symbol)
+                    self._increment_counter(self._replacement_near_misses_by_reason, str(strategy_reason))
+                    reason_bucket = self._strategy_rejection_reasons_by_symbol.setdefault(symbol, {}).setdefault(str(strategy_name), {})
+                    reason_bucket[str(strategy_reason)] = int(reason_bucket.get(str(strategy_reason), 0)) + 1
+                for candidate in list(generation.get("near_miss_candidates", []) or []):
+                    detail = str(dict(candidate or {}).get("rejection_detail", "") or "")
+                    if detail:
+                        self._increment_counter(self._replacement_near_misses_by_detail, detail)
+                    if len(self._replacement_near_miss_examples) >= 12:
+                        break
+                    self._replacement_near_miss_examples.append(dict(candidate or {}))
                 continue
             self._raw_signals += 1
             signal = dict(signal)
             signal["symbol"] = symbol
+            triple_barrier_label = self._label_triple_barrier_signal(signal)
+            if triple_barrier_label:
+                signal_metadata = dict(signal.get("metadata", {}) or {})
+                signal_metadata["triple_barrier_label"] = triple_barrier_label
+                signal["metadata"] = signal_metadata
+                self._record_triple_barrier_label(signal, triple_barrier_label)
             trace_id = uuid.uuid4().hex
             self._record_event(EVENT_SIGNAL, trace_id, {"symbol": symbol, **signal})
             strategy = str(signal.get("strategy", "unknown"))
@@ -1724,12 +1997,47 @@ class HistoricalSimulationEngine:
             for reason in list(realized_penalty.get("reasons", []) or []):
                 self._increment_counter(self._realized_performance_penalty_counts, str(reason))
                 self._increment_nested_counter(self._realized_performance_penalty_counts_by_strategy, strategy, str(reason))
+            pullback_meta_reason = self._pullback_meta_filter_reason(signal)
+            if pullback_meta_reason is not None:
+                self._pullback_meta_filter_blocks += 1
+                bucket_key = str(dict(signal.get("metadata", {}) or {}).get("triple_barrier_label", {}).get("bucket_key", self._triple_barrier_bucket_key(signal)) or "unknown")
+                self._increment_counter(self._pullback_meta_filter_blocks_by_bucket, bucket_key)
+                self._increment_counter(self._pullback_meta_filter_blocks_by_symbol, symbol)
+                self._record_skipped_signal(signal, pullback_meta_reason, trace_id)
+                reason_counts = self._generation_reasons_by_symbol.setdefault(symbol, {})
+                reason_counts[pullback_meta_reason] = int(reason_counts.get(pullback_meta_reason, 0)) + 1
+                continue
+            rescue_quality_reason = self._candidate_flow_rescue_quality_reason(signal)
+            if rescue_quality_reason is not None:
+                self._record_skipped_signal(signal, rescue_quality_reason, trace_id)
+                reason_counts = self._generation_reasons_by_symbol.setdefault(symbol, {})
+                reason_counts[rescue_quality_reason] = int(reason_counts.get(rescue_quality_reason, 0)) + 1
+                continue
             strategy_probation_reason = self._simulation_strategy_probation_reason(signal)
             if strategy_probation_reason is not None:
                 self._record_skipped_signal(signal, strategy_probation_reason, trace_id)
                 reason_counts = self._generation_reasons_by_symbol.setdefault(symbol, {})
                 reason_counts[strategy_probation_reason] = int(reason_counts.get(strategy_probation_reason, 0)) + 1
                 continue
+            strategy_symbol_reason = self._strategy_symbol_eligibility_reason(signal)
+            if strategy_symbol_reason is not None:
+                self._record_skipped_signal(signal, strategy_symbol_reason, trace_id)
+                reason_counts = self._generation_reasons_by_symbol.setdefault(symbol, {})
+                reason_counts[strategy_symbol_reason] = int(reason_counts.get(strategy_symbol_reason, 0)) + 1
+                continue
+            fresh_setup_reason = self._fresh_setup_reason(signal, current_index=current_index)
+            if fresh_setup_reason is not None:
+                self._fresh_setup_blocks += 1
+                self._increment_counter(self._fresh_setup_blocks_by_strategy, strategy)
+                if fresh_setup_reason == "repeated_setup_density":
+                    self._repeated_setup_blocks += 1
+                    self._increment_counter(self._repeated_setup_blocks_by_strategy, strategy)
+                self._record_skipped_signal(signal, fresh_setup_reason, trace_id)
+                reason_counts = self._generation_reasons_by_symbol.setdefault(symbol, {})
+                reason_counts[fresh_setup_reason] = int(reason_counts.get(fresh_setup_reason, 0)) + 1
+                self._register_setup_signature(signal, current_index=current_index)
+                continue
+            self._register_setup_signature(signal, current_index=current_index)
             self._expected_edge_sum_by_symbol[symbol] = float(self._expected_edge_sum_by_symbol.get(symbol, 0.0)) + float(signal.get("expected_edge_bps", 0.0) or 0.0)
             self._increment_counter(self._generation_outcomes, "selected")
             by_symbol = self._generation_outcomes_by_symbol.setdefault(symbol, {})
@@ -1741,6 +2049,41 @@ class HistoricalSimulationEngine:
                     "trace_id": trace_id,
                 }
             )
+
+        if blocked_replacement_candidates and bool(getattr(self.config, "replacement_cross_symbol_enabled", True)):
+            max_replacements = max(int(getattr(self.config, "replacement_cross_symbol_max_per_scan", 1) or 1), 0)
+            selected_replacements = 0
+            replacement_symbols = {
+                str(candidate.get("symbol", "") or "")
+                for candidate in blocked_replacement_candidates
+            }
+            for candidate in sorted(
+                candidates,
+                key=lambda item: self._candidate_rank_score(item["signal"], provisional_signals=[]),
+                reverse=True,
+            ):
+                if selected_replacements >= max_replacements:
+                    break
+                if candidate["symbol"] in replacement_symbols:
+                    continue
+                signal_metadata = dict(candidate["signal"].get("metadata", {}) or {})
+                signal_metadata["cross_symbol_replacement"] = {
+                    "active": True,
+                    "blocked_symbols": sorted(symbol for symbol in replacement_symbols if symbol),
+                    "blocked_reasons": sorted(
+                        {
+                            str(blocked.get("rejection_reason", "unknown") or "unknown")
+                            for blocked in blocked_replacement_candidates
+                        }
+                    ),
+                }
+                candidate["signal"]["metadata"] = signal_metadata
+                selected_replacements += 1
+                self._replacement_candidates_selected += 1
+                self._replacement_cross_symbol_selected += 1
+                strategy_name = str(candidate["signal"].get("strategy", "unknown") or "unknown")
+                self._increment_counter(self._replacement_selected_by_strategy, strategy_name)
+                self._increment_counter(self._replacement_cross_symbol_selected_by_strategy, strategy_name)
 
         prioritized_candidates: list[Dict[str, Any]] = []
         remaining_candidates = list(candidates)
@@ -1807,6 +2150,12 @@ class HistoricalSimulationEngine:
                         self._increment_nested_counter(self._realized_performance_no_trade_blocks_by_strategy, str(signal.get("strategy", "unknown") or "unknown"), str(reason))
                 self._record_skipped_signal(signal, no_trade_reason, trace_id)
                 continue
+            replacement_guard_reason = self._replacement_guard_reason(signal)
+            if replacement_guard_reason is not None:
+                self._replacement_guard_blocks += 1
+                self._increment_counter(self._replacement_guard_blocks_by_reason, replacement_guard_reason)
+                self._record_skipped_signal(signal, replacement_guard_reason, trace_id)
+                continue
 
             size = self.risk.calc_position_size(
                 float(signal.get("entry_price", 0.0) or 0.0),
@@ -1856,6 +2205,7 @@ class HistoricalSimulationEngine:
                 symbol,
                 str(signal.get("strategy", "unknown")),
             )
+            self._register_replacement_submission(signal)
             self._increment_counter(self._submitted_by_order_type, order.order_type)
             self._record_event(
                 EVENT_ORDER_SUBMITTED,
@@ -1919,7 +2269,248 @@ class HistoricalSimulationEngine:
             score += 1.5
         if provisional and side in provisional_sides:
             score -= 1.25
+        repeat_penalty = float((metadata.get("realized_performance_penalty", {}) or {}).get("repeat_setup_penalty_score", 0.0) or 0.0)
+        score -= repeat_penalty
         return score
+
+    def _strategy_symbol_eligibility_reason(self, signal: Dict[str, Any]) -> str | None:
+        metadata = dict(signal.get("metadata", {}) or {})
+        strategy = str(signal.get("strategy", "unknown") or "unknown")
+        symbol = str(signal.get("symbol", "") or "")
+        strategy_symbol_rollup = self._build_strategy_symbol_rollups().get((symbol, strategy), {})
+        strategy_symbol_trades = int(dict(strategy_symbol_rollup or {}).get("trades", 0) or 0)
+        strategy_symbol_expectancy = float(dict(strategy_symbol_rollup or {}).get("expectancy", 0.0) or 0.0)
+        strategy_symbol_veto_min_trades = max(int(getattr(self.config, "simulation_strategy_symbol_veto_min_trades", 2) or 2), 1)
+        bucket = self._symbol_bucket(symbol)
+        liquidity_score = float(metadata.get("liquidity_score", 0.0) or 0.0)
+        regime_state = str(self._current_universe_regime_state().get("state", "neutral") or "neutral")
+        if (
+            getattr(self.config, "trading_mode", "spot") == "spot"
+            and bool(getattr(self.config, "simulation_spot_high_beta_requires_trend_supportive", True))
+            and bucket == "high_beta_alts"
+            and regime_state != "trend_supportive"
+        ):
+            return "spot_high_beta_requires_trend_supportive"
+        if strategy == "trend_breakout":
+            if (
+                strategy_symbol_trades >= strategy_symbol_veto_min_trades
+                and strategy_symbol_expectancy <= float(getattr(self.config, "simulation_breakout_symbol_veto_expectancy_floor", -14.0) or -14.0)
+            ):
+                return "breakout_symbol_probation_veto"
+            if liquidity_score > 0.0 and liquidity_score < float(getattr(self.config, "simulation_trend_symbol_min_liquidity_score", 0.72) or 0.72):
+                return "trend_symbol_liquidity_gate"
+            if (
+                bool(getattr(self.config, "simulation_trend_allow_high_beta_only_in_trend_supportive", True))
+                and bucket == "high_beta_alts"
+                and regime_state not in {"trend_supportive", "neutral"}
+            ):
+                return "trend_high_beta_state_gate"
+        elif strategy == "trend_pullback":
+            if (
+                strategy_symbol_trades >= strategy_symbol_veto_min_trades
+                and strategy_symbol_expectancy <= float(getattr(self.config, "simulation_pullback_symbol_veto_expectancy_floor", -18.0) or -18.0)
+            ):
+                return "pullback_symbol_probation_veto"
+            if getattr(self.config, "trading_mode", "spot") == "spot" and bucket == "high_beta_alts":
+                high_beta_pullback_score = float(metadata.get("pullback_score", 0.0) or 0.0)
+                high_beta_trend_persistence = float(metadata.get("trend_persistence", 0.0) or 0.0)
+                high_beta_quality_escape = (
+                    bool(getattr(self.config, "simulation_spot_high_beta_quality_escape_enabled", True))
+                    and (
+                        (
+                            bool(metadata.get("htf_4h_bullish", False))
+                            and bool(metadata.get("htf_1h_uptrend", False))
+                        )
+                        or bool(metadata.get("partial_htf_used", False))
+                        or bool(metadata.get("htf_fallback_used", False))
+                        or str(metadata.get("strategy_variant", "")) in {"spot_core_local_structure_pullback", "spot_core_micro_reclaim", "spot_major_continuation_pullback"}
+                    )
+                    and high_beta_pullback_score >= float(getattr(self.config, "simulation_spot_high_beta_quality_escape_min_score", 1.35) or 1.35)
+                    and high_beta_trend_persistence >= float(getattr(self.config, "simulation_spot_high_beta_quality_escape_min_trend_persistence", 0.38) or 0.38)
+                    and float(signal.get("signal_quality", signal.get("confidence", 0.0)) or 0.0) >= float(getattr(self.config, "simulation_spot_high_beta_quality_escape_min_signal_quality", 0.76) or 0.76)
+                    and float(signal.get("expected_edge_bps", 0.0) or 0.0) >= float(getattr(self.config, "simulation_spot_high_beta_quality_escape_min_edge_bps", 35.0) or 35.0)
+                    and float(metadata.get("realized_vol_percentile", 1.0) or 1.0) <= float(getattr(self.config, "simulation_spot_high_beta_quality_escape_max_volatility_percentile", 0.72) or 0.72)
+                    and float(metadata.get("stretch_from_mean", metadata.get("stretch", 0.0)) or 0.0) <= float(getattr(self.config, "simulation_spot_high_beta_quality_escape_max_stretch", 0.030) or 0.030)
+                )
+                if (
+                    high_beta_pullback_score > 0.0
+                    and high_beta_pullback_score < float(getattr(self.config, "simulation_spot_high_beta_pullback_min_score", 1.55) or 1.55)
+                    and not high_beta_quality_escape
+                ):
+                    return "spot_high_beta_pullback_score_gate"
+                if (
+                    high_beta_trend_persistence > 0.0
+                    and high_beta_trend_persistence < float(getattr(self.config, "simulation_spot_high_beta_pullback_min_trend_persistence", 0.50) or 0.50)
+                    and not high_beta_quality_escape
+                ):
+                    return "spot_high_beta_pullback_persistence_gate"
+                if high_beta_quality_escape:
+                    metadata["high_beta_quality_escape"] = True
+                    signal["metadata"] = metadata
+            if liquidity_score > 0.0 and liquidity_score < float(getattr(self.config, "simulation_pullback_symbol_min_liquidity_score", 0.76) or 0.76):
+                return "pullback_symbol_liquidity_gate"
+            if bucket in {"other", "high_beta_alts"} and regime_state not in {"trend_supportive", "neutral"}:
+                return "pullback_bucket_quality_gate"
+        elif strategy == "mean_reversion":
+            if (
+                strategy_symbol_trades >= strategy_symbol_veto_min_trades
+                and strategy_symbol_expectancy <= float(getattr(self.config, "simulation_mean_reversion_symbol_veto_expectancy_floor", -12.0) or -12.0)
+            ):
+                return "mean_reversion_symbol_probation_veto"
+            if liquidity_score > 0.0 and liquidity_score < float(getattr(self.config, "simulation_mean_reversion_symbol_min_liquidity_score", 0.80) or 0.80):
+                return "mean_reversion_symbol_liquidity_gate"
+        return None
+
+    def _candidate_flow_rescue_quality_reason(self, signal: Mapping[str, Any]) -> str | None:
+        if not bool(getattr(self.config, "candidate_flow_rescue_quality_gate_enabled", True)):
+            return None
+        if str(signal.get("strategy", "") or "") != "trend_pullback":
+            return None
+        metadata = dict(signal.get("metadata", {}) or {})
+        rescue = dict(metadata.get("candidate_flow_rescue", {}) or {})
+        if not bool(rescue.get("active", False)):
+            return None
+        rank_score = float(rescue.get("rank_score", signal.get("replacement_rank_score", 0.0)) or 0.0)
+        min_rank = float(getattr(self.config, "candidate_flow_rescue_quality_gate_min_rank_score", 1.72) or 1.72)
+        if rank_score < min_rank:
+            return "candidate_flow_rescue_rank_gate"
+        pullback_score = float(metadata.get("pullback_score", 0.0) or 0.0)
+        if pullback_score < float(getattr(self.config, "candidate_flow_rescue_quality_gate_min_pullback_score", 0.98) or 0.98):
+            return "candidate_flow_rescue_pullback_score_gate"
+        trend_persistence = float(metadata.get("trend_persistence", 0.0) or 0.0)
+        if trend_persistence < float(getattr(self.config, "candidate_flow_rescue_quality_gate_min_trend_persistence", 0.34) or 0.34):
+            return "candidate_flow_rescue_persistence_gate"
+        directional_efficiency = float(metadata.get("directional_efficiency", metadata.get("trend_efficiency", 0.0)) or 0.0)
+        if directional_efficiency < float(getattr(self.config, "candidate_flow_rescue_quality_gate_min_directional_efficiency", 0.08) or 0.08):
+            return "candidate_flow_rescue_efficiency_gate"
+        realized_vol = float(metadata.get("realized_vol_percentile", 0.0) or 0.0)
+        if realized_vol > float(getattr(self.config, "candidate_flow_rescue_quality_gate_max_volatility_percentile", 0.82) or 0.82):
+            return "candidate_flow_rescue_volatility_gate"
+        label_payload = dict(metadata.get("triple_barrier_label", {}) or {})
+        if (
+            str(label_payload.get("label", "") or "") == "SL_FIRST"
+            and rank_score < float(getattr(self.config, "candidate_flow_rescue_quality_gate_sl_first_min_rank_score", 2.05) or 2.05)
+        ):
+            return "candidate_flow_rescue_sl_first_gate"
+        return None
+
+    def _setup_signature_key(self, signal: Dict[str, Any]) -> str:
+        symbol = str(signal.get("symbol", "") or "")
+        strategy = str(signal.get("strategy", "unknown") or "unknown")
+        side = str(signal.get("side", "long") or "long").lower()
+        return f"{symbol}::{strategy}::{side}"
+
+    def _register_setup_signature(self, signal: Dict[str, Any], *, current_index: int) -> None:
+        metadata = dict(signal.get("metadata", {}) or {})
+        self._recent_setup_signatures[self._setup_signature_key(signal)] = {
+            "entry_price": float(signal.get("entry_price", 0.0) or 0.0),
+            "regime": str(signal.get("regime", "unknown") or "unknown"),
+            "index": int(current_index),
+            "setup_score": self._fresh_setup_score(signal),
+            "structure_key": str(
+                metadata.get("structure_key")
+                or metadata.get("setup_structure")
+                or metadata.get("pattern")
+                or ""
+            ),
+        }
+
+    def _fresh_setup_score(self, signal: Dict[str, Any]) -> float:
+        metadata = dict(signal.get("metadata", {}) or {})
+        strategy = str(signal.get("strategy", "unknown") or "unknown")
+        if strategy == "trend_breakout":
+            family_score = float(metadata.get("breakout_score", 0.0) or 0.0)
+        elif strategy == "trend_pullback":
+            family_score = float(metadata.get("pullback_score", 0.0) or 0.0)
+        elif strategy == "mean_reversion":
+            family_score = float(metadata.get("mean_reversion_score", 0.0) or 0.0)
+        else:
+            family_score = 0.0
+        return max(
+            family_score,
+            float(metadata.get("ensemble_score", 0.0) or 0.0),
+            float(metadata.get("cross_sectional_score", 0.0) or 0.0) / 100.0,
+            float(signal.get("signal_quality", 0.0) or 0.0),
+        )
+
+    def _fresh_setup_reason(self, signal: Dict[str, Any], *, current_index: int) -> str | None:
+        quality = float(signal.get("signal_quality", 0.0) or 0.0)
+        if quality < float(getattr(self.config, "simulation_fresh_setup_block_quality_floor", 0.55) or 0.55):
+            return None
+        payload = dict(self._recent_setup_signatures.get(self._setup_signature_key(signal), {}) or {})
+        if not payload:
+            return None
+        bars = max(int(getattr(self.config, "simulation_repeat_setup_suppression_bars", 24) or 24), 1)
+        if int(current_index) - int(payload.get("index", -10_000)) > bars:
+            return None
+        prev_entry = float(payload.get("entry_price", 0.0) or 0.0)
+        entry = float(signal.get("entry_price", 0.0) or 0.0)
+        if prev_entry <= 0.0 or entry <= 0.0:
+            return None
+        distance_bps = abs(entry - prev_entry) / prev_entry * 10000.0
+        min_shift_bps = float(getattr(self.config, "simulation_fresh_setup_min_entry_shift_bps", 32.0) or 32.0)
+        score_improvement = self._fresh_setup_score(signal) - float(payload.get("setup_score", 0.0) or 0.0)
+        min_score_improvement = float(getattr(self.config, "simulation_fresh_setup_min_score_improvement", 0.18) or 0.18)
+        metadata = dict(signal.get("metadata", {}) or {})
+        structure_key = str(
+            metadata.get("structure_key")
+            or metadata.get("setup_structure")
+            or metadata.get("pattern")
+            or ""
+        )
+        prev_structure_key = str(payload.get("structure_key", "") or "")
+        structure_changed = bool(structure_key and prev_structure_key and structure_key != prev_structure_key)
+        if distance_bps >= min_shift_bps or score_improvement >= min_score_improvement or structure_changed:
+            return None
+        repeated_reason = self._repeated_setup_reason(signal, current_index=current_index)
+        if repeated_reason is not None:
+            return repeated_reason
+        realized = dict(metadata.get("realized_performance_penalty", {}) or {})
+        realized["repeat_setup_penalty_score"] = max(
+            float(realized.get("repeat_setup_penalty_score", 0.0) or 0.0),
+            float(getattr(self.config, "simulation_repeat_setup_density_penalty_score", 6.0) or 6.0),
+        )
+        reasons = list(realized.get("reasons", []) or [])
+        if "fresh_setup_required" not in reasons:
+            reasons.append("fresh_setup_required")
+        realized["reasons"] = reasons
+        metadata["realized_performance_penalty"] = realized
+        signal["metadata"] = metadata
+        return "fresh_setup_required"
+
+    def _repeated_setup_reason(self, signal: Dict[str, Any], *, current_index: int) -> str | None:
+        quality = float(signal.get("signal_quality", 0.0) or 0.0)
+        if quality < float(getattr(self.config, "simulation_repeat_setup_quality_floor", 0.70) or 0.70):
+            return None
+        payload = dict(self._recent_setup_signatures.get(self._setup_signature_key(signal), {}) or {})
+        if not payload:
+            return None
+        bars = max(int(getattr(self.config, "simulation_repeat_setup_suppression_bars", 24) or 24), 1)
+        if int(current_index) - int(payload.get("index", -10_000)) > bars:
+            return None
+        prev_entry = float(payload.get("entry_price", 0.0) or 0.0)
+        entry = float(signal.get("entry_price", 0.0) or 0.0)
+        if prev_entry <= 0.0 or entry <= 0.0:
+            return None
+        tolerance_bps = float(getattr(self.config, "simulation_repeat_setup_entry_tolerance_bps", 20.0) or 20.0)
+        distance_bps = abs(entry - prev_entry) / prev_entry * 10000.0
+        if distance_bps > tolerance_bps:
+            return None
+        if str(payload.get("regime", "unknown") or "unknown") != str(signal.get("regime", "unknown") or "unknown"):
+            return None
+        metadata = dict(signal.get("metadata", {}) or {})
+        penalty = float(getattr(self.config, "simulation_repeat_setup_density_penalty_score", 6.0) or 6.0)
+        no_trade_penalty = float(getattr(self.config, "simulation_repeat_setup_no_trade_penalty_bps", 3.0) or 3.0)
+        realized = dict(metadata.get("realized_performance_penalty", {}) or {})
+        realized["repeat_setup_penalty_score"] = max(float(realized.get("repeat_setup_penalty_score", 0.0) or 0.0), penalty)
+        realized["no_trade_penalty_bps"] = float(realized.get("no_trade_penalty_bps", 0.0) or 0.0) + no_trade_penalty
+        reasons = list(realized.get("reasons", []) or [])
+        if "repeated_setup_density" not in reasons:
+            reasons.append("repeated_setup_density")
+        realized["reasons"] = reasons
+        metadata["realized_performance_penalty"] = realized
+        signal["metadata"] = metadata
+        return "repeated_setup_density"
 
     def _portfolio_crowding_penalty(self, signal: Dict[str, Any], *, provisional_signals: Sequence[Dict[str, Any]] | None = None) -> float:
         symbol = str(signal.get("symbol", "") or "")
@@ -2171,10 +2762,12 @@ class HistoricalSimulationEngine:
         reasons: list[str] = []
         symbol_penalty = float(getattr(self.config, "simulation_realized_symbol_penalty_score", 5.0) or 5.0)
         strategy_penalty = float(getattr(self.config, "simulation_realized_strategy_penalty_score", 4.0) or 4.0)
+        strategy_symbol_penalty = float(getattr(self.config, "simulation_strategy_symbol_penalty_score", 4.0) or 4.0)
         symbol_bonus = float(getattr(self.config, "simulation_realized_symbol_positive_score", 2.5) or 2.5)
         strategy_bonus = float(getattr(self.config, "simulation_realized_strategy_positive_score", 2.0) or 2.0)
         pullback_symbol_penalty = float(getattr(self.config, "simulation_pullback_realized_symbol_penalty_score", 3.0) or 3.0)
         pullback_no_trade_penalty = float(getattr(self.config, "simulation_pullback_realized_symbol_no_trade_penalty_bps", 2.0) or 2.0)
+        strategy_symbol_veto_min_trades = max(int(getattr(self.config, "simulation_strategy_symbol_veto_min_trades", 2) or 2), 1)
 
         symbol_trades = int(self._closed_by_symbol.get(symbol, 0) or 0)
         if symbol_trades >= min_trades:
@@ -2191,6 +2784,21 @@ class HistoricalSimulationEngine:
             elif symbol_expectancy >= positive_expectancy_floor:
                 score_bonus += symbol_bonus
                 reasons.append("symbol_positive_expectancy")
+
+        strategy_symbol_rollup = self._build_strategy_symbol_rollups().get((symbol, strategy), {})
+        strategy_symbol_trades = int(dict(strategy_symbol_rollup or {}).get("trades", 0) or 0)
+        strategy_symbol_expectancy = float(dict(strategy_symbol_rollup or {}).get("expectancy", 0.0) or 0.0)
+        if strategy_symbol_trades >= strategy_symbol_veto_min_trades:
+            floor_by_strategy = {
+                "trend_pullback": float(getattr(self.config, "simulation_pullback_symbol_veto_expectancy_floor", -18.0) or -18.0),
+                "trend_breakout": float(getattr(self.config, "simulation_breakout_symbol_veto_expectancy_floor", -14.0) or -14.0),
+                "mean_reversion": float(getattr(self.config, "simulation_mean_reversion_symbol_veto_expectancy_floor", -12.0) or -12.0),
+            }
+            floor = float(floor_by_strategy.get(strategy, negative_expectancy_floor) or negative_expectancy_floor)
+            if strategy_symbol_expectancy <= floor:
+                score_penalty += strategy_symbol_penalty
+                no_trade_penalty += penalty_bps
+                reasons.append("strategy_symbol_negative_expectancy")
 
         strategy_trades = int(self._closed_by_strategy.get(strategy, 0) or 0)
         if strategy_trades >= min_trades:
@@ -2209,6 +2817,32 @@ class HistoricalSimulationEngine:
             "no_trade_penalty_bps": no_trade_penalty,
             "reasons": reasons,
         }
+
+    def _build_strategy_symbol_rollups(self) -> Dict[tuple[str, str], Dict[str, Any]]:
+        rollups: Dict[tuple[str, str], Dict[str, Any]] = {}
+        for trade in self.trades:
+            if not isinstance(trade, dict):
+                continue
+            symbol = str(trade.get("symbol", "") or "")
+            strategy = str(trade.get("strategy", "unknown") or "unknown")
+            if not symbol:
+                continue
+            payload = rollups.setdefault(
+                (symbol, strategy),
+                {"trades": 0, "wins": 0, "losses": 0, "total_pl": 0.0, "expectancy": 0.0},
+            )
+            payload["trades"] += 1
+            pl = float(trade.get("pl", 0.0) or 0.0)
+            payload["total_pl"] += pl
+            if pl >= 0.0:
+                payload["wins"] += 1
+            else:
+                payload["losses"] += 1
+        for payload in rollups.values():
+            trades = int(payload.get("trades", 0) or 0)
+            payload["expectancy"] = float(payload.get("total_pl", 0.0) or 0.0) / trades if trades else 0.0
+            payload["win_rate_pct"] = (int(payload.get("wins", 0) or 0) / trades * 100.0) if trades else 0.0
+        return rollups
 
     def _record_skipped_signal(self, signal: Dict[str, Any], reason: str, trace_id: str) -> None:
         self.learning.record_shadow_decision(
@@ -2233,19 +2867,74 @@ class HistoricalSimulationEngine:
                 reason,
             )
 
+    def _replacement_guard_reason(self, signal: Dict[str, Any]) -> str | None:
+        metadata = dict(signal.get("metadata", {}) or {})
+        replacement = dict(metadata.get("replacement_opportunity", {}) or {})
+        if not bool(replacement.get("active", False)):
+            return None
+        day_key = self._now.date().isoformat() if self._now is not None else "unknown"
+        max_per_day = max(int(getattr(self.config, "replacement_max_per_day", 2) or 0), 0)
+        if max_per_day > 0 and int(self._replacement_submitted_by_day.get(day_key, 0) or 0) >= max_per_day:
+            return "replacement_daily_cap"
+        symbol = str(signal.get("symbol", "") or "")
+        max_per_symbol = max(int(getattr(self.config, "replacement_max_per_symbol_per_day", 1) or 0), 0)
+        if max_per_symbol > 0 and symbol:
+            symbol_counts = dict(self._replacement_submitted_by_symbol_day.get(day_key, {}) or {})
+            if int(symbol_counts.get(symbol, 0) or 0) >= max_per_symbol:
+                return "replacement_symbol_daily_cap"
+        return None
+
+    def _register_replacement_submission(self, signal: Dict[str, Any]) -> None:
+        metadata = dict(signal.get("metadata", {}) or {})
+        replacement = dict(metadata.get("replacement_opportunity", {}) or {})
+        if not bool(replacement.get("active", False)):
+            return
+        self._replacement_submitted += 1
+        self._increment_counter(self._replacement_submitted_by_strategy, str(signal.get("strategy", "unknown") or "unknown"))
+        day_key = self._now.date().isoformat() if self._now is not None else "unknown"
+        self._replacement_submitted_by_day[day_key] = int(self._replacement_submitted_by_day.get(day_key, 0) or 0) + 1
+        symbol = str(signal.get("symbol", "") or "")
+        if symbol:
+            symbol_counts = self._replacement_submitted_by_symbol_day.setdefault(day_key, {})
+            symbol_counts[symbol] = int(symbol_counts.get(symbol, 0) or 0) + 1
+
     def _eligible_universe_symbols(self, symbols: Sequence[str]) -> list[str]:
         scored = self._build_universe_tradability_snapshot(symbols)
-        top_n = max(int(getattr(self.config, "simulation_universe_top_n", 0) or 0), 0)
+        base_top_n = max(int(getattr(self.config, "simulation_universe_top_n", 0) or 0), 0)
+        expansion_gate = self._frequency_expansion_gate()
+        top_n = base_top_n
+        if bool(expansion_gate.get("allowed", False)):
+            top_n += max(int(getattr(self.config, "frequency_expansion_universe_top_n_delta", 2) or 2), 0)
         floor = float(getattr(self.config, "simulation_universe_tradability_floor", 45.0) or 45.0)
         regime_state = self._current_universe_regime_state()
         ranked = sorted(scored.items(), key=lambda item: float(dict(item[1] or {}).get("tradability_score", 0.0) or 0.0), reverse=True)
         eligible: list[str] = []
         rejected: Dict[str, Dict[str, Any]] = {}
         eligible_buckets: Dict[str, int] = {}
+        reserved_core_symbols: set[str] = set()
+        if getattr(self.config, "trading_mode", "spot") == "spot" and bool(getattr(self.config, "simulation_spot_core_symbol_reservation_enabled", True)):
+            core_symbols = {
+                str(symbol)
+                for symbol in list(getattr(self.config, "simulation_spot_core_symbols", []) or [])
+                if str(symbol) in scored
+            }
+            core_min_count = max(int(getattr(self.config, "simulation_spot_core_symbol_min_count", 2) or 2), 0)
+            for symbol, payload in ranked:
+                if len(reserved_core_symbols) >= core_min_count:
+                    break
+                if symbol not in core_symbols:
+                    continue
+                score = float(dict(payload or {}).get("tradability_score", 0.0) or 0.0)
+                if score < floor:
+                    continue
+                if bool(dict(payload or {}).get("probation_veto_active", False)) or bool(dict(payload or {}).get("realized_veto_active", False)):
+                    continue
+                reserved_core_symbols.add(symbol)
         for index, (symbol, payload) in enumerate(ranked):
             score = float(dict(payload or {}).get("tradability_score", 0.0) or 0.0)
             bucket = str(dict(payload or {}).get("bucket", "other") or "other")
             bucket_cap = self._universe_bucket_cap(bucket, regime_state=regime_state)
+            core_reserved = symbol in reserved_core_symbols
             if bool(dict(payload or {}).get("probation_veto_active", False)):
                 rejected[symbol] = {**dict(payload or {}), "reason": "realized_symbol_probation_veto"}
                 continue
@@ -2255,10 +2944,10 @@ class HistoricalSimulationEngine:
             if score < floor:
                 rejected[symbol] = {**dict(payload or {}), "reason": "below_tradability_floor"}
                 continue
-            if top_n > 0 and len(eligible) >= top_n:
+            if top_n > 0 and len(eligible) >= top_n and not core_reserved:
                 rejected[symbol] = {**dict(payload or {}), "reason": "outside_top_n"}
                 continue
-            if int(eligible_buckets.get(bucket, 0)) >= bucket_cap:
+            if int(eligible_buckets.get(bucket, 0)) >= bucket_cap and not core_reserved:
                 rejected[symbol] = {**dict(payload or {}), "reason": "bucket_cap_reached"}
                 continue
             eligible.append(symbol)
@@ -2266,7 +2955,9 @@ class HistoricalSimulationEngine:
         self._latest_universe_selection = {
             "eligible_symbols": eligible,
             "eligible_bucket_counts": dict(sorted(eligible_buckets.items())),
+            "reserved_core_symbols": sorted(reserved_core_symbols),
             "regime_state": dict(sorted(regime_state.items())),
+            "frequency_expansion": dict(sorted(expansion_gate.items())),
             "rejected_symbols": {key: dict(sorted(value.items())) for key, value in sorted(rejected.items())},
             "scored_symbols": {key: dict(sorted(value.items())) for key, value in sorted(scored.items())},
         }
@@ -2303,6 +2994,66 @@ class HistoricalSimulationEngine:
             "avg_range": avg_range,
             "trend_strength": trend_strength,
             "symbol": primary_symbol,
+        }
+
+    def _frequency_expansion_gate(self) -> Dict[str, Any]:
+        if not bool(getattr(self.config, "frequency_expansion_enabled", True)):
+            return {"allowed": False, "reason": "disabled"}
+        if self._campaign_timeline_start is None or self._now is None:
+            return {"allowed": False, "reason": "frequency_window_unavailable"}
+        window_days = max((self._now - self._campaign_timeline_start).total_seconds() / 86400.0, 1.0 / 96.0)
+        trades_per_day = len(self.trades) / max(window_days, 1e-9)
+        target_min = float(getattr(self.config, "target_trades_per_day_min", 2.0) or 2.0)
+        if trades_per_day >= target_min:
+            return {
+                "allowed": False,
+                "reason": "frequency_target_already_met",
+                "trades_per_day": trades_per_day,
+                "target_trades_per_day_min": target_min,
+            }
+        closed_trades = len(self.trades)
+        min_trades = max(int(getattr(self.config, "frequency_expansion_min_closed_trades", 3) or 3), 1)
+        if closed_trades < min_trades:
+            return {"allowed": False, "reason": "not_enough_closed_trades", "closed_trades": closed_trades, "required_trades": min_trades}
+
+        negative_trades = [trade for trade in self.trades if float(dict(trade or {}).get("pl", 0.0) or 0.0) < 0.0]
+        negative_total_pl = abs(sum(float(trade.get("pl", 0.0) or 0.0) for trade in negative_trades))
+        stop_loss_negative_pl = abs(
+            sum(
+                float(trade.get("pl", 0.0) or 0.0)
+                for trade in negative_trades
+                if str(trade.get("exit_reason", "UNKNOWN") or "UNKNOWN") == "SL"
+            )
+        )
+        stop_loss_share = (stop_loss_negative_pl / negative_total_pl * 100.0) if negative_total_pl > 0.0 else 0.0
+        max_sl_share = float(getattr(self.config, "frequency_expansion_max_stop_loss_negative_pl_share_pct", 55.0) or 55.0)
+        if stop_loss_share > max_sl_share:
+            return {
+                "allowed": False,
+                "reason": "stop_loss_damage_too_high",
+                "closed_trades": closed_trades,
+                "stop_loss_negative_pl_share_pct": stop_loss_share,
+                "max_stop_loss_negative_pl_share_pct": max_sl_share,
+            }
+
+        by_strategy = self._build_realized_performance_summary(self._build_symbol_rollups()).get("by_strategy", {})
+        best_expectancy = max((float(dict(payload or {}).get("expectancy", 0.0) or 0.0) for payload in dict(by_strategy or {}).values()), default=0.0)
+        min_expectancy = float(getattr(self.config, "frequency_expansion_min_best_strategy_expectancy", 0.0) or 0.0)
+        if best_expectancy < min_expectancy:
+            return {
+                "allowed": False,
+                "reason": "no_positive_strategy_expectancy",
+                "closed_trades": closed_trades,
+                "best_strategy_expectancy": best_expectancy,
+                "required_expectancy": min_expectancy,
+            }
+        return {
+            "allowed": True,
+            "reason": "exit_repair_confirmed",
+            "closed_trades": closed_trades,
+            "trades_per_day": trades_per_day,
+            "stop_loss_negative_pl_share_pct": stop_loss_share,
+            "best_strategy_expectancy": best_expectancy,
         }
 
     def _universe_bucket_cap(self, bucket: str, *, regime_state: Dict[str, Any] | None = None) -> int:
@@ -2346,7 +3097,9 @@ class HistoricalSimulationEngine:
         realized_veto_floor = float(getattr(self.config, "simulation_universe_realized_veto_expectancy_floor", -8.0) or -8.0)
         probation_veto_min_trades = max(int(getattr(self.config, "simulation_symbol_probation_veto_min_trades", 1) or 1), 1)
         probation_veto_floor = float(getattr(self.config, "simulation_symbol_probation_veto_expectancy_floor", -20.0) or -20.0)
+        expectancy_half_life = max(float(getattr(self.config, "simulation_symbol_expectancy_decay_half_life_trades", 6.0) or 6.0), 1.0)
         symbol_rollups = self._build_symbol_rollups()
+        strategy_symbol_rollups = self._build_strategy_symbol_rollups()
         for symbol in symbols:
             bar = self.exchange.current_bar(symbol, self._base_timeframe)
             if bar is None:
@@ -2362,22 +3115,37 @@ class HistoricalSimulationEngine:
             realized_rollup = dict(symbol_rollups.get(symbol, {}) or {})
             realized_trades = int(realized_rollup.get("trades", 0) or 0)
             realized_expectancy = float(realized_rollup.get("expectancy", 0.0) or 0.0)
+            expectancy_memory_weight = 1.0 - (0.5 ** (realized_trades / expectancy_half_life)) if realized_trades > 0 else 0.0
             realized_score_adjustment = 0.0
             realized_adjustment_reason = ""
             realized_veto_active = False
             probation_veto_active = False
             if realized_trades >= realized_min_trades:
                 if realized_expectancy <= negative_expectancy_floor:
-                    realized_score_adjustment = -realized_penalty
+                    realized_score_adjustment = -realized_penalty * expectancy_memory_weight
                     realized_adjustment_reason = "negative_expectancy"
                 elif realized_expectancy >= positive_expectancy_floor:
-                    realized_score_adjustment = realized_boost
+                    realized_score_adjustment = realized_boost * expectancy_memory_weight
                     realized_adjustment_reason = "positive_expectancy"
+            strategy_rotation = self._universe_strategy_rotation_adjustment(symbol, strategy_symbol_rollups)
+            strategy_rotation_adjustment = float(strategy_rotation.get("score_adjustment", 0.0) or 0.0)
+            strategy_positive_override = bool(strategy_rotation.get("positive_override", False))
             if realized_trades >= probation_veto_min_trades and realized_expectancy <= probation_veto_floor:
                 probation_veto_active = True
             if realized_trades >= realized_veto_min_trades and realized_expectancy <= realized_veto_floor:
                 realized_veto_active = True
-            tradability_score = max(0.0, 100.0 + volume_score - (spread_bps * spread_weight) - (realized_volatility * vol_weight) + realized_score_adjustment)
+            if strategy_positive_override:
+                probation_veto_active = False
+                realized_veto_active = False
+            tradability_score = max(
+                0.0,
+                100.0
+                + volume_score
+                - (spread_bps * spread_weight)
+                - (realized_volatility * vol_weight)
+                + realized_score_adjustment
+                + strategy_rotation_adjustment,
+            )
             snapshot[symbol] = {
                 "tradability_score": tradability_score,
                 "spread_bps": spread_bps,
@@ -2386,12 +3154,64 @@ class HistoricalSimulationEngine:
                 "bucket": self._symbol_bucket(symbol),
                 "realized_trades": realized_trades,
                 "realized_expectancy": realized_expectancy,
+                "expectancy_memory_weight": expectancy_memory_weight,
                 "realized_score_adjustment": realized_score_adjustment,
                 "realized_adjustment_reason": realized_adjustment_reason,
+                "strategy_rotation_score_adjustment": strategy_rotation_adjustment,
+                "strategy_rotation_positive_override": strategy_positive_override,
+                "strategy_rotation": dict(strategy_rotation.get("by_strategy", {}) or {}),
                 "probation_veto_active": probation_veto_active,
                 "realized_veto_active": realized_veto_active,
             }
         return snapshot
+
+    def _universe_strategy_rotation_adjustment(
+        self,
+        symbol: str,
+        strategy_symbol_rollups: Dict[tuple[str, str], Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not bool(getattr(self.config, "simulation_universe_strategy_rotation_enabled", True)):
+            return {"score_adjustment": 0.0, "positive_override": False, "by_strategy": {}}
+        min_trades = max(int(getattr(self.config, "simulation_universe_strategy_rotation_min_trades", 2) or 2), 1)
+        positive_floor = float(getattr(self.config, "simulation_universe_strategy_rotation_positive_floor", 2.0) or 2.0)
+        negative_floor = float(getattr(self.config, "simulation_universe_strategy_rotation_negative_floor", -8.0) or -8.0)
+        boost_score = float(getattr(self.config, "simulation_universe_strategy_rotation_boost_score", 7.0) or 7.0)
+        penalty_score = float(getattr(self.config, "simulation_universe_strategy_rotation_penalty_score", 4.0) or 4.0)
+        by_strategy: Dict[str, Dict[str, Any]] = {}
+        total_adjustment = 0.0
+        positive_override = False
+        for (rollup_symbol, strategy), payload in sorted(strategy_symbol_rollups.items()):
+            if rollup_symbol != symbol:
+                continue
+            trades = int(dict(payload or {}).get("trades", 0) or 0)
+            expectancy = float(dict(payload or {}).get("expectancy", 0.0) or 0.0)
+            if trades < min_trades:
+                continue
+            memory_weight = 1.0 - (0.5 ** (trades / max(float(getattr(self.config, "simulation_symbol_expectancy_decay_half_life_trades", 6.0) or 6.0), 1.0)))
+            adjustment = 0.0
+            state = "neutral"
+            if expectancy >= positive_floor:
+                adjustment = boost_score * memory_weight
+                positive_override = True
+                state = "positive_rotation"
+            elif expectancy <= negative_floor:
+                adjustment = -penalty_score * memory_weight
+                state = "negative_rotation"
+            if state == "neutral":
+                continue
+            by_strategy[strategy] = {
+                "trades": trades,
+                "expectancy": expectancy,
+                "memory_weight": memory_weight,
+                "score_adjustment": adjustment,
+                "state": state,
+            }
+            total_adjustment += adjustment
+        return {
+            "score_adjustment": total_adjustment,
+            "positive_override": positive_override,
+            "by_strategy": by_strategy,
+        }
 
     def _simulation_strategy_probation_reason(self, signal: Dict[str, Any]) -> str | None:
         strategy = str(signal.get("strategy", "unknown") or "unknown")
@@ -2467,6 +3287,9 @@ class HistoricalSimulationEngine:
             self._filled_orders += 1
             self._increment_counter(self._filled_by_strategy, str(order.strategy))
             self._increment_counter(self._filled_by_symbol, order.symbol)
+            if bool(dict((order.signal or {}).get("metadata", {}) or {}).get("replacement_opportunity", {}).get("active", False)):
+                self._replacement_filled += 1
+                self._increment_counter(self._replacement_filled_by_strategy, str(order.strategy))
             self._increment_nested_counter(
                 self._filled_by_strategy_by_symbol,
                 order.symbol,
@@ -2581,7 +3404,7 @@ class HistoricalSimulationEngine:
             if order.remaining_size > 1e-9:
                 self._record_skipped_signal(order.signal, "limit_unfilled", order.trace_id)
 
-    def _manage_open_positions(self, bar_by_symbol: Mapping[str, "pd.Series"], now: dt.datetime) -> None:
+    def _manage_open_positions(self, bar_by_symbol: Mapping[str, "pd.Series"], now: dt.datetime, current_index: int | None = None) -> None:
         for symbol in list(self.state.open_positions.keys()):
             current_positions = self.state.open_positions.get(symbol, [])
             positions = list(current_positions if isinstance(current_positions, list) else [current_positions])
@@ -2592,8 +3415,8 @@ class HistoricalSimulationEngine:
             for position in positions:
                 self._update_excursions(position, bar)
                 self._update_dynamic_risk(position, symbol, bar)
-                self._maybe_partial_profit_take(position, bar)
-                exit_reason, raw_exit_price, exit_details = self._trigger_exit(position, bar)
+                self._maybe_partial_profit_take(position, bar, current_index=current_index)
+                exit_reason, raw_exit_price, exit_details = self._trigger_exit(position, bar, current_index=current_index)
                 if raw_exit_price is None:
                     exit_reason, raw_exit_price = self._time_stop_exit(position, bar, now)
                     if raw_exit_price is not None:
@@ -2629,14 +3452,25 @@ class HistoricalSimulationEngine:
                 self._increment_counter(self._closed_by_symbol, symbol)
                 self._increment_nested_counter(self._closed_by_strategy_by_symbol, symbol, strategy)
                 self._increment_counter(self._closed_by_order_type, order_type)
+                signal_snapshot = dict(metadata.get("signal_snapshot", {}) or {})
+                replacement_active = bool(dict(signal_snapshot.get("metadata", {}) or {}).get("replacement_opportunity", {}).get("active", False))
+                if replacement_active:
+                    self._replacement_closed += 1
+                    self._increment_counter(self._replacement_closed_by_strategy, strategy)
                 if total_profit_loss >= 0:
                     self._increment_counter(self._wins_by_strategy, strategy)
                     self._increment_counter(self._wins_by_symbol, symbol)
                     self._increment_nested_counter(self._wins_by_strategy_by_symbol, symbol, strategy)
+                    if replacement_active:
+                        self._replacement_wins += 1
+                        self._increment_counter(self._replacement_wins_by_strategy, strategy)
                 else:
                     self._increment_counter(self._losses_by_strategy, strategy)
                     self._increment_counter(self._losses_by_symbol, symbol)
                     self._increment_nested_counter(self._losses_by_strategy_by_symbol, symbol, strategy)
+                    if replacement_active:
+                        self._replacement_losses += 1
+                        self._increment_counter(self._replacement_losses_by_strategy, strategy)
                 self.trades.append(
                     asdict(
                         ClosedTrade(
@@ -2728,7 +3562,64 @@ class HistoricalSimulationEngine:
         else:
             rr = float(getattr(self.config, "trailing_rr", 1.5) or 1.5)
             atr_mult = float(getattr(self.config, "trailing_atr_mult", 1.0) or 1.0)
+        profile = self._regime_exit_profile(position)
+        if profile == "trend_supportive" and bool(dict(getattr(position, "metadata", {}) or {}).get("partial_profit_taken", False)):
+            rr *= float(getattr(self.config, "regime_exit_trend_trailing_rr_multiplier", 1.10) or 1.10)
+            atr_mult *= float(getattr(self.config, "regime_exit_trend_trailing_atr_multiplier", 1.15) or 1.15)
+        elif profile == "risk_off":
+            rr *= float(getattr(self.config, "regime_exit_risk_off_trailing_rr_multiplier", 0.70) or 0.70)
+            atr_mult *= float(getattr(self.config, "regime_exit_risk_off_trailing_atr_multiplier", 0.65) or 0.65)
+        elif profile == "choppy":
+            rr *= float(getattr(self.config, "regime_exit_choppy_trailing_rr_multiplier", 0.85) or 0.85)
+            atr_mult *= float(getattr(self.config, "regime_exit_choppy_trailing_atr_multiplier", 0.80) or 0.80)
         return rr, atr_mult
+
+    def _regime_exit_profile(self, position: Position) -> str:
+        if not bool(getattr(self.config, "regime_exit_profiles_enabled", True)):
+            return "neutral"
+        metadata = dict(getattr(position, "metadata", {}) or {})
+        signal_snapshot = dict(metadata.get("signal_snapshot", {}) or {})
+        signal_meta = dict(signal_snapshot.get("metadata", {}) or {})
+        raw_state = str(
+            signal_meta.get(
+                "regime_state",
+                signal_snapshot.get("regime_state", signal_snapshot.get("regime", signal_meta.get("regime", ""))),
+            )
+            or ""
+        ).lower()
+        if raw_state in {"trend_supportive", "trending", "bullish", "persistent_trend"}:
+            return "trend_supportive"
+        if raw_state in {"risk_off", "high_volatility", "crash", "bearish"}:
+            return "risk_off"
+        if raw_state in {"choppy", "neutral", "range", "sideways"}:
+            return "choppy"
+        try:
+            current_state = str(self._current_universe_regime_state().get("state", "neutral") or "neutral").lower()
+        except Exception:
+            current_state = "neutral"
+        if current_state in {"trend_supportive"}:
+            return "trend_supportive"
+        if current_state in {"risk_off", "high_volatility"}:
+            return "risk_off"
+        return "choppy" if current_state == "choppy" else "neutral"
+
+    def _regime_adjusted_partial_lock_rr(self, position: Position, lock_rr: float) -> float:
+        profile = self._regime_exit_profile(position)
+        if profile == "trend_supportive":
+            return lock_rr * float(getattr(self.config, "regime_exit_trend_partial_lock_multiplier", 0.85) or 0.85)
+        if profile == "risk_off":
+            return lock_rr * float(getattr(self.config, "regime_exit_risk_off_partial_lock_multiplier", 1.50) or 1.50)
+        if profile == "choppy":
+            return lock_rr * float(getattr(self.config, "regime_exit_choppy_partial_lock_multiplier", 1.25) or 1.25)
+        return lock_rr
+
+    def _regime_adjusted_close_floor_rr(self, position: Position, close_floor: float) -> float:
+        profile = self._regime_exit_profile(position)
+        if profile == "risk_off":
+            return max(close_floor, float(getattr(self.config, "regime_exit_risk_off_close_floor_rr", -0.06) or -0.06))
+        if profile == "choppy":
+            return max(close_floor, float(getattr(self.config, "regime_exit_choppy_close_floor_rr", -0.09) or -0.09))
+        return close_floor
 
     def _update_excursions(self, position: Position, bar: "pd.Series") -> None:
         entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
@@ -2763,9 +3654,20 @@ class HistoricalSimulationEngine:
         if risk_dist <= 0:
             return
         strategy = str(getattr(position, "strategy", "unknown") or "unknown").lower()
+        metadata = dict(getattr(position, "metadata", {}) or {})
+        signal_snapshot = dict(metadata.get("signal_snapshot", {}) or {})
+        signal_metadata = dict(signal_snapshot.get("metadata", {}) or {})
+        high_beta_quality_escape = strategy == "trend_pullback" and bool(signal_metadata.get("high_beta_quality_escape", False))
+        spot_core_pullback = strategy == "trend_pullback" and str(signal_metadata.get("symbol_bucket", "") or "") in {"majors", "exchange_beta"}
         if strategy == "trend_breakout":
             trigger_key = "profit_protect_breakout_trigger_rr"
             lock_key = "profit_protect_breakout_lock_rr"
+        elif high_beta_quality_escape:
+            trigger_key = "high_beta_pullback_profit_protect_trigger_rr"
+            lock_key = "high_beta_pullback_profit_protect_lock_rr"
+        elif spot_core_pullback:
+            trigger_key = "spot_core_pullback_profit_protect_trigger_rr"
+            lock_key = "spot_core_pullback_profit_protect_lock_rr"
         elif strategy == "trend_pullback":
             trigger_key = "profit_protect_pullback_trigger_rr"
             lock_key = "profit_protect_pullback_lock_rr"
@@ -2776,9 +3678,21 @@ class HistoricalSimulationEngine:
             trigger_key = "breakeven_rr"
             lock_key = None
         trigger_rr = float(getattr(self.config, trigger_key, 1.0) or 1.0)
+        profile = self._regime_exit_profile(position)
+        if profile == "risk_off":
+            trigger_rr *= 0.75
+        elif profile == "choppy":
+            trigger_rr *= 0.85
+        elif profile == "trend_supportive" and bool(metadata.get("partial_profit_taken", False)):
+            trigger_rr *= 1.10
         if rr_move < trigger_rr:
             return
         lock_rr = float(getattr(self.config, lock_key, 0.0) or 0.0) if lock_key is not None else 0.0
+        if lock_rr > 0.0:
+            lock_rr = self._regime_adjusted_partial_lock_rr(position, lock_rr)
+            metadata["regime_exit_profile"] = profile
+            metadata["regime_adjusted_profit_lock_rr"] = float(lock_rr)
+            position.metadata = metadata
         entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
         if str(getattr(position, "side", "long") or "long") == "long":
             protected_stop = entry_price + (risk_dist * lock_rr)
@@ -2807,11 +3721,15 @@ class HistoricalSimulationEngine:
             if protected_stop < float(getattr(position, "stop_loss", 0.0) or 0.0):
                 position.stop_loss = protected_stop
 
-    def _maybe_partial_profit_take(self, position: Position, bar: "pd.Series") -> None:
+    def _maybe_partial_profit_take(self, position: Position, bar: "pd.Series", current_index: int | None = None) -> None:
         strategy = str(getattr(position, "strategy", "unknown") or "unknown").lower()
-        if strategy not in {"trend_breakout", "mean_reversion"}:
-            return
         metadata = dict(getattr(position, "metadata", {}) or {})
+        signal_snapshot = dict(metadata.get("signal_snapshot", {}) or {})
+        signal_metadata = dict(signal_snapshot.get("metadata", {}) or {})
+        high_beta_quality_escape = strategy == "trend_pullback" and bool(signal_metadata.get("high_beta_quality_escape", False))
+        spot_core_pullback = strategy == "trend_pullback" and str(signal_metadata.get("symbol_bucket", "") or "") in {"majors", "exchange_beta"}
+        if strategy not in {"trend_breakout", "mean_reversion"} and not high_beta_quality_escape and not spot_core_pullback:
+            return
         if bool(metadata.get("partial_profit_taken", False)):
             return
         entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
@@ -2822,30 +3740,102 @@ class HistoricalSimulationEngine:
             return
         side = str(getattr(position, "side", "long") or "long")
         rr_move = ((float(bar["high"]) - entry_price) / risk_dist) if side == "long" else ((entry_price - float(bar["low"])) / risk_dist)
-        if strategy == "mean_reversion":
+        if high_beta_quality_escape:
+            trigger_rr = float(getattr(self.config, "partial_profit_take_high_beta_pullback_trigger_rr", 0.35) or 0.35)
+            fraction = float(getattr(self.config, "partial_profit_take_high_beta_pullback_fraction", 0.45) or 0.45)
+            stop_lock_rr = float(getattr(self.config, "partial_profit_take_high_beta_pullback_stop_lock_rr", 0.12) or 0.12)
+            take_reason = "high_beta_pullback_partial_profit_take"
+        elif spot_core_pullback:
+            trigger_rr = float(getattr(self.config, "partial_profit_take_spot_core_pullback_trigger_rr", 0.40) or 0.40)
+            fraction = float(getattr(self.config, "partial_profit_take_spot_core_pullback_fraction", 0.35) or 0.35)
+            stop_lock_rr = float(getattr(self.config, "partial_profit_take_spot_core_pullback_stop_lock_rr", 0.12) or 0.12)
+            take_reason = "spot_core_pullback_partial_profit_take"
+        elif strategy == "mean_reversion":
             trigger_rr = float(getattr(self.config, "partial_profit_take_mean_reversion_trigger_rr", 0.70) or 0.70)
             fraction = float(getattr(self.config, "partial_profit_take_mean_reversion_fraction", 0.50) or 0.50)
+            stop_lock_rr = 0.0
+            take_reason = f"{strategy}_partial_profit_take"
         else:
             trigger_rr = float(getattr(self.config, "partial_profit_take_breakout_trigger_rr", 1.00) or 1.00)
             fraction = float(getattr(self.config, "partial_profit_take_breakout_fraction", 0.35) or 0.35)
+            stop_lock_rr = 0.0
+            take_reason = f"{strategy}_partial_profit_take"
+        profile = self._regime_exit_profile(position)
+        if stop_lock_rr > 0.0:
+            stop_lock_rr = self._regime_adjusted_partial_lock_rr(position, stop_lock_rr)
+            metadata["regime_exit_profile"] = profile
+            metadata["regime_adjusted_partial_stop_lock_rr"] = float(stop_lock_rr)
         if rr_move < trigger_rr or fraction <= 0.0:
             return
         closed_size = current_size * min(max(fraction, 0.05), 0.90)
         remaining_size = current_size - closed_size
         if closed_size <= 0.0 or remaining_size <= 1e-9:
             return
-        exit_price, exit_fee = self._apply_exit_costs(position, float(bar["close"]), bar)
+        raw_partial_exit = float(bar["close"])
+        trigger_price = entry_price + (risk_dist * trigger_rr) if side == "long" else entry_price - (risk_dist * trigger_rr)
+        if high_beta_quality_escape or spot_core_pullback:
+            raw_partial_exit = max(raw_partial_exit, trigger_price) if side == "long" else min(raw_partial_exit, trigger_price)
+        exit_price, exit_fee = self._apply_exit_costs(position, raw_partial_exit, bar)
         partial_gross_pl = self._gross_pl(side, entry_price, exit_price, closed_size)
         self.state.balance += partial_gross_pl - exit_fee
         position.size = remaining_size
         metadata["partial_profit_taken"] = True
+        if current_index is not None:
+            metadata["partial_profit_bar_index"] = int(current_index)
         metadata["partial_profit_taken_fraction"] = float(closed_size / max(current_size, 1e-9))
+        metadata["partial_profit_rr_move"] = float(rr_move)
+        metadata["partial_profit_close_price"] = float(exit_price)
         metadata["partial_realized_gross_pl"] = float(metadata.get("partial_realized_gross_pl", 0.0) or 0.0) + partial_gross_pl
         metadata["partial_exit_fees"] = float(metadata.get("partial_exit_fees", 0.0) or 0.0) + exit_fee
-        metadata["partial_profit_take_reason"] = f"{strategy}_partial_profit_take"
+        metadata["partial_profit_take_reason"] = take_reason
+        if stop_lock_rr > 0.0:
+            fee_lock_rr = self._fee_aware_partial_profit_stop_lock_rr(
+                position,
+                entry_price=entry_price,
+                risk_dist=risk_dist,
+                remaining_size=remaining_size,
+                partial_gross_pl=float(metadata.get("partial_realized_gross_pl", 0.0) or 0.0),
+                partial_exit_fees=float(metadata.get("partial_exit_fees", 0.0) or 0.0),
+            )
+            lock_rr = min(max(stop_lock_rr, fee_lock_rr, 0.0), max(rr_move - 0.05, 0.0))
+            if side == "long":
+                protected_stop = entry_price + (risk_dist * lock_rr)
+                if protected_stop > float(getattr(position, "stop_loss", 0.0) or 0.0):
+                    position.stop_loss = protected_stop
+                    metadata["partial_profit_stop_lock_rr"] = float(lock_rr)
+                    metadata["partial_profit_fee_aware_stop_lock_rr"] = float(fee_lock_rr)
+            else:
+                protected_stop = entry_price - (risk_dist * lock_rr)
+                if protected_stop < float(getattr(position, "stop_loss", 0.0) or 0.0):
+                    position.stop_loss = protected_stop
+                    metadata["partial_profit_stop_lock_rr"] = float(lock_rr)
+                    metadata["partial_profit_fee_aware_stop_lock_rr"] = float(fee_lock_rr)
         position.metadata = metadata
         self._partial_profit_takes += 1
         self._increment_counter(self._partial_profit_takes_by_strategy, strategy)
+
+    def _fee_aware_partial_profit_stop_lock_rr(
+        self,
+        position: Position,
+        *,
+        entry_price: float,
+        risk_dist: float,
+        remaining_size: float,
+        partial_gross_pl: float,
+        partial_exit_fees: float,
+    ) -> float:
+        if not bool(getattr(self.config, "partial_profit_fee_aware_stop_lock_enabled", True)):
+            return 0.0
+        if entry_price <= 0.0 or risk_dist <= 0.0 or remaining_size <= 0.0:
+            return 0.0
+        fee_rate = float(getattr(self.config, "backtest_fee_bps", 10.0) or 10.0) / 10000.0
+        entry_fees = float(getattr(position, "fee_paid", 0.0) or 0.0)
+        estimated_exit_fee = abs(entry_price * remaining_size * fee_rate)
+        buffer_cost = abs(entry_price * remaining_size * (float(getattr(self.config, "partial_profit_fee_aware_stop_lock_buffer_bps", 2.0) or 2.0) / 10000.0))
+        net_cost_to_cover = max(entry_fees + partial_exit_fees + estimated_exit_fee + buffer_cost - partial_gross_pl, 0.0)
+        raw_lock_rr = net_cost_to_cover / max(risk_dist * remaining_size, 1e-9)
+        max_lock_rr = max(float(getattr(self.config, "partial_profit_fee_aware_stop_lock_max_rr", 0.18) or 0.18), 0.0)
+        return min(raw_lock_rr, max_lock_rr) if max_lock_rr > 0.0 else raw_lock_rr
 
     def _apply_volatility_tightening(self, position: Position, symbol: str, risk_dist: float) -> None:
         if risk_dist <= 0 or not hasattr(self.signals, "compute_atr"):
@@ -2923,7 +3913,7 @@ class HistoricalSimulationEngine:
         fallback = 1.35 if soft else 2.25
         return float(getattr(self.config, key, fallback) or fallback)
 
-    def _trigger_exit(self, position: Position, bar: "pd.Series") -> tuple[str, float | None, Dict[str, Any]]:
+    def _trigger_exit(self, position: Position, bar: "pd.Series", current_index: int | None = None) -> tuple[str, float | None, Dict[str, Any]]:
         side = str(getattr(position, "side", "long"))
         open_price = float(bar["open"])
         high = float(bar["high"])
@@ -2939,48 +3929,200 @@ class HistoricalSimulationEngine:
             "take_profit": take_profit,
             "ambiguous_bar": False,
             "path_assumption": "gap_then_touch",
+            "regime_exit_profile": self._regime_exit_profile(position),
         }
+        def _stop_reason(raw_price: float) -> str:
+            metadata = dict(getattr(position, "metadata", {}) or {})
+            if not bool(metadata.get("partial_profit_taken", False)):
+                return "SL"
+            if float(metadata.get("partial_profit_stop_lock_rr", 0.0) or 0.0) <= 0.0:
+                return "SL"
+            entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
+            protected = (raw_price > entry_price) if side == "long" else (raw_price < entry_price)
+            if not protected:
+                return "SL"
+            details["profit_protected_stop"] = True
+            details["partial_profit_stop_lock_rr"] = float(metadata.get("partial_profit_stop_lock_rr", 0.0) or 0.0)
+            return "PROFIT_PROTECT_STOP"
         if side == "long":
             if open_price <= stop_loss:
-                return "SL", open_price, details
+                return _stop_reason(open_price), open_price, details
             if open_price >= take_profit:
                 return "TP", open_price, details
+            thesis_reason, thesis_price = self._thesis_failure_exit(position, float(bar["close"]))
+            if thesis_reason != "OPEN" and str(thesis_reason).startswith("HIGH_BETA_"):
+                details["path_assumption"] = "pre_stop_high_beta_thesis_failure"
+                return thesis_reason, thesis_price, details
             stop_hit = low <= stop_loss
             tp_hit = high >= take_profit
             if stop_hit and tp_hit:
                 details["ambiguous_bar"] = True
                 details["path_assumption"] = "conservative_worst_case"
                 self._ambiguous_exit_bars += 1
-                return "SL", stop_loss, details
+                return _stop_reason(stop_loss), stop_loss, details
             if stop_hit:
-                return "SL", stop_loss, details
+                return _stop_reason(stop_loss), stop_loss, details
             if tp_hit:
                 return "TP", take_profit, details
+            follow_reason, follow_price, follow_details = self._winner_follow_through_exit(position, float(bar["close"]), current_index=current_index)
+            if follow_reason != "OPEN":
+                details.update(follow_details)
+                details["path_assumption"] = "close_follow_through_failure"
+                return follow_reason, follow_price, details
+            thesis_reason, thesis_price = self._thesis_failure_exit(position, float(bar["close"]))
+            if thesis_reason != "OPEN":
+                details["path_assumption"] = "close_thesis_failure"
+                return thesis_reason, thesis_price, details
             reclaim_reason, reclaim_price = self._mean_reversion_reclaim_failure_exit(position, float(bar["close"]))
             if reclaim_reason != "OPEN":
                 details["path_assumption"] = "close_reclaim_failure"
                 return reclaim_reason, reclaim_price, details
             return "OPEN", None, details
         if open_price >= stop_loss:
-            return "SL", open_price, details
+            return _stop_reason(open_price), open_price, details
         if open_price <= take_profit:
             return "TP", open_price, details
+        thesis_reason, thesis_price = self._thesis_failure_exit(position, float(bar["close"]))
+        if thesis_reason != "OPEN" and str(thesis_reason).startswith("HIGH_BETA_"):
+            details["path_assumption"] = "pre_stop_high_beta_thesis_failure"
+            return thesis_reason, thesis_price, details
         stop_hit = high >= stop_loss
         tp_hit = low <= take_profit
         if stop_hit and tp_hit:
             details["ambiguous_bar"] = True
             details["path_assumption"] = "conservative_worst_case"
             self._ambiguous_exit_bars += 1
-            return "SL", stop_loss, details
+            return _stop_reason(stop_loss), stop_loss, details
         if stop_hit:
-            return "SL", stop_loss, details
+            return _stop_reason(stop_loss), stop_loss, details
         if tp_hit:
             return "TP", take_profit, details
+        follow_reason, follow_price, follow_details = self._winner_follow_through_exit(position, float(bar["close"]), current_index=current_index)
+        if follow_reason != "OPEN":
+            details.update(follow_details)
+            details["path_assumption"] = "close_follow_through_failure"
+            return follow_reason, follow_price, details
+        thesis_reason, thesis_price = self._thesis_failure_exit(position, float(bar["close"]))
+        if thesis_reason != "OPEN":
+            details["path_assumption"] = "close_thesis_failure"
+            return thesis_reason, thesis_price, details
         reclaim_reason, reclaim_price = self._mean_reversion_reclaim_failure_exit(position, float(bar["close"]))
         if reclaim_reason != "OPEN":
             details["path_assumption"] = "close_reclaim_failure"
             return reclaim_reason, reclaim_price, details
         return "OPEN", None, details
+
+    def _winner_follow_through_exit(self, position: Position, close_price: float, current_index: int | None = None) -> tuple[str, float | None, Dict[str, Any]]:
+        if not bool(getattr(self.config, "winner_follow_through_filter_enabled", True)):
+            return "OPEN", None, {}
+        metadata = dict(getattr(position, "metadata", {}) or {})
+        if not bool(metadata.get("partial_profit_taken", False)):
+            return "OPEN", None, {}
+        entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
+        base_sl = float(getattr(position, "initial_stop_loss", None) or getattr(position, "stop_loss", 0.0) or 0.0)
+        risk_dist = abs(entry_price - base_sl)
+        if entry_price <= 0.0 or risk_dist <= 0.0 or close_price <= 0.0:
+            return "OPEN", None, {}
+        partial_index = metadata.get("partial_profit_bar_index")
+        confirm_bars = max(int(getattr(self.config, "winner_follow_through_confirm_bars", 2) or 2), 1)
+        if current_index is not None and partial_index is not None:
+            try:
+                bars_since_partial = int(current_index) - int(partial_index)
+            except (TypeError, ValueError):
+                bars_since_partial = confirm_bars
+            if bars_since_partial < confirm_bars:
+                return "OPEN", None, {}
+        side = str(getattr(position, "side", "long") or "long")
+        current_rr = ((close_price - entry_price) / risk_dist) if side == "long" else ((entry_price - close_price) / risk_dist)
+        partial_rr = float(metadata.get("partial_profit_rr_move", metadata.get("partial_profit_stop_lock_rr", 0.0)) or 0.0)
+        mfe_r = float(metadata.get("mfe_r", 0.0) or 0.0)
+        min_mfe = float(getattr(self.config, "winner_follow_through_min_mfe_r", 0.35) or 0.35)
+        if mfe_r < min_mfe:
+            return "OPEN", None, {}
+        min_progress = float(getattr(self.config, "winner_follow_through_min_progress_after_partial_rr", 0.10) or 0.10)
+        max_giveback = float(getattr(self.config, "winner_follow_through_max_giveback_rr", 0.22) or 0.22)
+        progress_target = partial_rr + min_progress
+        giveback_floor = max(float(metadata.get("partial_profit_stop_lock_rr", 0.0) or 0.0), partial_rr - max_giveback)
+        if mfe_r < progress_target and current_rr <= giveback_floor:
+            return (
+                "WINNER_FOLLOW_THROUGH_FAIL",
+                close_price,
+                {
+                    "winner_follow_through_fail": True,
+                    "current_rr": float(current_rr),
+                    "partial_profit_rr_move": float(partial_rr),
+                    "mfe_r": float(mfe_r),
+                    "progress_target_rr": float(progress_target),
+                    "giveback_floor_rr": float(giveback_floor),
+                },
+            )
+        return "OPEN", None, {}
+
+    def _thesis_failure_exit(self, position: Position, close_price: float) -> tuple[str, float | None]:
+        strategy = str(getattr(position, "strategy", "unknown") or "unknown").lower()
+        if strategy not in {"trend_breakout", "trend_pullback", "mean_reversion"}:
+            return "OPEN", None
+        entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
+        base_sl = float(getattr(position, "initial_stop_loss", None) or getattr(position, "stop_loss", 0.0) or 0.0)
+        risk_dist = abs(entry_price - base_sl)
+        if risk_dist <= 0 or close_price <= 0:
+            return "OPEN", None
+        metadata = dict(getattr(position, "metadata", {}) or {})
+        mfe_r = float(metadata.get("mfe_r", 0.0) or 0.0)
+        side = str(getattr(position, "side", "long") or "long")
+        close_rr = ((close_price - entry_price) / risk_dist) if side == "long" else ((entry_price - close_price) / risk_dist)
+        signal_snapshot = dict(metadata.get("signal_snapshot", {}) or {})
+        signal_meta = dict(signal_snapshot.get("metadata", {}) or {})
+        if strategy == "trend_breakout":
+            activation_rr = float(getattr(self.config, "breakout_thesis_fail_activation_rr", 0.10) or 0.10)
+            close_floor = float(getattr(self.config, "breakout_thesis_fail_close_rr", -0.20) or -0.20)
+            close_floor = self._regime_adjusted_close_floor_rr(position, close_floor)
+            structure_buffer_rr = float(getattr(self.config, "breakout_thesis_fail_structure_buffer_rr", 0.08) or 0.08)
+            breakout_level = float(signal_meta.get("breakout_level", signal_snapshot.get("breakout_level", 0.0)) or 0.0)
+            if mfe_r <= activation_rr and close_rr <= close_floor:
+                return "BREAKOUT_THESIS_FAIL", close_price
+            if bool(metadata.get("volatility_tightened", False)) and close_rr <= max(close_floor, -0.08):
+                return "BREAKOUT_THESIS_FAIL", close_price
+            if breakout_level > 0.0:
+                failed_level = close_price < (breakout_level - (risk_dist * structure_buffer_rr)) if side == "long" else close_price > (breakout_level + (risk_dist * structure_buffer_rr))
+                if failed_level and close_rr <= max(close_floor, -0.05):
+                    return "BREAKOUT_STRUCTURE_FAIL", close_price
+        elif strategy == "trend_pullback":
+            activation_rr = float(getattr(self.config, "pullback_thesis_fail_activation_rr", 0.05) or 0.05)
+            close_floor = float(getattr(self.config, "pullback_thesis_fail_close_rr", -0.15) or -0.15)
+            close_floor = self._regime_adjusted_close_floor_rr(position, close_floor)
+            trend_persistence = float(signal_meta.get("trend_persistence", signal_snapshot.get("trend_persistence", 0.0)) or 0.0)
+            min_trend_persistence = float(getattr(self.config, "pullback_thesis_fail_min_trend_persistence", 0.50) or 0.50)
+            if bool(signal_meta.get("high_beta_quality_escape", False)):
+                high_beta_floor = float(getattr(self.config, "high_beta_pullback_thesis_fail_close_rr", -0.08) or -0.08)
+                if close_rr <= high_beta_floor and (mfe_r < 0.55 or trend_persistence < min_trend_persistence):
+                    return "HIGH_BETA_PULLBACK_THESIS_FAIL", close_price
+            if close_rr <= close_floor and (mfe_r <= activation_rr or (trend_persistence > 0.0 and trend_persistence < min_trend_persistence)):
+                return "PULLBACK_THESIS_FAIL", close_price
+            reclaim_level = float(signal_meta.get("reclaim_level", signal_snapshot.get("reclaim_level", 0.0)) or 0.0)
+            reclaim_buffer_rr = float(getattr(self.config, "pullback_thesis_fail_reclaim_buffer_rr", 0.06) or 0.06)
+            if reclaim_level > 0.0:
+                failed_reclaim = close_price < (reclaim_level - (risk_dist * reclaim_buffer_rr)) if side == "long" else close_price > (reclaim_level + (risk_dist * reclaim_buffer_rr))
+                if failed_reclaim and close_rr <= max(close_floor, -0.05):
+                    return "PULLBACK_RECLAIM_FAIL", close_price
+            structure_level = float(
+                signal_meta.get(
+                    "structure_support",
+                    signal_snapshot.get("structure_support", signal_meta.get("structure_resistance", signal_snapshot.get("structure_resistance", 0.0))),
+                )
+                or 0.0
+            )
+            structure_buffer_rr = float(getattr(self.config, "pullback_thesis_fail_structure_buffer_rr", 0.10) or 0.10)
+            if structure_level > 0.0:
+                failed_structure = close_price < (structure_level - (risk_dist * structure_buffer_rr)) if side == "long" else close_price > (structure_level + (risk_dist * structure_buffer_rr))
+                if failed_structure and close_rr <= max(close_floor, -0.05):
+                    return "PULLBACK_STRUCTURE_FAIL", close_price
+        else:
+            close_floor = float(getattr(self.config, "mean_reversion_thesis_fail_close_rr", -0.12) or -0.12)
+            close_floor = self._regime_adjusted_close_floor_rr(position, close_floor)
+            if close_rr <= close_floor and mfe_r < 0.20:
+                return "MEAN_REVERSION_THESIS_FAIL", close_price
+        return "OPEN", None
 
     def _mean_reversion_reclaim_failure_exit(self, position: Position, close_price: float) -> tuple[str, float | None]:
         strategy = str(getattr(position, "strategy", "unknown") or "unknown").lower()
@@ -3016,6 +4158,18 @@ class HistoricalSimulationEngine:
         slippage = base_slippage + volatility_slippage
         direction = -1.0 if side == "long" else 1.0
         adjusted = raw_price * (1.0 + (direction * ((spread_fraction / 2.0) + slippage)))
+        metadata = dict(getattr(position, "metadata", {}) or {})
+        protected_lock_rr = float(metadata.get("partial_profit_stop_lock_rr", 0.0) or 0.0)
+        if protected_lock_rr > 0.0:
+            entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
+            base_sl = float(getattr(position, "initial_stop_loss", None) or getattr(position, "stop_loss", 0.0) or 0.0)
+            risk_dist = abs(entry_price - base_sl)
+            min_lock_rr = max(protected_lock_rr, 0.0)
+            if entry_price > 0.0 and risk_dist > 0.0 and min_lock_rr > 0.0:
+                if side == "long" and raw_price > entry_price:
+                    adjusted = max(adjusted, entry_price + (risk_dist * min_lock_rr))
+                elif side != "long" and raw_price < entry_price:
+                    adjusted = min(adjusted, entry_price - (risk_dist * min_lock_rr))
         fee_rate = float(getattr(self.config, "backtest_fee_bps", 10.0)) / 10000.0
         fee = abs(adjusted * float(getattr(position, "size", 0.0) or 0.0) * fee_rate)
         return adjusted, fee
@@ -3125,6 +4279,210 @@ class HistoricalSimulationEngine:
                 self._persist_checkpoint(current_index, total_bars, timeline)
                 self._write_artifact_manifest()
 
+    def _label_triple_barrier_signal(self, signal: Mapping[str, Any]) -> Dict[str, Any] | None:
+        if not bool(getattr(self.config, "triple_barrier_labeling_enabled", True)):
+            return None
+        if self.exchange is None or getattr(self.exchange, "current_time", None) is None:
+            return {"label": "UNAVAILABLE", "reason": "missing_exchange_time"}
+        symbol = str(signal.get("symbol", "") or "")
+        side = str(signal.get("side", "long") or "long").lower()
+        timeframe = str(getattr(self, "_base_timeframe", "") or getattr(self.exchange, "base_timeframe", "15m") or "15m")
+        try:
+            entry_price = float(signal.get("entry_price", 0.0) or 0.0)
+            stop_loss = float(signal.get("stop_loss", 0.0) or 0.0)
+            take_profit = float(signal.get("take_profit", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return {"label": "UNAVAILABLE", "reason": "invalid_signal_prices"}
+        if not symbol or entry_price <= 0.0 or stop_loss <= 0.0 or take_profit <= 0.0:
+            return {"label": "UNAVAILABLE", "reason": "missing_signal_prices"}
+        if side == "short":
+            if not (take_profit < entry_price < stop_loss):
+                return {"label": "UNAVAILABLE", "reason": "invalid_short_barriers"}
+        elif not (stop_loss < entry_price < take_profit):
+            return {"label": "UNAVAILABLE", "reason": "invalid_long_barriers"}
+
+        timeline = self.exchange.universe.timeline([symbol], timeframe=timeframe)
+        current_time = _normalize_timestamp(getattr(self.exchange, "current_time")).to_pydatetime()
+        try:
+            cursor = timeline.index(current_time)
+        except ValueError:
+            return {"label": "UNAVAILABLE", "reason": "current_time_not_in_symbol_timeline"}
+        horizon_bars = max(int(getattr(self.config, "triple_barrier_label_horizon_bars", 12) or 12), 1)
+        label = "TIME_EXIT"
+        bars_to_label = min(horizon_bars, max(len(timeline) - cursor - 1, 0))
+        hit_time: str | None = None
+        for offset, future_time in enumerate(timeline[cursor + 1 : cursor + 1 + horizon_bars], start=1):
+            bar = self.exchange.universe.bar_for_time(symbol, timeframe, future_time)
+            if bar is None:
+                continue
+            high = float(bar["high"])
+            low = float(bar["low"])
+            if side == "short":
+                hit_tp = low <= take_profit
+                hit_sl = high >= stop_loss
+            else:
+                hit_tp = high >= take_profit
+                hit_sl = low <= stop_loss
+            if hit_tp and hit_sl:
+                label = "AMBIGUOUS"
+            elif hit_tp:
+                label = "TP_FIRST"
+            elif hit_sl:
+                label = "SL_FIRST"
+            else:
+                continue
+            bars_to_label = offset
+            hit_time = future_time.isoformat()
+            break
+
+        bucket_key = self._triple_barrier_bucket_key(signal)
+        return {
+            "label": label,
+            "symbol": symbol,
+            "strategy": str(signal.get("strategy", "unknown") or "unknown"),
+            "side": side,
+            "timeframe": timeframe,
+            "horizon_bars": horizon_bars,
+            "bars_to_label": int(bars_to_label),
+            "hit_time": hit_time,
+            "bucket_key": bucket_key,
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+        }
+
+    def _triple_barrier_bucket_key(self, signal: Mapping[str, Any]) -> str:
+        metadata = dict(signal.get("metadata", {}) or {})
+
+        def bucket(value: Any, low: float, high: float, prefix: str) -> str:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return f"{prefix}_unknown"
+            if numeric < low:
+                return f"{prefix}_low"
+            if numeric < high:
+                return f"{prefix}_mid"
+            return f"{prefix}_high"
+
+        strategy = str(signal.get("strategy", "unknown") or "unknown")
+        symbol = str(signal.get("symbol", "unknown") or "unknown")
+        regime = str(signal.get("regime", metadata.get("regime", "unknown")) or "unknown")
+        pullback = bucket(metadata.get("pullback_score", signal.get("pullback_score")), 1.5, 2.5, "pullback")
+        volatility = bucket(metadata.get("realized_vol_percentile", metadata.get("volatility_percentile")), 0.33, 0.66, "vol")
+        liquidity = bucket(metadata.get("liquidity_score", signal.get("liquidity_score")), 0.50, 0.80, "liq")
+        return "|".join([strategy, symbol, regime, pullback, volatility, liquidity])
+
+    def _record_triple_barrier_label(self, signal: Mapping[str, Any], label_payload: Mapping[str, Any]) -> None:
+        label = str(label_payload.get("label", "UNAVAILABLE") or "UNAVAILABLE")
+        strategy = str(signal.get("strategy", "unknown") or "unknown")
+        symbol = str(signal.get("symbol", "unknown") or "unknown")
+        bucket_key = str(label_payload.get("bucket_key", self._triple_barrier_bucket_key(signal)) or "unknown")
+        self._increment_counter(self._triple_barrier_label_counts, label)
+        self._increment_nested_counter(self._triple_barrier_label_counts_by_strategy, strategy, label)
+        self._increment_nested_counter(self._triple_barrier_label_counts_by_symbol, symbol, label)
+        bucket = self._triple_barrier_bucket_stats.setdefault(
+            bucket_key,
+            {
+                "samples": 0,
+                "label_counts": {},
+                "strategy": strategy,
+                "symbol": symbol,
+            },
+        )
+        bucket["samples"] = int(bucket.get("samples", 0) or 0) + 1
+        label_counts = bucket.setdefault("label_counts", {})
+        label_counts[label] = int(label_counts.get(label, 0) or 0) + 1
+        if len(self._triple_barrier_labels) < 250:
+            self._triple_barrier_labels.append(
+                {
+                    "label": label,
+                    "strategy": strategy,
+                    "symbol": symbol,
+                    "side": str(label_payload.get("side", signal.get("side", "long")) or "long"),
+                    "bars_to_label": int(label_payload.get("bars_to_label", 0) or 0),
+                    "bucket_key": bucket_key,
+                }
+            )
+
+    def _pullback_meta_filter_reason(self, signal: Mapping[str, Any]) -> str | None:
+        if not bool(getattr(self.config, "pullback_meta_filter_enabled", True)):
+            return None
+        if str(signal.get("strategy", "") or "") != "trend_pullback":
+            return None
+        quality = float(signal.get("signal_quality", signal.get("confidence", 0.0)) or 0.0)
+        edge_bps = float(signal.get("expected_edge_bps", 0.0) or 0.0)
+        if (
+            quality >= float(getattr(self.config, "pullback_meta_filter_quality_escape_score", 0.82) or 0.82)
+            and edge_bps >= float(getattr(self.config, "pullback_meta_filter_quality_escape_edge_bps", 45.0) or 45.0)
+        ):
+            return None
+        metadata = dict(signal.get("metadata", {}) or {})
+        label_payload = dict(metadata.get("triple_barrier_label", {}) or {})
+        bucket_key = str(label_payload.get("bucket_key", self._triple_barrier_bucket_key(signal)) or "unknown")
+        bucket = dict(self._triple_barrier_bucket_stats.get(bucket_key, {}) or {})
+        label_counts = dict(bucket.get("label_counts", {}) or {})
+
+        # The current signal is labelled for diagnostics before filtering. Remove it
+        # from the decision sample so the filter only learns from prior bucket evidence.
+        current_label = str(label_payload.get("label", "") or "")
+        if current_label and current_label in label_counts:
+            label_counts[current_label] = max(int(label_counts.get(current_label, 0) or 0) - 1, 0)
+        samples = sum(int(value or 0) for value in label_counts.values())
+        if samples < max(int(getattr(self.config, "pullback_meta_filter_min_bucket_samples", 3) or 3), 1):
+            return None
+        sl_first = int(label_counts.get("SL_FIRST", 0) or 0)
+        tp_first = int(label_counts.get("TP_FIRST", 0) or 0)
+        sl_first_pct = sl_first / samples * 100.0 if samples else 0.0
+        tp_first_pct = tp_first / samples * 100.0 if samples else 0.0
+        max_sl_pct = float(getattr(self.config, "pullback_meta_filter_max_sl_first_pct", 60.0) or 60.0)
+        min_tp_pct = float(getattr(self.config, "pullback_meta_filter_min_tp_first_pct", 20.0) or 20.0)
+        if sl_first_pct >= max_sl_pct and tp_first_pct <= min_tp_pct:
+            metadata["pullback_meta_filter"] = {
+                "bucket_key": bucket_key,
+                "samples": int(samples),
+                "sl_first_pct": sl_first_pct,
+                "tp_first_pct": tp_first_pct,
+                "label_counts": dict(sorted(label_counts.items())),
+            }
+            signal["metadata"] = metadata  # type: ignore[index]
+            return "pullback_meta_filter_stop_first_bucket"
+        return None
+
+    def _build_triple_barrier_summary(self) -> Dict[str, Any]:
+        total = sum(int(value or 0) for value in self._triple_barrier_label_counts.values())
+        bucket_stats: Dict[str, Dict[str, Any]] = {}
+        min_samples = max(int(getattr(self.config, "triple_barrier_label_min_bucket_samples", 1) or 1), 1)
+        for key, payload in sorted(self._triple_barrier_bucket_stats.items()):
+            samples = int(payload.get("samples", 0) or 0)
+            if samples < min_samples:
+                continue
+            label_counts = dict(sorted(dict(payload.get("label_counts", {}) or {}).items()))
+            bucket_stats[key] = {
+                "samples": samples,
+                "label_counts": label_counts,
+                "tp_first_rate_pct": (float(label_counts.get("TP_FIRST", 0) or 0) / samples * 100.0) if samples else 0.0,
+                "sl_first_rate_pct": (float(label_counts.get("SL_FIRST", 0) or 0) / samples * 100.0) if samples else 0.0,
+                "time_exit_rate_pct": (float(label_counts.get("TIME_EXIT", 0) or 0) / samples * 100.0) if samples else 0.0,
+                "ambiguous_rate_pct": (float(label_counts.get("AMBIGUOUS", 0) or 0) / samples * 100.0) if samples else 0.0,
+                "strategy": str(payload.get("strategy", "unknown") or "unknown"),
+                "symbol": str(payload.get("symbol", "unknown") or "unknown"),
+            }
+        return {
+            "labels": int(total),
+            "label_counts": dict(sorted(self._triple_barrier_label_counts.items())),
+            "label_counts_by_strategy": {
+                strategy: dict(sorted(counts.items()))
+                for strategy, counts in sorted(self._triple_barrier_label_counts_by_strategy.items())
+            },
+            "label_counts_by_symbol": {
+                symbol: dict(sorted(counts.items()))
+                for symbol, counts in sorted(self._triple_barrier_label_counts_by_symbol.items())
+            },
+            "bucket_stats": bucket_stats,
+            "examples": list(self._triple_barrier_labels[:12]),
+        }
+
     def _build_results(self, *, symbol: str, timeframe: str, days: int, timeline: Sequence[dt.datetime]) -> Dict[str, Any]:
         metrics = self.compute_metrics()
         learning_summary = self.learning.summary_snapshot()
@@ -3142,6 +4500,8 @@ class HistoricalSimulationEngine:
         symbol_rollups = self._build_symbol_rollups()
         campaign_diagnostics = self._build_campaign_diagnostics(symbol_rollups)
         trade_frequency = self._build_trade_frequency_summary(days=days, timeline=timeline)
+        validation_harness = self._build_validation_harness_summary(symbol_rollups)
+        triple_barrier_summary = self._build_triple_barrier_summary()
         result = {
             **metrics,
             "raw_trades": len(self.trades),
@@ -3194,6 +4554,8 @@ class HistoricalSimulationEngine:
                     "proposals": int(self._proposal_count),
                     "raw_signals": int(self._raw_signals),
                     "skipped_signals": int(self._skipped_signals),
+                    "repeated_setup_blocks": int(self._repeated_setup_blocks),
+                    "fresh_setup_blocks": int(self._fresh_setup_blocks),
                     "limit_to_market_upgrades": int(self._limit_to_market_upgrades),
                     "limit_queue_priority_assists": int(self._limit_queue_priority_assists),
                     "limit_latency_reductions": int(self._limit_latency_reductions),
@@ -3219,10 +4581,19 @@ class HistoricalSimulationEngine:
                     "resumed_from_checkpoint": bool(self._resumed_from_checkpoint),
                 },
                 "universe_selection": dict(self._latest_universe_selection),
+                "market_data": {
+                    "datasets": dict(sorted(self._historical_data_rows.items())),
+                    "datasets_loaded": int(sum(1 for rows in self._historical_data_rows.values() if int(rows or 0) > 0)),
+                    "datasets_missing": int(sum(1 for rows in self._historical_data_rows.values() if int(rows or 0) <= 0)),
+                    "total_rows": int(sum(int(rows or 0) for rows in self._historical_data_rows.values())),
+                    "data_available": bool(any(int(rows or 0) > 0 for rows in self._historical_data_rows.values())),
+                },
                 "trade_frequency": trade_frequency,
-                "acceptance": self._build_campaign_acceptance_summary(metrics=metrics, trade_frequency=trade_frequency),
+                "acceptance": self._build_campaign_acceptance_summary(metrics=metrics, trade_frequency=trade_frequency, validation_harness=validation_harness),
                 "realized_performance": self._build_realized_performance_summary(symbol_rollups),
                 "exit_quality": self._build_exit_quality_summary(),
+                "validation_harness": validation_harness,
+                "triple_barrier": triple_barrier_summary,
             },
             "campaign_diagnostics": campaign_diagnostics,
             "decision_diagnostics": {
@@ -3278,11 +4649,61 @@ class HistoricalSimulationEngine:
                     strategy: dict(sorted(reason_counts.items()))
                     for strategy, reason_counts in sorted(self._missed_opportunity_relaxations_by_strategy.items())
                 },
+                "frequency_expansion_allowed_count": int(self._frequency_expansion_allowed_count),
+                "frequency_expansion_blocked_count": int(self._frequency_expansion_blocked_count),
+                "frequency_expansion_block_reasons": dict(sorted(self._frequency_expansion_block_reasons.items())),
                 "signals_by_strategy": dict(sorted(self._signals_by_strategy.items())),
                 "signals_by_regime": dict(sorted(self._signals_by_regime.items())),
                 "signals_by_order_type": dict(sorted(self._signals_by_order_type.items())),
+                "triple_barrier_label_counts": dict(sorted(self._triple_barrier_label_counts.items())),
+                "triple_barrier_label_counts_by_strategy": {
+                    strategy: dict(sorted(counts.items()))
+                    for strategy, counts in sorted(self._triple_barrier_label_counts_by_strategy.items())
+                },
+                "triple_barrier_label_counts_by_symbol": {
+                    symbol: dict(sorted(counts.items()))
+                    for symbol, counts in sorted(self._triple_barrier_label_counts_by_symbol.items())
+                },
+                "pullback_meta_filter_blocks": int(self._pullback_meta_filter_blocks),
+                "pullback_meta_filter_blocks_by_bucket": dict(sorted(self._pullback_meta_filter_blocks_by_bucket.items())),
+                "pullback_meta_filter_blocks_by_symbol": dict(sorted(self._pullback_meta_filter_blocks_by_symbol.items())),
                 "limit_to_market_upgrades": int(self._limit_to_market_upgrades),
                 "limit_to_market_upgrades_by_strategy": dict(sorted(self._limit_to_market_upgrades_by_strategy.items())),
+                "repeated_setup_blocks": int(self._repeated_setup_blocks),
+                "repeated_setup_blocks_by_strategy": dict(sorted(self._repeated_setup_blocks_by_strategy.items())),
+                "fresh_setup_blocks": int(self._fresh_setup_blocks),
+                "fresh_setup_blocks_by_strategy": dict(sorted(self._fresh_setup_blocks_by_strategy.items())),
+                "replacement_candidates_seen": int(self._replacement_candidates_seen),
+                "replacement_candidates_selected": int(self._replacement_candidates_selected),
+                "replacement_candidates_by_strategy": dict(sorted(self._replacement_candidates_by_strategy.items())),
+                "replacement_selected_by_strategy": dict(sorted(self._replacement_selected_by_strategy.items())),
+                "replacement_candidates_by_symbol": dict(sorted(self._replacement_candidates_by_symbol.items())),
+                "replacement_rejections_by_reason": dict(sorted(self._replacement_rejections_by_reason.items())),
+                "replacement_cross_symbol_selected": int(self._replacement_cross_symbol_selected),
+                "replacement_cross_symbol_selected_by_strategy": dict(sorted(self._replacement_cross_symbol_selected_by_strategy.items())),
+                "replacement_near_misses_seen": int(self._replacement_near_misses_seen),
+                "replacement_near_misses_by_strategy": dict(sorted(self._replacement_near_misses_by_strategy.items())),
+                "replacement_near_misses_by_symbol": dict(sorted(self._replacement_near_misses_by_symbol.items())),
+                "replacement_near_misses_by_reason": dict(sorted(self._replacement_near_misses_by_reason.items())),
+                "replacement_near_misses_by_detail": dict(sorted(self._replacement_near_misses_by_detail.items())),
+                "replacement_near_miss_examples": list(self._replacement_near_miss_examples),
+                "replacement_submitted": int(self._replacement_submitted),
+                "replacement_filled": int(self._replacement_filled),
+                "replacement_closed": int(self._replacement_closed),
+                "replacement_wins": int(self._replacement_wins),
+                "replacement_losses": int(self._replacement_losses),
+                "replacement_submitted_by_strategy": dict(sorted(self._replacement_submitted_by_strategy.items())),
+                "replacement_filled_by_strategy": dict(sorted(self._replacement_filled_by_strategy.items())),
+                "replacement_closed_by_strategy": dict(sorted(self._replacement_closed_by_strategy.items())),
+                "replacement_wins_by_strategy": dict(sorted(self._replacement_wins_by_strategy.items())),
+                "replacement_losses_by_strategy": dict(sorted(self._replacement_losses_by_strategy.items())),
+                "replacement_guard_blocks": int(self._replacement_guard_blocks),
+                "replacement_guard_blocks_by_reason": dict(sorted(self._replacement_guard_blocks_by_reason.items())),
+                "replacement_submitted_by_day": dict(sorted(self._replacement_submitted_by_day.items())),
+                "replacement_submitted_by_symbol_day": {
+                    day_key: dict(sorted(symbol_counts.items()))
+                    for day_key, symbol_counts in sorted(self._replacement_submitted_by_symbol_day.items())
+                },
                 "limit_queue_priority_assists": int(self._limit_queue_priority_assists),
                 "limit_queue_priority_assists_by_strategy": dict(sorted(self._limit_queue_priority_assists_by_strategy.items())),
                 "limit_latency_reductions": int(self._limit_latency_reductions),
@@ -3328,6 +4749,7 @@ class HistoricalSimulationEngine:
             set(symbol_rollups)
             | set(self._generation_outcomes_by_symbol)
             | set(self._generation_reasons_by_symbol)
+            | set(self._strategy_rejection_reasons_by_symbol)
             | set(self._raw_signals_by_strategy_by_symbol)
             | set(self._submitted_by_strategy_by_symbol)
             | set(self._filled_by_strategy_by_symbol)
@@ -3343,9 +4765,18 @@ class HistoricalSimulationEngine:
                 "summary": dict(symbol_rollups.get(symbol, {})),
                 "generation_outcomes": dict(sorted((self._generation_outcomes_by_symbol.get(symbol, {}) or {}).items())),
                 "generation_reasons": dict(sorted((self._generation_reasons_by_symbol.get(symbol, {}) or {}).items())),
+                "strategy_rejection_reasons": {
+                    strategy: dict(sorted((reasons or {}).items()))
+                    for strategy, reasons in sorted((self._strategy_rejection_reasons_by_symbol.get(symbol, {}) or {}).items())
+                },
                 "top_rejection_reasons": self._top_items(
                     {
                         **dict((self._generation_reasons_by_symbol.get(symbol, {}) or {})),
+                        **{
+                            f"{strategy}:{reason}": int(count or 0)
+                            for strategy, reasons in dict((self._strategy_rejection_reasons_by_symbol.get(symbol, {}) or {}).items()).items()
+                            for reason, count in dict(reasons or {}).items()
+                        },
                         **{
                             f"post_selection:{reason}": int(count or 0)
                             for reason, count in dict((self._skip_reasons_by_symbol.get(symbol, {}) or {})).items()
@@ -3390,6 +4821,9 @@ class HistoricalSimulationEngine:
 
             for reason, count in dict((self._generation_reasons_by_symbol.get(symbol, {}) or {})).items():
                 rejection_totals[f"pre_selection:{reason}"] = int(rejection_totals.get(f"pre_selection:{reason}", 0)) + int(count or 0)
+            for strategy, reasons in dict((self._strategy_rejection_reasons_by_symbol.get(symbol, {}) or {}).items()).items():
+                for reason, count in dict(reasons or {}).items():
+                    rejection_totals[f"strategy:{strategy}:{reason}"] = int(rejection_totals.get(f"strategy:{strategy}:{reason}", 0)) + int(count or 0)
 
         return {
             "primary_summary": {
@@ -3478,6 +4912,7 @@ class HistoricalSimulationEngine:
                 "trades_per_day": per_day(len(self.trades)),
                 "status": self._trade_frequency_status(per_day(len(self.trades))),
                 "controller_actions": dict(sorted(self._frequency_adjustment_counts.items())),
+                "expansion_gate": self._frequency_expansion_gate(),
             },
             "by_strategy": {
                 strategy: {
@@ -3584,9 +5019,97 @@ class HistoricalSimulationEngine:
             },
         }
 
-    def _build_campaign_acceptance_summary(self, *, metrics: Dict[str, Any], trade_frequency: Dict[str, Any]) -> Dict[str, Any]:
+    def _build_validation_harness_summary(self, symbol_rollups: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        raw_signals = int(self._raw_signals or 0)
+        submitted_orders = int(self._submitted_orders or 0)
+        filled_orders = int(self._filled_orders or 0)
+        total_trades = len(self.trades)
+        skip_total = max(int(self._skipped_signals or 0), 0)
+        repeated_setup_blocks = int(self._repeated_setup_blocks or 0)
+        fresh_setup_blocks = int(self._fresh_setup_blocks or 0)
+        triple_barrier_total = sum(int(value or 0) for value in self._triple_barrier_label_counts.values())
+        triple_barrier_tp = int(self._triple_barrier_label_counts.get("TP_FIRST", 0) or 0)
+        triple_barrier_sl = int(self._triple_barrier_label_counts.get("SL_FIRST", 0) or 0)
+        triple_barrier_time = int(self._triple_barrier_label_counts.get("TIME_EXIT", 0) or 0)
+        pre_selection_rejections: Dict[str, int] = {}
+        for reason_counts in self._generation_reasons_by_symbol.values():
+            for reason, count in dict(reason_counts or {}).items():
+                self._increment_counter(pre_selection_rejections, str(reason), int(count or 0))
+        strategy_rejections: Dict[str, int] = {}
+        for strategy_counts in self._strategy_rejection_reasons_by_symbol.values():
+            for strategy, reason_counts in dict(strategy_counts or {}).items():
+                for reason, count in dict(reason_counts or {}).items():
+                    self._increment_counter(strategy_rejections, f"{strategy}:{reason}", int(count or 0))
+        post_selection_rejections = dict(self._skip_reason_counts or {})
+        candidate_flow_starved = bool(
+            self._proposal_count <= 0
+            or raw_signals <= 0
+            or submitted_orders <= 0
+            or filled_orders <= 0
+        )
+
+        negative_trades = [trade for trade in self.trades if float(trade.get("pl", 0.0) or 0.0) < 0.0]
+        negative_total_pl = abs(sum(float(trade.get("pl", 0.0) or 0.0) for trade in negative_trades))
+        stop_loss_negative_pl = abs(
+            sum(
+                float(trade.get("pl", 0.0) or 0.0)
+                for trade in negative_trades
+                if str(trade.get("exit_reason", "UNKNOWN") or "UNKNOWN") == "SL"
+            )
+        )
+
+        return {
+            "signal_to_submission_pct": (submitted_orders / raw_signals * 100.0) if raw_signals > 0 else 0.0,
+            "submission_to_fill_pct": (filled_orders / submitted_orders * 100.0) if submitted_orders > 0 else 0.0,
+            "fill_to_close_pct": (total_trades / filled_orders * 100.0) if filled_orders > 0 else 0.0,
+            "expectancy_by_strategy": {
+                strategy: float(dict(payload or {}).get("expectancy", 0.0) or 0.0)
+                for strategy, payload in sorted(dict(self._build_realized_performance_summary(symbol_rollups).get("by_strategy", {}) or {}).items())
+            },
+            "expectancy_by_symbol": {
+                symbol: float(dict(payload or {}).get("expectancy", 0.0) or 0.0)
+                for symbol, payload in sorted(symbol_rollups.items())
+            },
+            "exit_expectancy_by_reason": {
+                reason: float(dict(payload or {}).get("expectancy", 0.0) or 0.0)
+                for reason, payload in sorted(dict(self._build_exit_quality_summary().get("by_exit_reason", {}) or {}).items())
+            },
+            "stop_loss_negative_pl_share_pct": (stop_loss_negative_pl / negative_total_pl * 100.0) if negative_total_pl > 0.0 else 0.0,
+            "repeated_setup_blocks": repeated_setup_blocks,
+            "fresh_setup_blocks": fresh_setup_blocks,
+            "repeated_setup_density_pct": (repeated_setup_blocks / skip_total * 100.0) if skip_total > 0 else 0.0,
+            "fresh_setup_block_density_pct": (fresh_setup_blocks / skip_total * 100.0) if skip_total > 0 else 0.0,
+            "triple_barrier_labels": int(triple_barrier_total),
+            "triple_barrier_tp_first_pct": (triple_barrier_tp / triple_barrier_total * 100.0) if triple_barrier_total > 0 else 0.0,
+            "triple_barrier_sl_first_pct": (triple_barrier_sl / triple_barrier_total * 100.0) if triple_barrier_total > 0 else 0.0,
+            "triple_barrier_time_exit_pct": (triple_barrier_time / triple_barrier_total * 100.0) if triple_barrier_total > 0 else 0.0,
+            "pullback_meta_filter_blocks": int(self._pullback_meta_filter_blocks),
+            "candidate_flow": {
+                "starved": candidate_flow_starved,
+                "proposals": int(self._proposal_count),
+                "raw_signals": raw_signals,
+                "submitted_orders": submitted_orders,
+                "filled_orders": filled_orders,
+                "closed_trades": total_trades,
+                "generation_outcomes": dict(sorted(self._generation_outcomes.items())),
+                "pre_selection_rejections": dict(sorted(pre_selection_rejections.items())),
+                "strategy_rejections": dict(sorted(strategy_rejections.items())),
+                "post_selection_rejections": dict(sorted(post_selection_rejections.items())),
+                "top_blockers": self._top_items(
+                    {
+                        **{f"pre:{key}": value for key, value in pre_selection_rejections.items()},
+                        **{f"strategy:{key}": value for key, value in strategy_rejections.items()},
+                        **{f"post:{key}": value for key, value in post_selection_rejections.items()},
+                    },
+                    limit=8,
+                ),
+            },
+        }
+
+    def _build_campaign_acceptance_summary(self, *, metrics: Dict[str, Any], trade_frequency: Dict[str, Any], validation_harness: Dict[str, Any] | None = None) -> Dict[str, Any]:
         global_frequency = dict(trade_frequency.get("global", {}) or {})
         target_band = dict(trade_frequency.get("target_band", {}) or {})
+        validation_harness = dict(validation_harness or {})
         trades_per_day = float(global_frequency.get("trades_per_day", global_frequency.get("closed_trades_per_day", 0.0)) or 0.0)
         preferred_min = float(target_band.get("preferred_min", getattr(self.config, "target_trades_per_day_min", 2.0)) or 0.0)
         preferred_max = float(target_band.get("preferred_max", getattr(self.config, "target_trades_per_day_max", 3.0)) or 0.0)
@@ -3594,12 +5117,18 @@ class HistoricalSimulationEngine:
         total_return_pct = float(metrics.get("total_return_pct", 0.0) or 0.0)
         profit_factor = float(metrics.get("profit_factor", 0.0) or 0.0)
         max_drawdown_pct = float(metrics.get("max_drawdown_pct", 0.0) or 0.0)
+        stop_loss_share = float(validation_harness.get("stop_loss_negative_pl_share_pct", 0.0) or 0.0)
+        signal_to_submission = float(validation_harness.get("signal_to_submission_pct", 0.0) or 0.0)
+        submission_to_fill = float(validation_harness.get("submission_to_fill_pct", 0.0) or 0.0)
         checks = {
             "trades_per_day_in_target_band": bool(preferred_min <= trades_per_day <= preferred_max),
             "win_rate_meets_floor": bool(win_rate_pct >= float(getattr(self.config, "promotion_min_win_rate_pct", 35.0) or 35.0)),
             "profit_factor_meets_floor": bool(profit_factor >= float(getattr(self.config, "promotion_min_profit_factor", 0.90) or 0.90)),
             "drawdown_within_limit": bool(abs(max_drawdown_pct) <= float(getattr(self.config, "promotion_max_drawdown_pct", 12.0) or 12.0)),
             "positive_return": bool(total_return_pct > 0.0),
+            "stop_loss_damage_within_limit": bool(stop_loss_share <= float(getattr(self.config, "promotion_max_stop_loss_negative_pl_share_pct", 55.0) or 55.0)),
+            "signal_to_submission_meets_floor": bool(signal_to_submission >= float(getattr(self.config, "promotion_min_signal_to_submission_pct", 18.0) or 18.0)),
+            "submission_to_fill_meets_floor": bool(submission_to_fill >= float(getattr(self.config, "promotion_min_submission_to_fill_pct", 45.0) or 45.0)),
         }
         return {
             "objective_hierarchy": [
@@ -3617,6 +5146,9 @@ class HistoricalSimulationEngine:
                 "total_return_pct": total_return_pct,
                 "profit_factor": profit_factor,
                 "max_drawdown_pct": max_drawdown_pct,
+                "stop_loss_negative_pl_share_pct": stop_loss_share,
+                "signal_to_submission_pct": signal_to_submission,
+                "submission_to_fill_pct": submission_to_fill,
             },
             "passes_all": bool(all(checks.values())),
         }
@@ -3752,10 +5284,18 @@ class HistoricalSimulationEngine:
         dominant_strategy = None
         if trade_counts:
             dominant_strategy = max(trade_counts.items(), key=lambda item: int(item[1] or 0))[0]
+        expansion_gate = self._frequency_expansion_gate()
+        if bool(expansion_gate.get("allowed", False)):
+            self._frequency_expansion_allowed_count += 1
+        else:
+            self._frequency_expansion_blocked_count += 1
+            self._increment_counter(self._frequency_expansion_block_reasons, str(expansion_gate.get("reason", "unknown") or "unknown"))
         return {
             "window_days": window_days,
             "trades_per_day": trades_per_day,
             "status": self._trade_frequency_status(trades_per_day),
+            "expansion_allowed": bool(expansion_gate.get("allowed", False)),
+            "expansion_gate": expansion_gate,
             "dominant_strategy": dominant_strategy,
             "strategy_trade_share": trade_share_by_strategy,
             "symbol": symbol,

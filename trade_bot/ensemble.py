@@ -192,6 +192,8 @@ class EnsembleAllocator:
         if not frequency_context:
             return {"score_delta": 0.0, "min_net_expectancy_delta": 0.0, "reason": "inactive"}
         status = str(frequency_context.get("status", "inactive") or "inactive")
+        if status in {"far_below_target", "below_target"} and "expansion_allowed" in frequency_context and not bool(frequency_context.get("expansion_allowed", False)):
+            return {"score_delta": 0.0, "min_net_expectancy_delta": 0.5, "reason": "frequency_expansion_waiting_for_exit_repair"}
         dominant_strategy = str(frequency_context.get("dominant_strategy", "") or "")
         strategy_share = float(frequency_context.get("strategy_trade_share", {}).get(strategy, 0.0) or 0.0)
         if status in {"far_below_target", "below_target"}:

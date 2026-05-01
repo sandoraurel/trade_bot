@@ -167,6 +167,8 @@ class RiskManager:
         momentum_crash_risk = float(metadata.get("momentum_crash_risk", 0.0) or 0.0)
         if strategy == "trend_breakout" and momentum_crash_risk > 0:
             size_multiplier *= max(0.55, 1.0 - (momentum_crash_risk * 0.35))
+        if bool(metadata.get("high_beta_quality_escape", False)):
+            size_multiplier *= float(getattr(self.config, "high_beta_quality_escape_risk_multiplier", 0.55) or 0.55)
         if strategy == "mean_reversion" and momentum_crash_risk >= 0.45 and volatility_percentile <= 0.82:
             size_multiplier *= 1.05
         if strategy == "mean_reversion" and volatility_percentile <= 0.58 and entry_zscore >= 1.35:

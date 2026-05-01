@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -22,9 +22,16 @@ class StrategyBase:
         self.config = config
         self.exch = exch
         self.helpers = helpers
+        self.last_rejection_reason: str = ""
+        self.last_rejection_details: Dict[str, Any] = {}
 
     def evaluate(self, symbol: str, regime: Any) -> Optional[StrategyProposal]:
         raise NotImplementedError
+
+    def _reject(self, reason: str, **details: Any) -> None:
+        self.last_rejection_reason = reason
+        self.last_rejection_details = dict(details or {})
+        return None
 
 
 def _ema(values: np.ndarray, period: int) -> np.ndarray:
@@ -64,6 +71,19 @@ def _close_location(candle: list[float]) -> float:
     close_price = float(candle[4])
     rng = max(high - low, 1e-9)
     return (close_price - low) / rng
+
+
+def _symbol_bucket(symbol: str) -> str:
+    base = str(symbol or "").split("/")[0].upper()
+    if base in {"BTC", "ETH"}:
+        return "majors"
+    if base in {"BNB", "XRP"}:
+        return "exchange_beta"
+    if base in {"SOL", "AVAX"}:
+        return "high_beta_alts"
+    if base in {"ADA", "DOT", "LINK", "TON"}:
+        return "slower_large_caps"
+    return "other"
 
 
 def _reward_risk_ratio(entry_price: float, stop_loss: float, take_profit: float) -> float:
@@ -442,19 +462,21 @@ class TrendPullbackStrategy(StrategyBase):
     name = "trend_pullback"
 
     def evaluate(self, symbol: str, regime: Any) -> Optional[StrategyProposal]:
-        if regime.regime not in {"trending", "high_volatility"}:
-            return None
+        self.last_rejection_reason = ""
+        self.last_rejection_details = {}
+        symbol_bucket = _symbol_bucket(symbol)
+        spot_core_symbol = getattr(self.config, "trading_mode", "spot") == "spot" and symbol_bucket in {"majors", "exchange_beta"}
 
         candles_15m = self.exch.fetch_ohlcv(symbol, "15m", limit=80)
         if len(candles_15m) < 40:
-            return None
+            return self._reject("insufficient_candles")
 
         closes = np.array([float(c[4]) for c in candles_15m], dtype=float)
         highs = np.array([float(c[2]) for c in candles_15m], dtype=float)
         lows = np.array([float(c[3]) for c in candles_15m], dtype=float)
         atr_15m = self.helpers.compute_atr(symbol, "15m", period=14)
         if atr_15m is None or atr_15m <= 0:
-            return None
+            return self._reject("missing_atr")
 
         fast_period = max(int(getattr(self.config, "pullback_ema_fast_period", 8)), 3)
         slow_period = max(int(getattr(self.config, "pullback_ema_slow_period", 21)), fast_period + 1)
@@ -479,6 +501,48 @@ class TrendPullbackStrategy(StrategyBase):
             trend_persistence = min(0.35 + (trend_efficiency * 0.45), 0.75)
         entry_zscore = float(regime.metadata.get("entry_zscore", 0.0))
         volatility_percentile = float(regime.metadata.get("realized_vol_percentile", 0.5))
+        inferred_bullish_direction = (
+            bool(getattr(self.config, "spot_core_infer_bullish_direction_enabled", True))
+            and spot_core_symbol
+            and direction in {"flat", "neutral", ""}
+            and ema_fast[-1] > ema_slow[-1] > ema_anchor[-1]
+            and closes[-1] >= ema_fast[-1] - (atr_15m * 0.20)
+            and trend_efficiency >= float(getattr(self.config, "spot_core_infer_bullish_min_trend_efficiency", 0.08))
+            and volume_impulse >= float(getattr(self.config, "spot_core_infer_bullish_min_volume_impulse", 0.90))
+            and volatility_percentile <= float(getattr(self.config, "spot_core_infer_bullish_max_volatility_percentile", 0.82))
+            and stretch <= float(getattr(self.config, "pullback_max_stretch", 0.035))
+        )
+        if inferred_bullish_direction:
+            direction = "bullish"
+        constructive_spot_core_regime = (
+            bool(getattr(self.config, "spot_core_constructive_regime_enabled", True))
+            and spot_core_symbol
+            and direction == "bullish"
+            and regime.regime in {"choppy", "high_volatility", "neutral"}
+            and pullback_score >= float(getattr(self.config, "spot_core_constructive_regime_min_pullback_score", 1.46))
+            and trend_persistence >= float(getattr(self.config, "spot_core_constructive_regime_min_trend_persistence", 0.50))
+            and volume_impulse >= float(getattr(self.config, "spot_core_constructive_regime_min_volume_impulse", 1.04))
+            and trend_efficiency >= float(getattr(self.config, "spot_core_constructive_regime_min_directional_efficiency", 0.18))
+            and volatility_percentile <= float(getattr(self.config, "spot_core_constructive_regime_max_volatility_percentile", 0.68))
+            and stretch <= float(getattr(self.config, "spot_core_constructive_regime_max_stretch", 0.026))
+        )
+        spot_core_regime_relaxed = spot_core_symbol and regime.regime not in {"unstable", "low_liquidity"}
+        if regime.regime not in {"trending", "high_volatility"} and not constructive_spot_core_regime and not spot_core_regime_relaxed:
+            regime_detail = "low_liquidity_regime" if regime.regime == "low_liquidity" else f"{regime.regime}_regime"
+            return self._reject(
+                "regime_not_trend",
+                primary_detail=regime_detail,
+                symbol_bucket=symbol_bucket,
+                spot_core_symbol=spot_core_symbol,
+                regime=str(regime.regime),
+                regime_confidence=float(getattr(regime, "confidence", 0.0) or 0.0),
+                pullback_score=pullback_score,
+                trend_persistence=trend_persistence,
+                volume_impulse=volume_impulse,
+                trend_efficiency=trend_efficiency,
+                volatility_percentile=volatility_percentile,
+                stretch=stretch,
+            )
 
         pullback_fraction = float(getattr(self.config, "pullback_entry_atr_fraction", 0.35))
         pullback_threshold = atr_15m * pullback_fraction
@@ -496,6 +560,12 @@ class TrendPullbackStrategy(StrategyBase):
         recent_low = float(np.min(lows[-10:]))
         recent_low_buffer = float(np.min(lows[-4:]))
         recent_high_buffer = float(np.max(highs[-4:]))
+        safe_reopen_symbols = {
+            str(item).strip().upper()
+            for item in getattr(self.config, "spot_core_safe_reopen_symbols", ("BTC/USDT", "ETH/USDT")) or ()
+            if str(item).strip()
+        }
+        safe_reopen_symbol = symbol.upper() in safe_reopen_symbols
 
         shallow_pullback_score_floor = float(getattr(self.config, "pullback_shallow_min_pullback_score", 1.24))
         shallow_persistence_floor = float(getattr(self.config, "pullback_shallow_min_trend_persistence", 0.38))
@@ -509,15 +579,167 @@ class TrendPullbackStrategy(StrategyBase):
         reclaim_close_location_max = float(getattr(self.config, "pullback_reclaim_close_location_max", 0.76))
         reclaim_buffer = atr_15m * float(getattr(self.config, "pullback_reclaim_buffer_atr_fraction", 0.04))
 
+        def spot_core_htf_fallback(aligned: bool, *, bullish: bool) -> bool:
+            if aligned:
+                return True
+            if not (
+                bool(getattr(self.config, "spot_core_htf_fallback_enabled", True))
+                and spot_core_symbol
+            ):
+                return False
+            if bullish:
+                ema_aligned = ema_fast[-1] > ema_slow[-1] > ema_anchor[-1]
+                direction_aligned = direction == "bullish"
+                stretch_ok = stretch <= float(getattr(self.config, "spot_core_htf_fallback_max_stretch", 0.035))
+            else:
+                ema_aligned = ema_fast[-1] < ema_slow[-1] < ema_anchor[-1]
+                direction_aligned = direction == "bearish"
+                stretch_ok = stretch >= -float(getattr(self.config, "spot_core_htf_fallback_max_stretch", 0.035))
+            return (
+                ema_aligned
+                and direction_aligned
+                and pullback_score >= float(getattr(self.config, "spot_core_htf_fallback_min_pullback_score", 1.30))
+                and trend_persistence >= float(getattr(self.config, "spot_core_htf_fallback_min_trend_persistence", 0.42))
+                and volume_impulse >= float(getattr(self.config, "spot_core_htf_fallback_min_volume_impulse", 0.98))
+                and volatility_percentile <= float(getattr(self.config, "spot_core_htf_fallback_max_volatility_percentile", 0.78))
+                and stretch_ok
+            )
+
         if direction == "bullish":
-            if not self.helpers.is_4h_bullish(symbol) or not self.helpers.is_1h_uptrend(symbol):
-                return None
+            htf_4h_bullish = bool(self.helpers.is_4h_bullish(symbol))
+            htf_1h_uptrend = bool(self.helpers.is_1h_uptrend(symbol))
+            htf_aligned = htf_4h_bullish and htf_1h_uptrend
+            htf_fallback_used = not htf_aligned and spot_core_htf_fallback(htf_aligned, bullish=True)
+            partial_htf_used = (
+                bool(getattr(self.config, "spot_core_partial_htf_enabled", True))
+                and spot_core_symbol
+                and not htf_aligned
+                and (htf_4h_bullish or htf_1h_uptrend or inferred_bullish_direction or constructive_spot_core_regime)
+                and ema_fast[-1] > ema_slow[-1] > ema_anchor[-1]
+                and pullback_score >= float(getattr(self.config, "spot_core_partial_htf_min_pullback_score", 1.24))
+                and trend_persistence >= float(getattr(self.config, "spot_core_partial_htf_min_trend_persistence", 0.38))
+                and volume_impulse >= float(getattr(self.config, "spot_core_partial_htf_min_volume_impulse", 0.92))
+                and trend_efficiency >= float(getattr(self.config, "spot_core_partial_htf_min_trend_efficiency", 0.08))
+                and volatility_percentile <= float(getattr(self.config, "spot_core_partial_htf_max_volatility_percentile", 0.84))
+                and stretch <= float(getattr(self.config, "spot_core_partial_htf_max_stretch", 0.040))
+            )
+            alignment_bridge_used = (
+                bool(getattr(self.config, "spot_core_alignment_bridge_enabled", True))
+                and spot_core_symbol
+                and symbol_bucket in {"majors", "exchange_beta"}
+                and not htf_aligned
+                and not htf_fallback_used
+                and not partial_htf_used
+                and ema_fast[-1] > ema_slow[-1] > ema_anchor[-1]
+                and float(getattr(regime, "confidence", 0.0) or 0.0) >= float(getattr(self.config, "spot_core_alignment_bridge_min_regime_confidence", 0.62))
+                and pullback_score >= float(getattr(self.config, "spot_core_alignment_bridge_min_pullback_score", 1.28))
+                and trend_persistence >= float(getattr(self.config, "spot_core_alignment_bridge_min_trend_persistence", 0.40))
+                and volume_impulse >= float(getattr(self.config, "spot_core_alignment_bridge_min_volume_impulse", 0.96))
+                and trend_efficiency >= float(getattr(self.config, "spot_core_alignment_bridge_min_trend_efficiency", 0.10))
+                and volatility_percentile <= float(getattr(self.config, "spot_core_alignment_bridge_max_volatility_percentile", 0.76))
+                and entry_zscore <= float(getattr(self.config, "spot_core_alignment_bridge_max_entry_zscore", 0.24))
+                and stretch <= float(getattr(self.config, "spot_core_alignment_bridge_max_stretch", 0.026))
+                and close_location >= float(getattr(self.config, "spot_core_alignment_bridge_min_close_location", 0.46))
+                and body_fraction >= float(getattr(self.config, "spot_core_alignment_bridge_min_body_fraction", 0.12))
+                and last_close >= ema_fast[-1] - (atr_15m * 0.18)
+                and float(last_candle[3]) >= ema_slow[-1] - (atr_15m * 0.08)
+                and (last_close > prev_close or constructive_spot_core_regime or inferred_bullish_direction)
+            )
+            liquid_value_near_stack = (
+                ema_slow[-1] > ema_anchor[-1]
+                and (ema_slow[-1] - ema_fast[-1]) <= (
+                    atr_15m * float(getattr(self.config, "spot_core_liquid_value_pullback_max_fast_slow_gap_atr", 0.18))
+                )
+                and (ema_slow[-1] - ema_anchor[-1]) >= (
+                    atr_15m * float(getattr(self.config, "spot_core_liquid_value_pullback_min_slow_anchor_gap_atr", 0.05))
+                )
+            )
+            liquid_value_bridge_used = (
+                bool(getattr(self.config, "spot_core_liquid_value_pullback_enabled", True))
+                and spot_core_symbol
+                and symbol_bucket in {"majors", "exchange_beta"}
+                and not htf_aligned
+                and not htf_fallback_used
+                and not partial_htf_used
+                and (ema_fast[-1] > ema_slow[-1] > ema_anchor[-1] or liquid_value_near_stack)
+                and float(getattr(regime, "confidence", 0.0) or 0.0) >= float(getattr(self.config, "spot_core_alignment_bridge_min_regime_confidence", 0.62))
+                and pullback_score >= float(getattr(self.config, "spot_core_liquid_value_pullback_min_score", 2.25))
+                and trend_persistence >= float(getattr(self.config, "spot_core_liquid_value_pullback_min_trend_persistence", 0.27))
+                and volume_impulse >= float(getattr(self.config, "spot_core_liquid_value_pullback_min_volume_impulse", 0.68))
+                and trend_efficiency >= float(getattr(self.config, "spot_core_liquid_value_pullback_min_trend_efficiency", 0.30))
+                and volatility_percentile <= float(getattr(self.config, "spot_core_liquid_value_pullback_max_volatility_percentile", 0.65))
+                and entry_zscore <= float(getattr(self.config, "spot_core_liquid_value_pullback_max_entry_zscore", -0.30))
+                and abs(stretch) <= float(getattr(self.config, "spot_core_liquid_value_pullback_max_abs_stretch", 0.010))
+                and float(last_candle[3]) >= ema_slow[-1] - (atr_15m * 0.18)
+            )
+            safe_reopen_bridge_used = (
+                bool(getattr(self.config, "spot_core_safe_reopen_enabled", True))
+                and spot_core_symbol
+                and safe_reopen_symbol
+                and not htf_aligned
+                and not htf_fallback_used
+                and not partial_htf_used
+                and not alignment_bridge_used
+                and not liquid_value_bridge_used
+                and (htf_4h_bullish or htf_1h_uptrend or inferred_bullish_direction or constructive_spot_core_regime)
+                and ema_fast[-1] > ema_slow[-1]
+                and ema_slow[-1] >= ema_anchor[-1] - (atr_15m * 0.08)
+                and pullback_score >= float(getattr(self.config, "spot_core_safe_reopen_min_pullback_score", 1.42))
+                and trend_persistence >= float(getattr(self.config, "spot_core_safe_reopen_min_trend_persistence", 0.46))
+                and volume_impulse >= float(getattr(self.config, "spot_core_safe_reopen_min_volume_impulse", 0.96))
+                and trend_efficiency >= float(getattr(self.config, "spot_core_safe_reopen_min_trend_efficiency", 0.18))
+                and volatility_percentile <= float(getattr(self.config, "spot_core_safe_reopen_max_volatility_percentile", 0.74))
+                and entry_zscore <= float(getattr(self.config, "spot_core_safe_reopen_max_entry_zscore", 0.24))
+                and abs(stretch) <= float(getattr(self.config, "spot_core_safe_reopen_max_stretch", 0.026))
+                and close_location >= float(getattr(self.config, "spot_core_safe_reopen_min_close_location", 0.38))
+                and body_fraction >= float(getattr(self.config, "spot_core_safe_reopen_min_body_fraction", 0.10))
+                and max(ema_fast[-1] - last_close, 0.0) <= atr_15m * float(getattr(self.config, "spot_core_safe_reopen_max_pullback_atr", 0.86))
+                and float(last_candle[3]) >= ema_slow[-1] - (atr_15m * 0.14)
+            )
+            if not htf_aligned and not htf_fallback_used and not partial_htf_used and not alignment_bridge_used and not liquid_value_bridge_used and not safe_reopen_bridge_used:
+                failed_htf_checks: List[str] = []
+                if not spot_core_symbol:
+                    failed_htf_checks.append("not_spot_core_symbol")
+                if ema_fast[-1] <= ema_slow[-1] or ema_slow[-1] <= ema_anchor[-1]:
+                    failed_htf_checks.append("ema_stack_not_bridge_ready")
+                if pullback_score < float(getattr(self.config, "spot_core_liquid_value_pullback_min_score", 2.25)):
+                    failed_htf_checks.append("pullback_score_below_value_bridge")
+                if trend_persistence < float(getattr(self.config, "spot_core_liquid_value_pullback_min_trend_persistence", 0.27)):
+                    failed_htf_checks.append("trend_persistence_below_value_bridge")
+                if volume_impulse < float(getattr(self.config, "spot_core_liquid_value_pullback_min_volume_impulse", 0.68)):
+                    failed_htf_checks.append("volume_impulse_below_value_bridge")
+                if trend_efficiency < float(getattr(self.config, "spot_core_liquid_value_pullback_min_trend_efficiency", 0.30)):
+                    failed_htf_checks.append("trend_efficiency_below_value_bridge")
+                if volatility_percentile > float(getattr(self.config, "spot_core_liquid_value_pullback_max_volatility_percentile", 0.65)):
+                    failed_htf_checks.append("volatility_above_value_bridge")
+                if entry_zscore > float(getattr(self.config, "spot_core_liquid_value_pullback_max_entry_zscore", -0.30)):
+                    failed_htf_checks.append("entry_zscore_not_deep_value")
+                if abs(stretch) > float(getattr(self.config, "spot_core_liquid_value_pullback_max_abs_stretch", 0.010)):
+                    failed_htf_checks.append("stretch_above_value_bridge")
+                if float(last_candle[3]) < ema_slow[-1] - (atr_15m * 0.18):
+                    failed_htf_checks.append("low_below_slow_value_bridge")
+                return self._reject(
+                    "bullish_higher_timeframe_not_aligned",
+                    primary_detail=failed_htf_checks[0] if failed_htf_checks else "htf_not_aligned",
+                    failed_htf_checks=failed_htf_checks,
+                    htf_4h_bullish=htf_4h_bullish,
+                    htf_1h_uptrend=htf_1h_uptrend,
+                    symbol_bucket=symbol_bucket,
+                    spot_core_symbol=spot_core_symbol,
+                    pullback_score=pullback_score,
+                    trend_persistence=trend_persistence,
+                    volume_impulse=volume_impulse,
+                    trend_efficiency=trend_efficiency,
+                    volatility_percentile=volatility_percentile,
+                    entry_zscore=entry_zscore,
+                    stretch=stretch,
+                )
             if ema_fast[-1] <= ema_slow[-1] or ema_slow[-1] <= ema_anchor[-1]:
-                return None
-            if trend_efficiency < 0.10 or volume_impulse < 0.86:
-                return None
+                return self._reject("bullish_ema_stack_not_aligned")
+            if trend_efficiency < 0.10 or (volume_impulse < 0.86 and not liquid_value_bridge_used):
+                return self._reject("bullish_trend_efficiency_or_volume_low")
             if stretch > float(getattr(self.config, "pullback_max_stretch", 0.035)):
-                return None
+                return self._reject("bullish_stretch_too_high")
             pullback_depth = max(ema_fast[-1] - last_close, 0.0)
             shallow_pullback = (
                 pullback_score >= shallow_pullback_score_floor
@@ -542,6 +764,101 @@ class TrendPullbackStrategy(StrategyBase):
                 and trend_efficiency >= deep_efficiency_floor
                 and volume_impulse >= deep_volume_floor
             )
+            spot_major_continuation_pullback = (
+                bool(getattr(self.config, "spot_major_pullback_expansion_enabled", True))
+                and getattr(self.config, "trading_mode", "spot") == "spot"
+                and symbol_bucket in {"majors", "exchange_beta"}
+                and pullback_score >= float(getattr(self.config, "spot_major_pullback_min_score", 1.45))
+                and trend_persistence >= float(getattr(self.config, "spot_major_pullback_min_trend_persistence", 0.50))
+                and volume_impulse >= float(getattr(self.config, "spot_major_pullback_min_volume_impulse", 1.05))
+                and volatility_percentile <= float(getattr(self.config, "spot_major_pullback_max_volatility_percentile", 0.66))
+                and entry_zscore <= float(getattr(self.config, "spot_major_pullback_max_entry_zscore", 0.22))
+                and trend_efficiency >= 0.18
+                and pullback_depth >= pullback_threshold * 0.03
+                and pullback_depth <= atr_15m * 0.72
+                and recent_low_buffer <= ema_fast[-1] + (atr_15m * 0.18)
+                and last_close >= ema_fast[-1] - (atr_15m * 0.18)
+                and last_close > prev_close
+                and body_fraction >= 0.22
+                and close_location >= 0.50
+                and stretch <= min(float(getattr(self.config, "pullback_max_stretch", 0.035)), 0.024)
+            )
+            spot_core_micro_reclaim = (
+                bool(getattr(self.config, "spot_core_micro_reclaim_enabled", True))
+                and spot_core_symbol
+                and pullback_score >= float(getattr(self.config, "spot_core_micro_reclaim_min_score", 1.34))
+                and trend_persistence >= float(getattr(self.config, "spot_core_micro_reclaim_min_trend_persistence", 0.44))
+                and volume_impulse >= float(getattr(self.config, "spot_core_micro_reclaim_min_volume_impulse", 1.00))
+                and volatility_percentile <= float(getattr(self.config, "spot_core_micro_reclaim_max_volatility_percentile", 0.72))
+                and entry_zscore <= float(getattr(self.config, "spot_core_micro_reclaim_max_entry_zscore", 0.18))
+                and trend_efficiency >= 0.20
+                and pullback_depth <= atr_15m * (
+                    max(float(getattr(self.config, "spot_core_micro_reclaim_max_pullback_atr", 0.46)), 0.70)
+                    if inferred_bullish_direction
+                    else float(getattr(self.config, "spot_core_micro_reclaim_max_pullback_atr", 0.46))
+                )
+                and recent_low_buffer <= ema_fast[-1] + (atr_15m * 0.20)
+                and last_close >= ema_fast[-1] - (atr_15m * (0.30 if inferred_bullish_direction else 0.14))
+                and last_close >= min(prev_high, ema_fast[-1] + (atr_15m * 0.04))
+                and last_close >= prev_close - reclaim_buffer
+                and body_fraction >= (
+                    min(float(getattr(self.config, "spot_core_micro_reclaim_min_body_fraction", 0.16)), 0.12)
+                    if inferred_bullish_direction
+                    else float(getattr(self.config, "spot_core_micro_reclaim_min_body_fraction", 0.16))
+                )
+                and close_location >= (
+                    min(float(getattr(self.config, "spot_core_micro_reclaim_min_close_location", 0.46)), 0.40)
+                    if inferred_bullish_direction
+                    else float(getattr(self.config, "spot_core_micro_reclaim_min_close_location", 0.46))
+                )
+                and float(last_candle[3]) >= ema_slow[-1] - (atr_15m * 0.08)
+                and stretch <= min(float(getattr(self.config, "pullback_max_stretch", 0.035)), 0.022)
+            )
+            spot_core_local_structure_pullback = (
+                bool(getattr(self.config, "spot_core_local_structure_enabled", True))
+                and spot_core_symbol
+                and (partial_htf_used or htf_fallback_used or alignment_bridge_used or liquid_value_bridge_used or inferred_bullish_direction or constructive_spot_core_regime)
+                and pullback_score >= float(getattr(self.config, "spot_core_local_structure_min_pullback_score", 1.22))
+                and trend_persistence >= (
+                    float(getattr(self.config, "spot_core_liquid_value_pullback_min_trend_persistence", 0.27))
+                    if liquid_value_bridge_used
+                    else float(getattr(self.config, "spot_core_local_structure_min_trend_persistence", 0.36))
+                )
+                and volume_impulse >= (
+                    float(getattr(self.config, "spot_core_liquid_value_pullback_min_volume_impulse", 0.68))
+                    if liquid_value_bridge_used
+                    else float(getattr(self.config, "spot_core_local_structure_min_volume_impulse", 0.90))
+                )
+                and trend_efficiency >= float(getattr(self.config, "spot_core_local_structure_min_trend_efficiency", 0.08))
+                and volatility_percentile <= float(getattr(self.config, "spot_core_local_structure_max_volatility_percentile", 0.84))
+                and entry_zscore <= (
+                    float(getattr(self.config, "spot_core_liquid_value_pullback_max_entry_zscore", -0.30))
+                    if liquid_value_bridge_used
+                    else float(getattr(self.config, "spot_core_local_structure_max_entry_zscore", 0.35))
+                )
+                and stretch <= float(getattr(self.config, "spot_core_local_structure_max_stretch", 0.040))
+                and recent_low_buffer <= ema_fast[-1] + (atr_15m * 0.28)
+                and last_close >= (
+                    ema_slow[-1] - (atr_15m * 0.18)
+                    if liquid_value_bridge_used
+                    else ema_fast[-1] - (atr_15m * 0.36)
+                )
+                and last_close <= ema_fast[-1] + (atr_15m * 0.42)
+                and float(last_candle[3]) >= ema_slow[-1] - (atr_15m * (0.18 if liquid_value_bridge_used else 0.12))
+                and close_location >= (0.22 if liquid_value_bridge_used else 0.34)
+                and body_fraction >= (0.06 if liquid_value_bridge_used else 0.10)
+            )
+            spot_core_safe_reopen_pullback = (
+                safe_reopen_bridge_used
+                and recent_low_buffer <= ema_fast[-1] + (atr_15m * 0.32)
+                and pullback_depth <= atr_15m * float(getattr(self.config, "spot_core_safe_reopen_max_pullback_atr", 0.86))
+                and last_close >= ema_slow[-1] - (atr_15m * 0.14)
+                and last_close <= ema_fast[-1] + (atr_15m * 0.36)
+                and last_close >= prev_close - reclaim_buffer
+                and close_location >= float(getattr(self.config, "spot_core_safe_reopen_min_close_location", 0.38))
+                and body_fraction >= float(getattr(self.config, "spot_core_safe_reopen_min_body_fraction", 0.10))
+                and float(last_candle[3]) >= ema_slow[-1] - (atr_15m * 0.14)
+            )
             legacy_pullback = (
                 sparse_regime_metadata
                 and pullback_depth >= pullback_threshold * 0.08
@@ -551,8 +868,43 @@ class TrendPullbackStrategy(StrategyBase):
                 and body_fraction >= 0.30
                 and close_location >= 0.30
             )
-            if not shallow_pullback and not deep_pullback and not legacy_pullback:
-                return None
+            if (
+                not shallow_pullback
+                and not deep_pullback
+                and not spot_major_continuation_pullback
+                and not spot_core_micro_reclaim
+                and not spot_core_local_structure_pullback
+                and not spot_core_safe_reopen_pullback
+                and not legacy_pullback
+            ):
+                shape_details: Dict[str, Any] = {
+                    "pullback_depth_atr": pullback_depth / max(atr_15m, 1e-9),
+                    "recent_low_to_fast_atr": (recent_low_buffer - ema_fast[-1]) / max(atr_15m, 1e-9),
+                    "last_close_to_fast_atr": (last_close - ema_fast[-1]) / max(atr_15m, 1e-9),
+                    "last_close_to_slow_atr": (last_close - ema_slow[-1]) / max(atr_15m, 1e-9),
+                    "close_location": close_location,
+                    "body_fraction": body_fraction,
+                    "liquid_value_bridge_used": liquid_value_bridge_used,
+                    "alignment_bridge_used": alignment_bridge_used,
+                    "safe_reopen_bridge_used": safe_reopen_bridge_used,
+                }
+                if liquid_value_bridge_used:
+                    failed_value_checks: List[str] = []
+                    if recent_low_buffer > ema_fast[-1] + (atr_15m * 0.28):
+                        failed_value_checks.append("recent_low_above_fast_zone")
+                    if last_close < ema_slow[-1] - (atr_15m * 0.18):
+                        failed_value_checks.append("close_below_slow_zone")
+                    if last_close > ema_fast[-1] + (atr_15m * 0.42):
+                        failed_value_checks.append("close_above_fast_zone")
+                    if float(last_candle[3]) < ema_slow[-1] - (atr_15m * 0.18):
+                        failed_value_checks.append("low_below_slow_zone")
+                    if close_location < 0.22:
+                        failed_value_checks.append("close_location_low")
+                    if body_fraction < 0.06:
+                        failed_value_checks.append("body_fraction_low")
+                    shape_details["failed_value_checks"] = failed_value_checks
+                    shape_details["primary_detail"] = failed_value_checks[0] if failed_value_checks else "value_bridge_shape_unknown"
+                return self._reject("bullish_pullback_shape_not_qualified", **shape_details)
             bullish_continuation_confirmation = (
                 last_close > prev_close
                 and last_close >= max(prev_close + (confirmation_buffer * 0.20), ema_fast[-1] - (pullback_threshold * 0.75))
@@ -568,32 +920,101 @@ class TrendPullbackStrategy(StrategyBase):
                 and last_close >= prev_close - reclaim_buffer
                 and float(last_candle[3]) >= ema_slow[-1] - (atr_15m * 0.10)
             )
-            if not bullish_continuation_confirmation and not bullish_reclaim_confirmation:
-                return None
+            bullish_confirmation_near_miss = (
+                bool(getattr(self.config, "pullback_confirmation_near_miss_enabled", True))
+                and not bullish_continuation_confirmation
+                and not bullish_reclaim_confirmation
+                and not spot_major_continuation_pullback
+                and not spot_core_micro_reclaim
+                and not spot_core_local_structure_pullback
+                and not spot_core_safe_reopen_pullback
+                and pullback_score >= float(getattr(self.config, "pullback_confirmation_near_miss_min_score", 1.58))
+                and trend_persistence >= float(getattr(self.config, "pullback_confirmation_near_miss_min_trend_persistence", 0.40))
+                and volume_impulse >= float(getattr(self.config, "pullback_confirmation_near_miss_min_volume_impulse", 1.02))
+                and entry_zscore <= float(getattr(self.config, "pullback_confirmation_near_miss_max_entry_zscore", 0.28))
+                and stretch <= float(getattr(self.config, "pullback_confirmation_near_miss_max_stretch", 0.022))
+                and close_location >= float(getattr(self.config, "pullback_confirmation_near_miss_min_close_location", 0.42))
+                and body_fraction >= float(getattr(self.config, "pullback_confirmation_near_miss_min_body_fraction", 0.14))
+                and last_close >= ema_fast[-1] - (pullback_threshold * 0.55)
+                and float(last_candle[3]) >= ema_slow[-1] - (atr_15m * 0.08)
+            )
+            if (
+                not bullish_continuation_confirmation
+                and not bullish_reclaim_confirmation
+                and not spot_major_continuation_pullback
+                and not spot_core_micro_reclaim
+                and not spot_core_local_structure_pullback
+                and not spot_core_safe_reopen_pullback
+                and not bullish_confirmation_near_miss
+            ):
+                return self._reject("bullish_confirmation_missing")
 
-            variant = "shallow_pullback" if shallow_pullback else "deep_pullback" if deep_pullback else "legacy_pullback"
+            variant = (
+                "shallow_pullback"
+                if shallow_pullback
+                else "deep_pullback"
+                if deep_pullback
+                else "spot_major_continuation_pullback"
+                if spot_major_continuation_pullback
+                else "confirmation_near_miss_pullback"
+                if bullish_confirmation_near_miss
+                else "spot_core_micro_reclaim"
+                if spot_core_micro_reclaim
+                else "spot_core_local_structure_pullback"
+                if spot_core_local_structure_pullback
+                else "spot_core_safe_reopen_pullback"
+                if spot_core_safe_reopen_pullback
+                else "legacy_pullback"
+            )
             entry_price = min(last_close, float(ema_fast[-1]) + (atr_15m * 0.02))
             stop_loss = min(
-                last_close - (atr_15m * (1.08 if shallow_pullback else 1.22)),
+                last_close - (
+                    atr_15m
+                    * (
+                        0.84
+                        if spot_core_micro_reclaim or spot_core_local_structure_pullback
+                        or spot_core_safe_reopen_pullback
+                        else 0.92
+                        if spot_major_continuation_pullback
+                        else 1.08
+                        if shallow_pullback
+                        else 1.22
+                    )
+                ),
                 (recent_low_buffer if shallow_pullback else recent_low) - (atr_15m * 0.12),
                 prev_low - (atr_15m * 0.05),
             )
             if stop_loss <= 0 or stop_loss >= entry_price:
-                return None
+                return self._reject("bullish_invalid_stop")
             risk = entry_price - stop_loss
             if risk < atr_15m * 0.24 or risk > atr_15m * 1.90:
-                return None
+                return self._reject("bullish_risk_distance_out_of_bounds")
 
             rr_ratio = (
+                float(getattr(self.config, "pullback_shallow_rr_ratio", 1.35)) + (0.18 if spot_core_micro_reclaim or spot_core_local_structure_pullback else 0.10)
+                if spot_major_continuation_pullback
+                or spot_core_micro_reclaim
+                or spot_core_local_structure_pullback
+                or spot_core_safe_reopen_pullback
+                else
                 float(getattr(self.config, "pullback_shallow_rr_ratio", 1.35))
                 if shallow_pullback
                 else float(getattr(self.config, "pullback_deep_rr_ratio", 1.2))
             )
             take_profit = max(recent_high, entry_price + (risk * rr_ratio))
             if take_profit <= entry_price:
-                return None
+                return self._reject("bullish_invalid_take_profit")
 
-            profile_bonus = 0.02 if shallow_pullback and volatility_percentile <= shallow_volatility_ceiling else 0.0
+            profile_bonus = (
+                0.04
+                if spot_core_micro_reclaim or spot_core_local_structure_pullback
+                or spot_core_safe_reopen_pullback
+                else 0.03
+                if spot_major_continuation_pullback
+                else 0.02
+                if shallow_pullback and volatility_percentile <= shallow_volatility_ceiling
+                else 0.0
+            )
             profile_penalty = 0.02 if deep_pullback and volatility_percentile > 0.74 else 0.0
             win_probability = min(
                 0.71,
@@ -637,12 +1058,27 @@ class TrendPullbackStrategy(StrategyBase):
                     "continuation_score": continuation_score,
                     "pullback_score": pullback_score,
                     "entry_zscore": entry_zscore,
+                    "entry_close_location": close_location,
+                    "entry_body_fraction": body_fraction,
                     "trend_persistence": trend_persistence,
                     "realized_vol_percentile": volatility_percentile,
                     "volatility_ratio": float(regime.volatility_ratio),
                     "strategy_variant": variant,
-                    "profile_preference": "shallow_preferred" if shallow_pullback else "deep_selective" if deep_pullback else "legacy",
-                    "confirmation_variant": "continuation" if bullish_continuation_confirmation else "reclaim_hold",
+                    "profile_preference": "spot_core_micro_reclaim" if spot_core_micro_reclaim else "spot_core_local_structure" if spot_core_local_structure_pullback else "spot_core_safe_reopen" if spot_core_safe_reopen_pullback else "spot_major_quality" if spot_major_continuation_pullback else "shallow_preferred" if shallow_pullback else "deep_selective" if deep_pullback else "legacy",
+                    "confirmation_variant": "spot_core_micro_reclaim" if spot_core_micro_reclaim else "spot_core_local_structure" if spot_core_local_structure_pullback else "spot_core_safe_reopen" if spot_core_safe_reopen_pullback else "spot_major_continuation" if spot_major_continuation_pullback else "confirmation_near_miss" if bullish_confirmation_near_miss else "continuation" if bullish_continuation_confirmation else "reclaim_hold",
+                    "symbol_bucket": symbol_bucket,
+                    "htf_fallback_used": htf_fallback_used,
+                    "partial_htf_used": partial_htf_used,
+                    "alignment_bridge_used": alignment_bridge_used,
+                    "liquid_value_bridge_used": liquid_value_bridge_used,
+                    "safe_reopen_bridge_used": safe_reopen_bridge_used,
+                    "liquid_value_near_stack": liquid_value_near_stack,
+                    "htf_4h_bullish": htf_4h_bullish,
+                    "htf_1h_uptrend": htf_1h_uptrend,
+                    "constructive_spot_core_regime": constructive_spot_core_regime,
+                    "spot_core_regime_relaxed": spot_core_regime_relaxed,
+                    "inferred_bullish_direction": inferred_bullish_direction,
+                    "bullish_confirmation_near_miss": bullish_confirmation_near_miss,
                     "preferred_order_type": "limit",
                     "order_expiry_bars": 4,
                 },
@@ -650,15 +1086,15 @@ class TrendPullbackStrategy(StrategyBase):
             return StrategyProposal(signal=signal, expected_edge_bps=expected_edge_bps, rationale=f"bull trend pullback continuation ({variant})")
 
         if direction != "bearish":
-            return None
+            return self._reject("trend_direction_not_actionable")
         if not self.helpers.is_4h_bearish(symbol) or not self.helpers.is_1h_downtrend(symbol):
-            return None
+            return self._reject("bearish_higher_timeframe_not_aligned")
         if ema_fast[-1] >= ema_slow[-1] or ema_slow[-1] >= ema_anchor[-1]:
-            return None
+            return self._reject("bearish_ema_stack_not_aligned")
             if trend_efficiency < 0.10 or volume_impulse < 0.86:
-                return None
+                return self._reject("bearish_trend_efficiency_or_volume_low")
         if stretch < -float(getattr(self.config, "pullback_max_stretch", 0.035)):
-            return None
+            return self._reject("bearish_stretch_too_high")
 
         pullback_depth = max(last_close - ema_fast[-1], 0.0)
         shallow_pullback = (
@@ -696,7 +1132,7 @@ class TrendPullbackStrategy(StrategyBase):
             and close_location <= 0.70
         )
         if not shallow_pullback and not deep_pullback and not legacy_pullback:
-            return None
+            return self._reject("bearish_pullback_shape_not_qualified")
         bearish_continuation_confirmation = (
             last_close < prev_close
             and last_close <= min(prev_close - (confirmation_buffer * 0.20), ema_fast[-1] + (pullback_threshold * 0.75))
@@ -713,7 +1149,7 @@ class TrendPullbackStrategy(StrategyBase):
             and float(last_candle[2]) <= ema_slow[-1] + (atr_15m * 0.10)
         )
         if not bearish_continuation_confirmation and not bearish_reclaim_confirmation:
-            return None
+            return self._reject("bearish_confirmation_missing")
 
         variant = "shallow_pullback" if shallow_pullback else "deep_pullback" if deep_pullback else "legacy_pullback"
         entry_price = max(last_close, float(ema_fast[-1]) - (atr_15m * 0.02))
@@ -723,10 +1159,10 @@ class TrendPullbackStrategy(StrategyBase):
             prev_high + (atr_15m * 0.05),
         )
         if stop_loss <= entry_price:
-            return None
+            return self._reject("bearish_invalid_stop")
         risk = stop_loss - entry_price
         if risk < atr_15m * 0.24 or risk > atr_15m * 1.90:
-            return None
+            return self._reject("bearish_risk_distance_out_of_bounds")
 
         rr_ratio = (
             float(getattr(self.config, "pullback_shallow_rr_ratio", 1.35))
@@ -735,7 +1171,7 @@ class TrendPullbackStrategy(StrategyBase):
         )
         take_profit = min(recent_low, entry_price - (risk * rr_ratio))
         if take_profit >= entry_price or take_profit <= 0:
-            return None
+            return self._reject("bearish_invalid_take_profit")
 
         profile_bonus = 0.02 if shallow_pullback and volatility_percentile <= shallow_volatility_ceiling else 0.0
         profile_penalty = 0.02 if deep_pullback and volatility_percentile > 0.74 else 0.0
@@ -781,6 +1217,8 @@ class TrendPullbackStrategy(StrategyBase):
                 "continuation_score": continuation_score,
                 "pullback_score": pullback_score,
                 "entry_zscore": entry_zscore,
+                "entry_close_location": close_location,
+                "entry_body_fraction": body_fraction,
                 "trend_persistence": trend_persistence,
                 "realized_vol_percentile": volatility_percentile,
                 "volatility_ratio": float(regime.volatility_ratio),

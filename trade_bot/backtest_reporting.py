@@ -183,6 +183,20 @@ def build_batch_summary(reports: list[Dict[str, Any]], *, include_horizons: bool
         "repriced_by_strategy": {},
         "touch_escalations_by_strategy": {},
         "partial_profit_takes_by_strategy": {},
+        "replacement_candidates_by_strategy": {},
+        "replacement_selected_by_strategy": {},
+        "replacement_cross_symbol_selected_by_strategy": {},
+        "replacement_submitted_by_strategy": {},
+        "replacement_filled_by_strategy": {},
+        "replacement_closed_by_strategy": {},
+        "replacement_wins_by_strategy": {},
+        "replacement_losses_by_strategy": {},
+        "replacement_candidates_by_symbol": {},
+        "replacement_rejections_by_reason": {},
+        "replacement_near_misses_by_strategy": {},
+        "replacement_near_misses_by_symbol": {},
+        "replacement_near_misses_by_reason": {},
+        "replacement_guard_blocks_by_reason": {},
     }
     execution_totals: Dict[str, int] = {
         "limit_to_market_upgrades": 0,
@@ -192,6 +206,16 @@ def build_batch_summary(reports: list[Dict[str, Any]], *, include_horizons: bool
         "repriced_orders": 0,
         "touch_escalations": 0,
         "partial_profit_takes": 0,
+        "replacement_candidates_seen": 0,
+        "replacement_candidates_selected": 0,
+        "replacement_cross_symbol_selected": 0,
+        "replacement_near_misses_seen": 0,
+        "replacement_submitted": 0,
+        "replacement_filled": 0,
+        "replacement_closed": 0,
+        "replacement_wins": 0,
+        "replacement_losses": 0,
+        "replacement_guard_blocks": 0,
     }
     acceptance_totals: Dict[str, int] = {}
     realized_performance: Dict[str, Dict[str, Dict[str, float]]] = {
@@ -201,6 +225,45 @@ def build_batch_summary(reports: list[Dict[str, Any]], *, include_horizons: bool
     exit_quality: Dict[str, Dict[str, Dict[str, float]]] = {
         "by_exit_reason": {},
         "giveback_by_strategy": {},
+    }
+    validation_harness: Dict[str, Any] = {
+        "signal_to_submission_pct": [],
+        "submission_to_fill_pct": [],
+        "fill_to_close_pct": [],
+        "stop_loss_negative_pl_share_pct": [],
+        "repeated_setup_density_pct": [],
+        "fresh_setup_block_density_pct": [],
+        "triple_barrier_tp_first_pct": [],
+        "triple_barrier_sl_first_pct": [],
+        "triple_barrier_time_exit_pct": [],
+        "repeated_setup_blocks": 0,
+        "fresh_setup_blocks": 0,
+        "triple_barrier_labels": 0,
+        "pullback_meta_filter_blocks": 0,
+        "candidate_flow_starved_runs": 0,
+        "candidate_flow": {
+            "proposals": 0,
+            "raw_signals": 0,
+            "submitted_orders": 0,
+            "filled_orders": 0,
+            "closed_trades": 0,
+            "generation_outcomes": {},
+            "pre_selection_rejections": {},
+            "strategy_rejections": {},
+            "post_selection_rejections": {},
+        },
+    }
+    triple_barrier: Dict[str, Any] = {
+        "label_counts": {},
+        "label_counts_by_strategy": {},
+        "label_counts_by_symbol": {},
+    }
+    market_data: Dict[str, Any] = {
+        "datasets_loaded": 0,
+        "datasets_missing": 0,
+        "total_rows": 0,
+        "runs_with_data": 0,
+        "runs_without_data": 0,
     }
     family_rotation_by_strategy: Dict[str, Dict[str, int]] = {}
     family_rotation_recovery_by_strategy: Dict[str, Dict[str, int]] = {}
@@ -218,6 +281,7 @@ def build_batch_summary(reports: list[Dict[str, Any]], *, include_horizons: bool
     expected_edge_by_symbol: Dict[str, Dict[str, float]] = {}
     universe_selection: Dict[str, Any] = {
         "eligible_symbols": {},
+        "reserved_core_symbols": {},
         "rejected_symbols": {},
         "eligible_buckets": {},
         "rejected_buckets": {},
@@ -235,15 +299,69 @@ def build_batch_summary(reports: list[Dict[str, Any]], *, include_horizons: bool
         campaign_summary = dict(item.get("campaign_summary", {}) or {})
         realized_payload = dict(campaign_summary.get("realized_performance", {}) or {})
         exit_quality_payload = dict(campaign_summary.get("exit_quality", {}) or {})
+        validation_payload = dict(campaign_summary.get("validation_harness", {}) or {})
         universe_payload = dict(campaign_summary.get("universe_selection", {}) or {})
         acceptance_payload = dict(campaign_summary.get("acceptance", {}) or {})
+        market_data_payload = dict(campaign_summary.get("market_data", {}) or {})
         symbol_rollups = dict(item.get("symbol_rollups", {}) or {})
+        market_data["datasets_loaded"] += int(market_data_payload.get("datasets_loaded", 0) or 0)
+        market_data["datasets_missing"] += int(market_data_payload.get("datasets_missing", 0) or 0)
+        market_data["total_rows"] += int(market_data_payload.get("total_rows", 0) or 0)
+        if bool(market_data_payload.get("data_available", False)):
+            market_data["runs_with_data"] += 1
+        elif market_data_payload:
+            market_data["runs_without_data"] += 1
         for bucket in decision_totals:
             payload = dict(diagnostics.get(bucket, {}) or {})
             for key, value in payload.items():
                 decision_totals[bucket][str(key)] = int(decision_totals[bucket].get(str(key), 0)) + int(value or 0)
         for key in execution_totals:
             execution_totals[key] += int(diagnostics.get(key, 0) or 0)
+        validation_harness["repeated_setup_blocks"] += int(
+            validation_payload.get("repeated_setup_blocks", diagnostics.get("repeated_setup_blocks", 0)) or 0
+        )
+        validation_harness["fresh_setup_blocks"] += int(
+            validation_payload.get("fresh_setup_blocks", diagnostics.get("fresh_setup_blocks", 0)) or 0
+        )
+        validation_harness["triple_barrier_labels"] += int(validation_payload.get("triple_barrier_labels", 0) or 0)
+        validation_harness["pullback_meta_filter_blocks"] += int(
+            validation_payload.get("pullback_meta_filter_blocks", diagnostics.get("pullback_meta_filter_blocks", 0)) or 0
+        )
+        candidate_flow_payload = dict(validation_payload.get("candidate_flow", {}) or {})
+        if bool(candidate_flow_payload.get("starved", False)):
+            validation_harness["candidate_flow_starved_runs"] += 1
+        candidate_flow_totals = validation_harness["candidate_flow"]
+        for key in ("proposals", "raw_signals", "submitted_orders", "filled_orders", "closed_trades"):
+            candidate_flow_totals[key] += int(candidate_flow_payload.get(key, 0) or 0)
+        for key in ("generation_outcomes", "pre_selection_rejections", "strategy_rejections", "post_selection_rejections"):
+            target = candidate_flow_totals[key]
+            for reason, value in dict(candidate_flow_payload.get(key, {}) or {}).items():
+                target[str(reason)] = int(target.get(str(reason), 0)) + int(value or 0)
+        for key in (
+            "signal_to_submission_pct",
+            "submission_to_fill_pct",
+            "fill_to_close_pct",
+            "stop_loss_negative_pl_share_pct",
+            "repeated_setup_density_pct",
+            "fresh_setup_block_density_pct",
+            "triple_barrier_tp_first_pct",
+            "triple_barrier_sl_first_pct",
+            "triple_barrier_time_exit_pct",
+        ):
+            value = validation_payload.get(key)
+            if isinstance(value, (int, float)) and math.isfinite(float(value or 0.0)):
+                validation_harness[key].append(float(value or 0.0))
+        triple_payload = dict(campaign_summary.get("triple_barrier", {}) or {})
+        for label, value in dict(triple_payload.get("label_counts", {}) or {}).items():
+            triple_barrier["label_counts"][str(label)] = int(triple_barrier["label_counts"].get(str(label), 0)) + int(value or 0)
+        for strategy, counts in dict(triple_payload.get("label_counts_by_strategy", {}) or {}).items():
+            target = triple_barrier["label_counts_by_strategy"].setdefault(str(strategy), {})
+            for label, value in dict(counts or {}).items():
+                target[str(label)] = int(target.get(str(label), 0)) + int(value or 0)
+        for symbol, counts in dict(triple_payload.get("label_counts_by_symbol", {}) or {}).items():
+            target = triple_barrier["label_counts_by_symbol"].setdefault(str(symbol), {})
+            for label, value in dict(counts or {}).items():
+                target[str(label)] = int(target.get(str(label), 0)) + int(value or 0)
         for key, value in dict(acceptance_payload.get("checks", {}) or {}).items():
             if bool(value):
                 acceptance_totals[str(key)] = int(acceptance_totals.get(str(key), 0)) + 1
@@ -378,6 +496,8 @@ def build_batch_summary(reports: list[Dict[str, Any]], *, include_horizons: bool
             elif realized_adjustment < 0.0:
                 universe_selection["realized_universe_penalties"][str(symbol)] = int(universe_selection["realized_universe_penalties"].get(str(symbol), 0)) + 1
                 universe_selection["realized_universe_adjustments_by_bucket"][bucket] = int(universe_selection["realized_universe_adjustments_by_bucket"].get(bucket, 0)) - 1
+        for symbol in list(universe_payload.get("reserved_core_symbols", []) or []):
+            universe_selection["reserved_core_symbols"][str(symbol)] = int(universe_selection["reserved_core_symbols"].get(str(symbol), 0)) + 1
         for bucket, value in dict(universe_payload.get("eligible_bucket_counts", {}) or {}).items():
             bucket_key = str(bucket or "other")
             universe_selection["eligible_bucket_pressure"][bucket_key] = int(universe_selection["eligible_bucket_pressure"].get(bucket_key, 0)) + int(value or 0)
@@ -432,6 +552,56 @@ def build_batch_summary(reports: list[Dict[str, Any]], *, include_horizons: bool
     for payload in exit_quality["giveback_by_strategy"].values():
         trades = float(payload.get("trades", 0.0) or 0.0)
         payload["avg_giveback_r"] = float(payload.get("total_giveback_r", 0.0) or 0.0) / trades if trades else 0.0
+    exit_reason_groups: Dict[str, Dict[str, float]] = {}
+
+    def _exit_group(reason: str) -> str:
+        reason_upper = str(reason or "UNKNOWN").upper()
+        if reason_upper == "SL":
+            return "stop_loss"
+        if "PROFIT_PROTECT" in reason_upper:
+            return "profit_protection"
+        if reason_upper == "TP":
+            return "take_profit"
+        if (
+            "THESIS_FAIL" in reason_upper
+            or "STRUCTURE_FAIL" in reason_upper
+            or "RECLAIM_FAIL" in reason_upper
+            or "FOLLOW_THROUGH_FAIL" in reason_upper
+        ):
+            return "thesis_failure"
+        if reason_upper.startswith("TIME_"):
+            return "time_stop"
+        if "TRAIL" in reason_upper:
+            return "trailing"
+        return "other"
+
+    for reason, payload in exit_quality["by_exit_reason"].items():
+        group = _exit_group(reason)
+        target = exit_reason_groups.setdefault(
+            group,
+            {"trades": 0.0, "wins": 0.0, "losses": 0.0, "total_pl": 0.0, "negative_pl": 0.0},
+        )
+        trades = float(payload.get("trades", 0.0) or 0.0)
+        total_pl = float(payload.get("total_pl", 0.0) or 0.0)
+        target["trades"] += trades
+        target["wins"] += float(payload.get("wins", 0.0) or 0.0)
+        target["losses"] += float(payload.get("losses", 0.0) or 0.0)
+        target["total_pl"] += total_pl
+        if total_pl < 0.0:
+            target["negative_pl"] += abs(total_pl)
+    total_negative_exit_pl = sum(float(payload.get("negative_pl", 0.0) or 0.0) for payload in exit_reason_groups.values())
+    for payload in exit_reason_groups.values():
+        trades = float(payload.get("trades", 0.0) or 0.0)
+        wins = float(payload.get("wins", 0.0) or 0.0)
+        payload["expectancy"] = float(payload.get("total_pl", 0.0) or 0.0) / trades if trades else 0.0
+        payload["win_rate_pct"] = (wins / trades * 100.0) if trades else 0.0
+        payload["negative_pl_share_pct"] = (
+            float(payload.get("negative_pl", 0.0) or 0.0) / total_negative_exit_pl * 100.0
+        ) if total_negative_exit_pl > 0.0 else 0.0
+    exit_quality["by_exit_group"] = {
+        key: dict(sorted(value.items()))
+        for key, value in sorted(exit_reason_groups.items())
+    }
     failure_leaderboard: Dict[str, Any] = {
         "top_skip_reasons": dict(sorted(decision_totals["skip_reasons"].items(), key=lambda item: item[1], reverse=True)[:5]),
         "losing_families": {},
@@ -568,6 +738,167 @@ def build_batch_summary(reports: list[Dict[str, Any]], *, include_horizons: bool
                     ),
                 },
             }
+    validation_harness_summary = {
+        "signal_to_submission_pct": (sum(validation_harness["signal_to_submission_pct"]) / len(validation_harness["signal_to_submission_pct"])) if validation_harness["signal_to_submission_pct"] else 0.0,
+        "submission_to_fill_pct": (sum(validation_harness["submission_to_fill_pct"]) / len(validation_harness["submission_to_fill_pct"])) if validation_harness["submission_to_fill_pct"] else 0.0,
+        "fill_to_close_pct": (sum(validation_harness["fill_to_close_pct"]) / len(validation_harness["fill_to_close_pct"])) if validation_harness["fill_to_close_pct"] else 0.0,
+        "stop_loss_negative_pl_share_pct": (sum(validation_harness["stop_loss_negative_pl_share_pct"]) / len(validation_harness["stop_loss_negative_pl_share_pct"])) if validation_harness["stop_loss_negative_pl_share_pct"] else 0.0,
+        "repeated_setup_density_pct": (sum(validation_harness["repeated_setup_density_pct"]) / len(validation_harness["repeated_setup_density_pct"])) if validation_harness["repeated_setup_density_pct"] else 0.0,
+        "fresh_setup_block_density_pct": (sum(validation_harness["fresh_setup_block_density_pct"]) / len(validation_harness["fresh_setup_block_density_pct"])) if validation_harness["fresh_setup_block_density_pct"] else 0.0,
+        "triple_barrier_tp_first_pct": (sum(validation_harness["triple_barrier_tp_first_pct"]) / len(validation_harness["triple_barrier_tp_first_pct"])) if validation_harness["triple_barrier_tp_first_pct"] else 0.0,
+        "triple_barrier_sl_first_pct": (sum(validation_harness["triple_barrier_sl_first_pct"]) / len(validation_harness["triple_barrier_sl_first_pct"])) if validation_harness["triple_barrier_sl_first_pct"] else 0.0,
+        "triple_barrier_time_exit_pct": (sum(validation_harness["triple_barrier_time_exit_pct"]) / len(validation_harness["triple_barrier_time_exit_pct"])) if validation_harness["triple_barrier_time_exit_pct"] else 0.0,
+        "repeated_setup_blocks": int(validation_harness["repeated_setup_blocks"] or 0),
+        "fresh_setup_blocks": int(validation_harness["fresh_setup_blocks"] or 0),
+        "triple_barrier_labels": int(validation_harness["triple_barrier_labels"] or 0),
+        "pullback_meta_filter_blocks": int(validation_harness["pullback_meta_filter_blocks"] or 0),
+    }
+    candidate_flow_totals = dict(validation_harness.get("candidate_flow", {}) or {})
+    candidate_flow_blockers = {
+        **{
+            f"pre:{key}": value
+            for key, value in dict(candidate_flow_totals.get("pre_selection_rejections", {}) or {}).items()
+        },
+        **{
+            f"strategy:{key}": value
+            for key, value in dict(candidate_flow_totals.get("strategy_rejections", {}) or {}).items()
+        },
+        **{
+            f"post:{key}": value
+            for key, value in dict(candidate_flow_totals.get("post_selection_rejections", {}) or {}).items()
+        },
+    }
+    validation_harness_summary["candidate_flow"] = {
+        "starved_runs": int(validation_harness.get("candidate_flow_starved_runs", 0) or 0),
+        "starved_run_pct": (
+            int(validation_harness.get("candidate_flow_starved_runs", 0) or 0) / len(completed) * 100.0
+        ) if completed else 0.0,
+        "proposals": int(candidate_flow_totals.get("proposals", 0) or 0),
+        "raw_signals": int(candidate_flow_totals.get("raw_signals", 0) or 0),
+        "submitted_orders": int(candidate_flow_totals.get("submitted_orders", 0) or 0),
+        "filled_orders": int(candidate_flow_totals.get("filled_orders", 0) or 0),
+        "closed_trades": int(candidate_flow_totals.get("closed_trades", 0) or 0),
+        "generation_outcomes": dict(sorted(dict(candidate_flow_totals.get("generation_outcomes", {}) or {}).items())),
+        "top_pre_selection_rejections": dict(sorted(dict(candidate_flow_totals.get("pre_selection_rejections", {}) or {}).items(), key=lambda item: item[1], reverse=True)[:8]),
+        "top_strategy_rejections": dict(sorted(dict(candidate_flow_totals.get("strategy_rejections", {}) or {}).items(), key=lambda item: item[1], reverse=True)[:8]),
+        "top_post_selection_rejections": dict(sorted(dict(candidate_flow_totals.get("post_selection_rejections", {}) or {}).items(), key=lambda item: item[1], reverse=True)[:8]),
+        "top_blockers": dict(sorted(candidate_flow_blockers.items(), key=lambda item: item[1], reverse=True)[:8]),
+    }
+    avg_trades = float(dict(aggregates.get("num_trades", {}) or {}).get("avg", 0.0) or 0.0)
+    avg_return = float(dict(aggregates.get("total_return_pct", {}) or {}).get("avg", 0.0) or 0.0)
+    avg_win_rate = float(dict(aggregates.get("win_rate_pct", {}) or {}).get("avg", 0.0) or 0.0)
+    run_days = [
+        float(dict(dict(item.get("campaign_summary", {}) or {}).get("session", {}) or {}).get("days", item.get("days", 0)) or 0.0)
+        for item in completed
+    ]
+    avg_days = sum(day for day in run_days if day > 0.0) / max(sum(1 for day in run_days if day > 0.0), 1)
+    avg_trades_per_day = avg_trades / avg_days if avg_days > 0.0 else 0.0
+    target_trades_per_day_min = 2.0
+    target_stop_loss_share = 55.0
+    target_signal_to_submission = 18.0
+    target_submission_to_fill = 45.0
+    target_win_rate = 35.0
+    candidate_flow_summary = dict(validation_harness_summary.get("candidate_flow", {}) or {})
+    candidate_flow_starved_runs = int(candidate_flow_summary.get("starved_runs", 0) or 0)
+    candidate_flow_starved_pct = float(candidate_flow_summary.get("starved_run_pct", 0.0) or 0.0)
+    candidate_flow_raw_signals = int(candidate_flow_summary.get("raw_signals", 0) or 0)
+    candidate_flow_closed_trades = int(candidate_flow_summary.get("closed_trades", 0) or 0)
+    has_candidate_flow_samples = bool(
+        candidate_flow_summary
+        and (
+            candidate_flow_starved_runs > 0
+            or int(candidate_flow_summary.get("proposals", 0) or 0) > 0
+            or candidate_flow_raw_signals > 0
+            or int(candidate_flow_summary.get("submitted_orders", 0) or 0) > 0
+            or int(candidate_flow_summary.get("filled_orders", 0) or 0) > 0
+            or candidate_flow_closed_trades > 0
+        )
+    )
+    min_flow_trades_per_day = 0.20
+    min_flow_raw_signals_per_run = 1.0
+    flow_recovered = (
+        has_candidate_flow_samples
+        and
+        candidate_flow_starved_runs <= 0
+        and candidate_flow_raw_signals >= max(len(completed) * min_flow_raw_signals_per_run, 1.0)
+        and avg_trades_per_day >= min_flow_trades_per_day
+    )
+    flow_starved = has_candidate_flow_samples and (candidate_flow_starved_runs > 0 or candidate_flow_raw_signals <= 0)
+    readiness_components = {
+        "positive_return": 1.0 if avg_return > 0.0 else max(0.0, min(1.0, 1.0 + (avg_return / 2.0))),
+        "trade_frequency": max(0.0, min(avg_trades_per_day / target_trades_per_day_min, 1.0)),
+        "win_rate": max(0.0, min(avg_win_rate / target_win_rate, 1.0)),
+        "stop_loss_damage": max(0.0, min((100.0 - float(validation_harness_summary.get("stop_loss_negative_pl_share_pct", 0.0) or 0.0)) / (100.0 - target_stop_loss_share), 1.0)),
+        "signal_to_submission": max(0.0, min(float(validation_harness_summary.get("signal_to_submission_pct", 0.0) or 0.0) / target_signal_to_submission, 1.0)),
+        "submission_to_fill": max(0.0, min(float(validation_harness_summary.get("submission_to_fill_pct", 0.0) or 0.0) / target_submission_to_fill, 1.0)),
+        "candidate_flow": 0.0 if flow_starved else max(0.0, min(avg_trades_per_day / min_flow_trades_per_day, 1.0)),
+    }
+    base_readiness_score = (
+        readiness_components["positive_return"] * 0.30
+        + readiness_components["stop_loss_damage"] * 0.22
+        + readiness_components["win_rate"] * 0.18
+        + readiness_components["trade_frequency"] * 0.14
+        + readiness_components["signal_to_submission"] * 0.08
+        + readiness_components["submission_to_fill"] * 0.08
+    ) * 100.0
+    readiness_penalty = 0.0
+    if flow_starved:
+        readiness_penalty += 12.0
+    if candidate_flow_starved_pct >= 50.0:
+        readiness_penalty += 8.0
+    readiness_score = max(base_readiness_score - readiness_penalty, 0.0)
+    if flow_starved:
+        candidate_flow_status = "candidate_flow_starved"
+    elif not has_candidate_flow_samples:
+        candidate_flow_status = "candidate_flow_not_measured"
+    elif avg_return <= 0.0 or avg_win_rate < target_win_rate:
+        candidate_flow_status = "flow_recovered_but_unprofitable"
+    elif avg_trades_per_day < target_trades_per_day_min:
+        candidate_flow_status = "flow_recovered_below_goal_frequency"
+    else:
+        candidate_flow_status = "flow_healthy"
+    validation_targets = {
+        "readiness_score": readiness_score,
+        "base_readiness_score": base_readiness_score,
+        "readiness_penalty": readiness_penalty,
+        "readiness_components": readiness_components,
+        "candidate_flow_status": candidate_flow_status,
+        "flow_recovered": flow_recovered,
+        "flow_starved": flow_starved,
+        "candidate_flow_measured": has_candidate_flow_samples,
+        "min_flow_trades_per_day": min_flow_trades_per_day,
+        "min_flow_raw_signals_per_run": min_flow_raw_signals_per_run,
+        "candidate_flow_raw_signals": candidate_flow_raw_signals,
+        "candidate_flow_closed_trades": candidate_flow_closed_trades,
+        "candidate_flow_starved_runs": candidate_flow_starved_runs,
+        "avg_trades_per_day": avg_trades_per_day,
+        "target_trades_per_day_min": target_trades_per_day_min,
+        "target_trades_per_day_max": 3.0,
+        "trade_frequency_gap_to_min": max(target_trades_per_day_min - avg_trades_per_day, 0.0),
+        "return_gap_to_positive_pct": max(0.0 - avg_return, 0.0),
+        "win_rate_gap_to_floor_pct": max(target_win_rate - avg_win_rate, 0.0),
+        "stop_loss_share_gap_to_limit_pct": max(float(validation_harness_summary.get("stop_loss_negative_pl_share_pct", 0.0) or 0.0) - target_stop_loss_share, 0.0),
+        "signal_to_submission_gap_to_floor_pct": max(target_signal_to_submission - float(validation_harness_summary.get("signal_to_submission_pct", 0.0) or 0.0), 0.0),
+        "submission_to_fill_gap_to_floor_pct": max(target_submission_to_fill - float(validation_harness_summary.get("submission_to_fill_pct", 0.0) or 0.0), 0.0),
+    }
+    blockers = {
+        "profitability": validation_targets["return_gap_to_positive_pct"],
+        "stop_loss_damage": validation_targets["stop_loss_share_gap_to_limit_pct"],
+        "win_rate": validation_targets["win_rate_gap_to_floor_pct"],
+        "trade_frequency": validation_targets["trade_frequency_gap_to_min"],
+        "signal_conversion": validation_targets["signal_to_submission_gap_to_floor_pct"],
+        "fill_conversion": validation_targets["submission_to_fill_gap_to_floor_pct"],
+    }
+    validation_targets["top_blockers"] = [
+        {"name": key, "gap": value}
+        for key, value in sorted(blockers.items(), key=lambda item: item[1], reverse=True)
+        if value > 0.0
+    ][:4]
+    has_validation_harness_samples = bool(
+        validation_harness["signal_to_submission_pct"]
+        or validation_harness["submission_to_fill_pct"]
+        or validation_harness["stop_loss_negative_pl_share_pct"]
+    )
     candidate_verdict_reasons: list[str] = []
     if int(acceptance_totals.get("passes_all", 0) or 0) <= 0:
         candidate_verdict_reasons.append("no_run_passed_acceptance")
@@ -581,6 +912,19 @@ def build_batch_summary(reports: list[Dict[str, Any]], *, include_horizons: bool
         candidate_verdict_reasons.append("losing_families_present")
     if dict(failure_leaderboard.get("expected_vs_realized_edge_divergence", {}) or {}):
         candidate_verdict_reasons.append("edge_realization_divergence_present")
+    market_data_unavailable = int(market_data.get("runs_without_data", 0) or 0) > 0 and int(market_data.get("runs_with_data", 0) or 0) <= 0
+    if market_data_unavailable:
+        candidate_verdict_reasons.append("market_data_unavailable")
+    if not market_data_unavailable and has_validation_harness_samples and float(validation_harness_summary.get("stop_loss_negative_pl_share_pct", 0.0) or 0.0) > 55.0:
+        candidate_verdict_reasons.append("stop_loss_damage_too_high")
+    if not market_data_unavailable and has_validation_harness_samples and float(validation_harness_summary.get("signal_to_submission_pct", 0.0) or 0.0) < 18.0:
+        candidate_verdict_reasons.append("signal_to_submission_too_low")
+    if not market_data_unavailable and has_validation_harness_samples and float(validation_harness_summary.get("submission_to_fill_pct", 0.0) or 0.0) < 45.0:
+        candidate_verdict_reasons.append("submission_to_fill_too_low")
+    if not market_data_unavailable and flow_starved:
+        candidate_verdict_reasons.append("candidate_flow_starved")
+    if not market_data_unavailable and flow_recovered and (avg_return <= 0.0 or avg_win_rate < target_win_rate):
+        candidate_verdict_reasons.append("flow_recovered_but_unprofitable")
     if not candidate_verdict_reasons:
         candidate_verdict = {
             "status": "promising",
@@ -641,6 +985,10 @@ def build_batch_summary(reports: list[Dict[str, Any]], *, include_horizons: bool
         "realized_performance_penalty_by_strategy": realized_performance_penalty_by_strategy,
         "realized_performance_no_trade_by_strategy": realized_performance_no_trade_by_strategy,
         "fill_conversion_by_strategy": fill_conversion_by_strategy,
+        "validation_harness": validation_harness_summary,
+        "triple_barrier": triple_barrier,
+        "validation_targets": validation_targets,
+        "market_data": dict(market_data),
         "universe_selection": universe_selection,
         "skip_reasons_by_symbol": skip_reasons_by_symbol,
         "comparisons": {

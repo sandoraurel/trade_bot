@@ -145,6 +145,19 @@ class MarketRegimeEngine:
             - abs(trend_strength) * 85.0
             - max(realized_vol_percentile - 0.88, 0.0) * 1.2
         )
+        symbol_bucket = self._symbol_bucket(symbol)
+        spot_core_symbol = getattr(self.config, "trading_mode", "spot") == "spot" and symbol_bucket in {"majors", "exchange_beta"}
+        constructive_pullback_regime = (
+            bool(getattr(self.config, "spot_core_constructive_regime_enabled", True))
+            and spot_core_symbol
+            and trend_direction == "bullish"
+            and pullback_score >= float(getattr(self.config, "spot_core_constructive_regime_min_pullback_score", 1.46))
+            and trend_persistence >= float(getattr(self.config, "spot_core_constructive_regime_min_trend_persistence", 0.50))
+            and volume_impulse >= float(getattr(self.config, "spot_core_constructive_regime_min_volume_impulse", 1.04))
+            and directional_efficiency >= float(getattr(self.config, "spot_core_constructive_regime_min_directional_efficiency", 0.18))
+            and realized_vol_percentile <= float(getattr(self.config, "spot_core_constructive_regime_max_volatility_percentile", 0.68))
+            and stretch_from_mean <= float(getattr(self.config, "spot_core_constructive_regime_max_stretch", 0.026))
+        )
 
         if unstable:
             regime = "unstable"
@@ -165,6 +178,9 @@ class MarketRegimeEngine:
         ):
             regime = "trending"
             confidence = min(0.95, 0.55 + (continuation_score - 1.0) * 0.18 + min(abs(direction_bias), 0.18))
+        elif constructive_pullback_regime:
+            regime = "trending"
+            confidence = min(0.86, 0.58 + max(pullback_score - 1.0, 0.0) * 0.12 + min(trend_persistence * 0.10, 0.06))
         elif (
             mean_reversion_score >= float(getattr(self.config, "regime_mean_reversion_score_threshold", 1.3))
             and abs(entry_zscore) >= float(getattr(self.config, "regime_mean_reversion_zscore_threshold", 1.0))
@@ -225,6 +241,8 @@ class MarketRegimeEngine:
                 "recent_drawdown": recent_drawdown,
                 "rebound_from_trough": rebound_from_trough,
                 "momentum_crash_risk": momentum_crash_risk,
+                "constructive_spot_core_regime": constructive_pullback_regime,
+                "symbol_bucket": symbol_bucket,
                 "rotation_policy": rotation_policy,
                 "preferred_family": rotation_policy["preferred_family"],
                 "suppressed_family": rotation_policy["suppressed_family"],
@@ -314,6 +332,19 @@ class MarketRegimeEngine:
             "trend_direction": trend_direction,
             "regime": regime,
         }
+
+    @staticmethod
+    def _symbol_bucket(symbol: str) -> str:
+        base = str(symbol or "").split("/")[0].upper()
+        if base in {"BTC", "ETH"}:
+            return "majors"
+        if base in {"BNB", "XRP"}:
+            return "exchange_beta"
+        if base in {"SOL", "AVAX"}:
+            return "high_beta_alts"
+        if base in {"ADA", "DOT", "LINK", "TON"}:
+            return "slower_large_caps"
+        return "other"
 
     @staticmethod
     def _efficiency_ratio(values: np.ndarray, lookback: int = 10) -> float:

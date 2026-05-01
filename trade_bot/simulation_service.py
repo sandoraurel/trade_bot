@@ -27,6 +27,8 @@ BATCH_STOP_FILE = "batch_stop.request"
 BATCH_SUMMARY_FILE = "batch_summary.json"
 BATCH_STDOUT_FILE = "batch_stdout.log"
 BATCH_STDERR_FILE = "batch_stderr.log"
+VALIDATION_DIRNAME = "simulation_validation"
+VALIDATION_SUMMARY_FILE = "validation_summary.json"
 SIMULATION_STATUS_STALE_SECONDS = 1800
 
 
@@ -40,6 +42,13 @@ def simulation_runtime_dir(base_dir: str) -> str:
 def simulation_batch_dir(base_dir: str) -> str:
     ensure_runtime_directories(base_dir)
     path = Path(base_dir, "data", BATCH_DIRNAME)
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def simulation_validation_dir(base_dir: str) -> str:
+    ensure_runtime_directories(base_dir)
+    path = Path(base_dir, "data", VALIDATION_DIRNAME)
     path.mkdir(parents=True, exist_ok=True)
     return str(path)
 
@@ -68,6 +77,15 @@ def simulation_batch_paths(base_dir: str) -> Dict[str, str]:
         "stdout": os.path.join(batch_dir, BATCH_STDOUT_FILE),
         "stderr": os.path.join(batch_dir, BATCH_STDERR_FILE),
         "runs_dir": os.path.join(batch_dir, "runs"),
+    }
+
+
+def simulation_validation_paths(base_dir: str) -> Dict[str, str]:
+    validation_dir = simulation_validation_dir(base_dir)
+    return {
+        "validation_dir": validation_dir,
+        "summary": os.path.join(validation_dir, VALIDATION_SUMMARY_FILE),
+        "runs_dir": os.path.join(validation_dir, "runs"),
     }
 
 
